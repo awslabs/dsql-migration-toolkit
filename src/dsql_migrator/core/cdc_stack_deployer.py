@@ -276,6 +276,10 @@ class CdcStackDeployer:
         # This deployer's own account (sts:GetCallerIdentity), read once: the owner the
         # template upload asserts, and the account Start CDC names the bucket after.
         self._caller_account = CallerAccount(lambda: self._client("sts"))
+        # The bucket the template was last staged in, bound to that account: kept, so a
+        # Start's preflight (preflight_template) and the update after it share what the
+        # first owner-checked upload confirmed.
+        self._template_bucket: Optional[OwnedBucket] = None
 
     @property
     def region(self) -> str:
@@ -325,14 +329,17 @@ class CdcStackDeployer:
         key = "cdc-plugins/cdc-stack.yaml"
         bucket_name = self.template_s3_bucket
         not_staged = "The cdc-stack template was not staged, so the stack was not changed"
-        try:
-            bucket = OwnedBucket(self._client("s3"), bucket_name, self.caller_account_id())
-        except BucketOwnershipError as exc:
-            raise CdcDeployError(f"{not_staged}: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001 - e.g. no S3 client for this session
-            raise CdcDeployError(
-                f"{not_staged}: {(str(exc).splitlines() or [type(exc).__name__])[0]}"
-            ) from exc
+        bucket = self._template_bucket
+        if bucket is None or bucket.name != bucket_name:
+            try:
+                bucket = OwnedBucket(self._client("s3"), bucket_name, self.caller_account_id())
+            except BucketOwnershipError as exc:
+                raise CdcDeployError(f"{not_staged}: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 - e.g. no S3 client for this session
+                raise CdcDeployError(
+                    f"{not_staged}: {(str(exc).splitlines() or [type(exc).__name__])[0]}"
+                ) from exc
+            self._template_bucket = bucket
         try:
             bucket.put(key, template_body.encode("utf-8"))
         except Exception as exc:  # noqa: BLE001 - classified into an actionable refusal
@@ -357,6 +364,26 @@ class CdcStackDeployer:
         # endpoint must match it.
         url = f"https://{bucket_name}.s3.{self._region}.amazonaws.com/{key}"
         return {"TemplateURL": url}
+
+    def preflight_template(self, template_body: Optional[str]) -> None:
+        """Stage ``template_body`` now, before the caller changes anything.
+
+        Start CDC stages its template right before UpdateStack, after the column-exclusion
+        overlay, the PostgreSQL publication repair and the in-process Kafka prep have run. A
+        template that cannot be staged there (its bucket owned by another account, missing,
+        or this deployer's account unreadable) would stop the Start only once those changes
+        were made. Staged first, it stops it while nothing has changed, with the same
+        :class:`CdcDeployError`. Nothing to do for ``None`` (UsePreviousTemplate) or a
+        template small enough to send inline, nor once this deployer has staged one in that
+        bucket (the owner it asserted is confirmed); the CreateStack / UpdateStack after it
+        stages the template again, owner-checked, right before its call.
+        """
+        if template_body is None:
+            return
+        staged = self._template_bucket
+        if staged is not None and staged.confirmed and staged.name == self.template_s3_bucket:
+            return
+        self._template_kwargs(template_body)
 
     def stack_has_resource(self, stack_name: str, logical_id: str) -> Optional[bool]:
         """Whether the deployed stack has the logical resource ``logical_id`` (read-only);

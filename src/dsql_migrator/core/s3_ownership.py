@@ -26,6 +26,13 @@ it (:meth:`OwnedBucket.ensure`). A bucket cannot change owner without being dele
 the tool uploaded with the check is the one a service reads next by name (CloudFormation's
 TemplateURL, an MSK Connect plugin, a Lambda function's code).
 
+A 403 to an owner-checked request cannot say why: another account owns the bucket, or this
+identity may not make the request. So the refusal (:func:`not_owned_message`) names both, the
+permission the refused request needs and S3's own answer -- until an owner-checked request has
+reached the bucket (:attr:`OwnedBucket.confirmed`). From then on the bucket is known to be this
+account's, and a 403 is IAM, a KMS key policy or an SCP: :func:`refusal_text` leaves it to be
+reported as the error it is.
+
 Verified against the Amazon S3 documentation: a request whose expected owner is not the
 bucket's owner fails with 403 Access Denied; HeadBucket answers a bucket that does not exist, or
 one this identity may not access, with a bare 400, 403 or 404 (only a 404 is taken as "absent";
@@ -65,6 +72,27 @@ _WHY = (
     "The tool derives the name from the account ID and Region, so another account can create a "
     "bucket with that name first."
 )
+# The refusal is about this request; versions of the tool before the check used such a bucket.
+_EARLIER = (
+    "Versions of the tool before this check used such a bucket. If another account owns it, "
+    "CDC infrastructure deployed in this account and Region may run connector plugins, an "
+    "offset seeder and a template from it (delete it on the CDC step and review what its stack "
+    "created), and on ECS Fargate the job and session state may have been restored from it."
+)
+
+# The IAM permission each request the tool sends to the bucket needs: what a 403 to it points
+# at when the bucket is this account's (HeadObject is authorized by s3:GetObject).
+_PERMISSIONS = {
+    "HeadBucket": "s3:ListBucket",
+    "ListObjectsV2": "s3:ListBucket",
+    "HeadObject": "s3:GetObject",
+    "GetObject": "s3:GetObject",
+    "PutObject": "s3:PutObject",
+    "DeleteObject": "s3:DeleteObject",
+}
+# botocore names the operation in an error's text (a managed upload's S3UploadFailedError
+# carries only the text of the PutObject error it wraps).
+_OPERATION_IN_TEXT = re.compile(r"when calling the (\w+) operation")
 
 
 class BucketOwnershipError(RuntimeError):
@@ -124,14 +152,31 @@ def _code_is(exc: BaseException, code: str) -> bool:
     return error_code(exc) == code or code in str(exc)
 
 
-def not_owned_message(bucket: str, owner: str) -> str:
-    """The refusal for a 403 to a request that asserted ``owner`` owns ``bucket``."""
+def _operation(exc: BaseException) -> Optional[str]:
+    """The S3 operation ``exc`` is the answer to (``None`` when it does not say)."""
+    name = getattr(exc, "operation_name", None)
+    if isinstance(name, str) and name:
+        return name
+    match = _OPERATION_IN_TEXT.search(str(exc))
+    return match.group(1) if match else None
+
+
+def not_owned_message(bucket: str, owner: str, exc: Optional[BaseException] = None) -> str:
+    """The refusal for a 403 (``exc``) to a request that asserted ``owner`` owns ``bucket``,
+    before any owner-checked request has reached it: another account owns the bucket, or this
+    identity may not make that request, and S3 does not say which. Names the request, the
+    IAM permission it needs and S3's own answer."""
+    operation = _operation(exc) if exc is not None else None
+    permission = _PERMISSIONS.get(operation or "")
+    request = f"a {operation} request" if operation else "a request"
+    allows = f"allows {permission} on it" if permission else "allows the request"
+    answer = f" S3 answered: {_first_line(exc).rstrip('.')}." if exc is not None else ""
     return (
         f"S3 bucket '{bucket}' is owned by another AWS account, or this identity cannot reach "
-        f"it, so the tool did not use it: S3 refused a request that required this account "
-        f"({owner}) to own it, and nothing was written to it. {_REMEDY} If the bucket is in "
-        "this account, check that this identity's IAM policy allows the request (HeadBucket "
-        f"needs s3:ListBucket on the bucket). {_WHY}"
+        f"it, so the tool did not use it: S3 refused {request} that required this account "
+        f"({owner}) to own it, so that request read and wrote nothing.{answer} {_REMEDY} If "
+        f"the bucket is in this account, check that this identity's IAM policy {allows}. "
+        f"{_EARLIER} {_WHY}"
     )
 
 
@@ -213,6 +258,10 @@ class OwnedBucket:
     Every request this class sends carries ``ExpectedBucketOwner=owner`` (CreateBucket, which
     takes none, is followed by a HeadBucket that does). An ``owner`` that is not a 12-digit
     account ID is refused here, so no request goes out without a real one.
+
+    :attr:`confirmed` turns true once one of those requests succeeds: S3 answered it, so this
+    account owns the bucket, and a 403 after that is not another account's bucket
+    (:func:`refusal_text`).
     """
 
     def __init__(self, client: Any, name: str, owner: str) -> None:
@@ -224,38 +273,47 @@ class OwnedBucket:
         self.client = client
         self.name = name
         self.owner = owner
+        #: An owner-checked request to the bucket has succeeded: this account owns it.
+        self.confirmed = False
+
+    def _reached(self, response: Any) -> Any:
+        self.confirmed = True
+        return response
 
     def head(self) -> Any:
-        return self.client.head_bucket(Bucket=self.name, ExpectedBucketOwner=self.owner)
+        return self._reached(
+            self.client.head_bucket(Bucket=self.name, ExpectedBucketOwner=self.owner)
+        )
 
     def head_key(self, key: str) -> Any:
-        return self.client.head_object(
-            Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner
+        return self._reached(
+            self.client.head_object(Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner)
         )
 
     def get(self, key: str) -> Any:
-        return self.client.get_object(
-            Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner
+        return self._reached(
+            self.client.get_object(Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner)
         )
 
     def put(self, key: str, body: Any, **params: Any) -> Any:
-        return self.client.put_object(
-            Bucket=self.name, Key=key, Body=body, ExpectedBucketOwner=self.owner, **params
+        return self._reached(
+            self.client.put_object(
+                Bucket=self.name, Key=key, Body=body, ExpectedBucketOwner=self.owner, **params
+            )
         )
 
     def delete(self, key: str) -> Any:
-        return self.client.delete_object(
-            Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner
+        return self._reached(
+            self.client.delete_object(Bucket=self.name, Key=key, ExpectedBucketOwner=self.owner)
         )
 
     def pages(self, prefix: str) -> Iterator[dict]:
         """The ListObjectsV2 pages under ``prefix``."""
         paginator = self.client.get_paginator("list_objects_v2")
-        return iter(
-            paginator.paginate(
-                Bucket=self.name, Prefix=prefix, ExpectedBucketOwner=self.owner
-            )
-        )
+        for page in paginator.paginate(
+            Bucket=self.name, Prefix=prefix, ExpectedBucketOwner=self.owner
+        ):
+            yield self._reached(page)
 
     def upload(
         self, filename: str, key: str, *, extra_args: dict, config: Any = None
@@ -268,6 +326,7 @@ class OwnedBucket:
             ExtraArgs={**extra_args, "ExpectedBucketOwner": self.owner},
             Config=config,
         )
+        self.confirmed = True
 
     def ensure(
         self, region: Optional[str], *, sleep: Callable[[float], None] = time.sleep
@@ -287,7 +346,9 @@ class OwnedBucket:
             return
         except Exception as exc:  # noqa: BLE001 - classified below
             if is_access_denied(exc):
-                raise BucketOwnershipError(not_owned_message(self.name, self.owner)) from exc
+                raise BucketOwnershipError(
+                    not_owned_message(self.name, self.owner, exc)
+                ) from exc
             if not is_missing(exc):
                 raise
         try:
@@ -314,7 +375,7 @@ class OwnedBucket:
             except Exception as exc:  # noqa: BLE001 - classified below
                 if is_access_denied(exc):
                     raise BucketOwnershipError(
-                        not_owned_message(self.name, self.owner)
+                        not_owned_message(self.name, self.owner, exc)
                     ) from exc
                 if not is_missing(exc) or attempt + 1 == _VERIFY_ATTEMPTS:
                     raise
@@ -323,12 +384,15 @@ class OwnedBucket:
 
 def refusal_text(exc: BaseException, bucket: OwnedBucket | None = None) -> Optional[str]:
     """The operator-facing refusal when ``exc`` is the tool not using a bucket it cannot
-    confirm it owns (a :class:`BucketOwnershipError`, or a 403 to an owner-checked request on
-    ``bucket``); ``None`` for any other error."""
+    confirm it owns: a :class:`BucketOwnershipError`, or a 403 to an owner-checked request on
+    ``bucket`` before one of them has reached it. ``None`` for any other error -- a 403 on a
+    bucket already :attr:`~OwnedBucket.confirmed` among them: a bucket cannot change owner
+    without being deleted, so that 403 is this identity's IAM policy, a KMS key policy or an
+    SCP, and the caller reports it as the error it is (S3 refused it all the same)."""
     if isinstance(exc, BucketOwnershipError):
         return str(exc)
-    if bucket is not None and is_access_denied(exc):
-        return not_owned_message(bucket.name, bucket.owner)
+    if bucket is not None and not bucket.confirmed and is_access_denied(exc):
+        return not_owned_message(bucket.name, bucket.owner, exc)
     return None
 
 

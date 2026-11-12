@@ -159,7 +159,8 @@ def test_user_data_source_mode_branches() -> None:
     # SourceMode selects S3-tarball (restricted network / local copy) vs git clone.
     ud = str(_load()["Resources"]["AppHost"]["Properties"]["UserData"])
     assert 'if [ "${!SOURCE_MODE}" = "s3" ]' in ud  # S3 tarball branch
-    assert "aws s3 cp" in ud
+    # ...downloaded only from a bucket this account owns (test_s3_bucket_owner runs it).
+    assert "aws s3api get-object" in ud and "--expected-bucket-owner ${AWS::AccountId}" in ud
     assert "git clone" in ud  # public-HTTPS git branch
 
 

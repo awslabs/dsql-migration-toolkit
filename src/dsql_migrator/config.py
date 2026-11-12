@@ -116,6 +116,10 @@ class AppConfig(BaseModel):
             "Load job snapshots are written to S3, so a Fargate task replacement (a "
             "redeploy) no longer loses job/resume state -- unlike job_state_path, "
             "which lives on the task's EPHEMERAL /tmp and is wiped on replacement. "
+            "Every request names this identity's own AWS account as the bucket's "
+            "expected owner, so a bucket by this name in another account is never "
+            "used: no job state is saved to it or restored from it, and the activity "
+            "log records the refusal at startup. "
             "When None, the local SQLite path is used (local dev). Config key: "
             "DSQL_MIGRATOR_JOB_STATE_BUCKET."
         ),
@@ -148,7 +152,11 @@ class AppConfig(BaseModel):
             "each session's non-secret snapshot is written to S3, so a Fargate "
             "task replacement (a redeploy) no longer loses the resume state -- "
             "unlike session_state_path, which lives on the task's EPHEMERAL disk "
-            "and is wiped on replacement. When None, the local SQLite path is used "
+            "and is wiped on replacement. Every request names this identity's own "
+            "AWS account as the bucket's expected owner, so a bucket by this name in "
+            "another account is never used: no session state is saved to it or "
+            "restored from it, and the activity log records the refusal at startup. "
+            "When None, the local SQLite path is used "
             "(local dev). Config key: DSQL_MIGRATOR_SESSION_STATE_BUCKET."
         ),
     )

@@ -76,12 +76,22 @@ the canonical prefix. Set a per-DB name (suffix only) in the deploy form's Advan
 
 ## Manual deploy (inspection / break-glass only)
 
-```bash
-aws cloudformation validate-template --template-body file://deploy/cdc-stack/cdc-stack.yaml
+The template exceeds CloudFormation's 51,200-byte inline limit, so the CLI stages it in an S3
+bucket: the tool's plugin bucket, which `PluginBucketArn` names and the stack's connector
+plugins and offset seeder are read from. That bucket's name is derived from the account ID
+and Region, so another AWS account could own a bucket by that name: the deploy runs only if
+the `head-bucket` check confirms that this account owns it. Add `--no-execute-changeset` to
+inspect the change set without applying it.
 
-aws cloudformation deploy --template-file deploy/cdc-stack/cdc-stack.yaml \
-  --stack-name dsql-cdc-stack --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides ...   # see the template's Parameters section
+```bash
+export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+export PLUGIN_BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
+aws s3api head-bucket --bucket "$PLUGIN_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy --template-file deploy/cdc-stack/cdc-stack.yaml \
+  --stack-name dsql-cdc-stack --region "$AWS_REGION" --capabilities CAPABILITY_NAMED_IAM \
+  --s3-bucket "$PLUGIN_BUCKET" --s3-prefix cdc-plugins \
+  --parameter-overrides PluginBucketArn="arn:aws:s3:::$PLUGIN_BUCKET" \
+    ...   # the rest: see the template's Parameters section
 ```
 
 Prefer the in-app flow: it fills almost every parameter for you and avoids the

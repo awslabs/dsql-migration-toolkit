@@ -499,11 +499,12 @@ def test_a_stack_on_an_older_sink_plugin_warns_with_the_way_to_the_bundled_one(m
 
 
 def _deploy_commands(text):
-    """Each ``aws cloudformation deploy`` command, its backslash-continued lines joined."""
+    """Each ``aws cloudformation deploy`` command, its backslash-continued lines joined -- one
+    chained after the guides' owner check (``&& aws cloudformation deploy``) included."""
     lines = text.splitlines()
     commands = []
     for i, line in enumerate(lines):
-        if not line.lstrip().startswith("aws cloudformation deploy"):
+        if not line.lstrip().removeprefix("&& ").startswith("aws cloudformation deploy"):
             continue
         parts = [line]
         while parts[-1].rstrip().endswith("\\") and i + len(parts) < len(lines):

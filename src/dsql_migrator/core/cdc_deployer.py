@@ -2150,6 +2150,14 @@ def run_cdc_start(
                 "Delete the CDC infrastructure on the CDC step, then deploy it again and "
                 "Start CDC: a new stack gets a capture list without key columns."
             )
+        # The template the update sends is staged in S3 (it exceeds CloudFormation's inline
+        # limit), in a bucket whose owner the upload asserts. Staged once NOW, so a bucket
+        # that refuses it stops this Start before the publication repair, the in-process
+        # Kafka prep and the update change anything (the UI's Start staged it before its
+        # overlay already; the deployer then skips this one).
+        _preflight = getattr(deployer, "preflight_template", None)
+        if callable(_preflight):
+            _preflight(template_body)
         driver.stage("validate_params", "DONE")
 
         if driver.cancelled:

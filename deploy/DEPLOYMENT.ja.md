@@ -450,7 +450,8 @@ export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 ランダムなサフィックスを付けてください: アカウント ID とリージョンだけで作った名前は予測でき、
 別の AWS アカウントが先に作成できます。そのうえでこのアカウントがバケットを所有していることを
 確認し、**確認が失敗したら止まってください** — CloudFormation はそのバケットが渡すテンプレートを
-何であれデプロイします:
+何であれデプロイします。このガイドでこのバケットから行うデプロイはどれも、同じコマンドの中でその確認を
+`&&` でつないでもう一度行うため、確認が失敗するとデプロイは実行されません:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -463,7 +464,9 @@ echo "$TEMPLATE_BUCKET"  # 名前を控えてください: 後の更新も同じ
 ```
 
 ```bash
-aws cloudformation deploy \
+# このアカウントがバケットを所有しているときだけデプロイします: そうでなければ head-bucket の確認が失敗します。
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
@@ -735,10 +738,10 @@ docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
 # $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット(このテンプレートは
-# CloudFormation のインラインアップロード上限 51,200 バイトを超えています)。この確認が成功したときだけデプロイ:
-aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
-
-aws cloudformation deploy \
+# CloudFormation のインラインアップロード上限 51,200 バイトを超えています)。このアカウントがバケットを
+# 所有しているときだけデプロイします: そうでなければ head-bucket の確認が失敗します。
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
@@ -746,6 +749,12 @@ aws cloudformation deploy \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (他のパラメータを再度指定するか、以前の値に依存する)
 ```
+
+確認が失敗したら、そのバケットからはデプロイしないでください: 上の AWS CLI デプロイのセクションのとおりに
+新しいバケットを作成し、そこからデプロイします。このガイドの以前の版はバケット名を
+`mysql-dsql-migrator-templates-<account>-<region>` としていましたが、この名前は別の AWS アカウントが
+先に作成できます。デプロイに使ったバケットを別のアカウントが所有している場合は、下のセキュリティに関する
+注記の *このアカウントで以前のバージョンを実行した場合は?* を参照してください。
 
 > [!IMPORTANT]
 > **PostgreSQL ソースで v0.1.503 以降にアップグレードする場合は、完全なテンプレート**
@@ -791,10 +800,13 @@ aws cloudformation deploy \
 ### AI 支援変換の有効化 (オプション)
 
 AI アシストは opt-in であり、`bedrock:InvokeModel` と `bedrock:InvokeModelWithResponseStream` を **`anthropic.`
-プロバイダーにスコープを限定して** 付与します:
+プロバイダーにスコープを限定して** 付与します。これらのオーバーライドで再デプロイします（`...` は上の
+デプロイコマンドの残りの部分）。テンプレートバケットから、その所有者の確認を経てデプロイします:
 
 ```bash
-aws cloudformation deploy ... \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy ... \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --parameter-overrides \
     EnableAiAssist=true \
     BedrockModelId=global.anthropic.claude-sonnet-5 \
@@ -950,7 +962,22 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   バケットの想定所有者として指定し、このアカウントがバケットを所有していなければ S3 が拒否します。別の
   アカウントにあるその名前のバケットは決して使用しません: Deploy CDC infrastructure と Start CDC は
   バケット名と対処方法を示すエラーで止まり、ジョブとセッションの状態は保存されません（起動時に
-  アクティビティログに記録されます）。
+  アクティビティログに記録されます）。`DSQL_MIGRATOR_JOB_STATE_BUCKET` または
+  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` で指定したバケットも同じです。ツールにはプラグインバケットの別の
+  名前を選ぶ設定がないため、別のアカウントがその名前のバケットを持っている間は、このアカウントと
+  リージョンで Deploy CDC infrastructure を実行できず、ECS Fargate ではジョブとセッションの状態が
+  保存されません。
+- **このアカウントで以前のバージョンを実行した場合は?** 所有者の確認より前のバージョンは、別のアカウントに
+  あるその名前のバケットを、そのバケットポリシーが許可していれば使用しました。また、このガイドの以前の版は
+  テンプレートバケットを確認なしで `mysql-dsql-migrator-templates-<account>-<region>` として作成しました。
+  このアカウントの管理者として両方の名前を確認してください:
+  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` は、このアカウントが
+  バケットを所有していれば成功し、そのようなバケットがなければ 404、別のアカウントが所有していれば
+  403 を返します。どちらかを別のアカウントが所有している場合は、そこから来たものを信頼しないで
+  ください: CDC インフラのコネクタープラグイン・オフセットシーダー・テンプレート（プラグインバケット）、
+  アプリスタックのテンプレート（テンプレートバケット）、そして ECS Fargate で復元されたジョブと
+  セッションの状態です。CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認したうえで、
+  このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
 - **監査証跡**: 構造化されたアクティビティログ（成功 + 失敗のタイムライン、UI から
   ダウンロード可能）は、シークレットではないフィールドのみを記録します — 行の値、
   パスワード、IAM トークンは決して記録しません。タスクの一時ディスク上でサイズ上限が
@@ -1038,8 +1065,10 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
   [ホストを MSK 9098 に許可](#5-ホストを-msk-9098-に許可-cdc-のみ) を参照）。
 - **ホストがアプリソースを取得する方法。** デフォルト（`SourceMode=git`）は公開リポジトリを
   HTTPS でクローンします — 認証情報は不要。ホストのネットワークがリポジトリに到達できない
-  場合は、チェックアウトの tarball を S3 にアップロードして `SourceMode=s3`（`SourceS3Uri`）を
-  使用してください。
+  場合は、チェックアウトの tarball をこのアカウントが所有するバケットにアップロードして
+  `SourceMode=s3`（`SourceS3Uri`）を使用してください: ホストはこのアカウントが所有するバケットから
+  のみダウンロードするため（`aws s3api get-object --expected-bucket-owner`）、別のアカウントにある
+  その名前のバケットは拒否されます。
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -1052,7 +1081,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 | `DsqlClusterArn` | はい | — | ターゲット DSQL クラスター（`dsql:DbConnect` のスコープ）。 |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | いずれか必須 | `""` | ソース DB へのホスト egress を開放（生の CIDR より SG を推奨）。 |
 | `SourceMode` | いいえ | `git` | `git`（公開 HTTPS で `SourceRepoUrl@SourceRepoRef` をクローン）または `s3`（`SourceS3Uri` の tarball）。 |
-| `SourceS3Uri` | `s3` の場合必須 | `""` | リポジトリルートの `s3://…/source.tar.gz` — 一時的な「ローカルコピーを実行」パス。 |
+| `SourceS3Uri` | `s3` の場合必須 | `""` | リポジトリルートの `s3://…/source.tar.gz` — 一時的な「ローカルコピーを実行」パス。バケットはこのアカウントのものである必要があります: ホストのダウンロードがそれを確認し、ホストロールが読み取れるのはこのオブジェクトだけです。 |
 | `MskEgressCidr` | いいえ | `0.0.0.0/0` | インプロセスシードのためにホストが MSK 9098 に到達する CIDR。最小権限のためコネクタサブネット CIDR に絞る。 |
 | `InstanceType` | いいえ | `t3.large` | コントロールプレーンホストのサイズ。 |
 | `StateVolumeSizeGiB` | いいえ | `20` | 保持型 EBS 状態ボリューム。大きなテーブルの Full Load でローカル CSV がスピルする場合は大きく。 |
@@ -1164,10 +1193,11 @@ aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
 ```
 
-上の `head-bucket` の確認が成功したときだけデプロイを実行してください:
+デプロイは `head-bucket` の確認をもう一度行い、それが成功したときだけ実行されます:
 
 ```bash
-aws cloudformation deploy \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
@@ -1181,6 +1211,7 @@ aws cloudformation deploy \
     MskEgressCidr="$HOST_SUBNET_CIDR"
     # デフォルトの SourceMode=git は公開リポジトリをクローンします（認証情報不要）。ホストが
     # リポジトリに到達できない場合は追加:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
+    # （ホストはこのアカウントが所有するバケットからのみダウンロードします）
 ```
 
 初回起動は約 3〜4 分: ホストが 443 経由で Python 3.12 + wheel をインストールし、

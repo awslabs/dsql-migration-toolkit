@@ -451,7 +451,9 @@ it's the recommended path). Create one once, or reuse a bucket you already have
 in this account/region. Give a new bucket a random suffix: a name built only from the
 account ID and Region is predictable, and another AWS account can create it first. Then
 confirm that this account owns the bucket, and **stop if that check fails** — CloudFormation
-would deploy whatever template that bucket hands it:
+would deploy whatever template that bucket hands it. Every deploy from the bucket in this
+guide repeats that check in the same command, chained with `&&`, so the deploy does not run
+when the check fails:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -464,7 +466,9 @@ echo "$TEMPLATE_BUCKET"  # keep the name: a later update deploys from the same b
 ```
 
 ```bash
-aws cloudformation deploy \
+# Deploys only if this account owns the bucket: the head-bucket check fails otherwise.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
@@ -736,10 +740,10 @@ docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
 # $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above (the template
-# exceeds CloudFormation's 51,200-byte inline-upload limit). Deploy only if this succeeds:
-aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
-
-aws cloudformation deploy \
+# exceeds CloudFormation's 51,200-byte inline-upload limit). Deploys only if this account
+# owns the bucket: the head-bucket check fails otherwise.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
@@ -747,6 +751,12 @@ aws cloudformation deploy \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (re-supply the other parameters, or rely on previous values)
 ```
+
+If the check fails, do not deploy from that bucket: create a new one as in the AWS CLI
+deploy section above and deploy from it. An earlier version of this guide named the bucket
+`mysql-dsql-migrator-templates-<account>-<region>`, a name another AWS account can create
+first; if another account owns the bucket you deployed from, see *Ran an earlier version in
+this account?* in the security notes below.
 
 > [!IMPORTANT]
 > **Upgrading to v0.1.503 or later with a PostgreSQL source needs the FULL template**
@@ -790,10 +800,14 @@ aws cloudformation deploy \
 ### Enable AI-assisted conversion (optional)
 
 AI assist is opt-in and grants `bedrock:InvokeModel` and
-`bedrock:InvokeModelWithResponseStream`, **scoped to the `anthropic.` provider**:
+`bedrock:InvokeModelWithResponseStream`, **scoped to the `anthropic.` provider**. Redeploy
+with these overrides (`...` is the rest of the deploy command above), from the template
+bucket and behind its owner check:
 
 ```bash
-aws cloudformation deploy ... \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy ... \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --parameter-overrides \
     EnableAiAssist=true \
     BedrockModelId=global.anthropic.claude-sonnet-5 \
@@ -955,7 +969,23 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   account owns the bucket. A bucket by that name in another account is never used:
   Deploy CDC infrastructure and Start CDC stop with an error that names the bucket and
   what to do, and the job and session state are not saved (the activity log records it
-  at startup).
+  at startup). The same holds for a bucket set with `DSQL_MIGRATOR_JOB_STATE_BUCKET` or
+  `DSQL_MIGRATOR_SESSION_STATE_BUCKET`. The tool has no setting for another plugin bucket
+  name, so while another account holds a bucket by that name, Deploy CDC infrastructure
+  cannot run in this account and Region, and on ECS Fargate the job and session state are
+  not saved.
+- **Ran an earlier version in this account?** Versions before the owner check used a
+  bucket by that name in another account when its bucket policy let them in, and an earlier
+  version of this guide created the template bucket as
+  `mysql-dsql-migrator-templates-<account>-<region>` without checking it. Check both names,
+  as an administrator of this account:
+  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` succeeds if this
+  account owns the bucket, answers 404 if there is no such bucket, and 403 if another account
+  owns it. If another account owns either, treat what came from it as untrusted: the CDC
+  infrastructure's connector plugins, offset seeder and template (the plugin bucket), the app
+  stack's template (the template bucket), and the job and session state restored on ECS
+  Fargate. Delete the CDC infrastructure, review the stacks' resources and their CloudTrail
+  history, and deploy again with this version from a bucket this account owns.
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's
@@ -1045,7 +1075,10 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
   [Admit the host to MSK](#5-admit-the-host-to-msk-on-9098-cdc-only) below).
 - **A way for the host to fetch the app source.** By default (`SourceMode=git`) it clones
   the public repo over HTTPS — no credentials. If the host's network can't reach the
-  repo, upload a tarball of your checkout to S3 and use `SourceMode=s3` (`SourceS3Uri`).
+  repo, upload a tarball of your checkout to a bucket this account owns and use
+  `SourceMode=s3` (`SourceS3Uri`): the host downloads it only from a bucket this account
+  owns (`aws s3api get-object --expected-bucket-owner`), so a bucket by that name in another
+  account is refused.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -1058,7 +1091,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `DsqlClusterArn` | yes | — | Target DSQL cluster (scopes `dsql:DbConnect`). |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | one required | `""` | Opens host egress to the source DB (SG preferred over a raw CIDR). |
 | `SourceMode` | no | `git` | `git` (clone `SourceRepoUrl@SourceRepoRef` over public HTTPS) or `s3` (tarball from `SourceS3Uri`). |
-| `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. |
+| `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. The bucket must be this account's: the host's download asserts it, and the host role may read only this object. |
 | `MskEgressCidr` | no | `0.0.0.0/0` | CIDR the host may reach MSK on 9098 for the in-process seed; narrow to the connector subnet CIDR for least privilege. |
 | `InstanceType` | no | `t3.large` | Control-plane host size. |
 | `StateVolumeSizeGiB` | no | `20` | Retained EBS state volume; size up for a large-table Full Load's local CSV spillover. |
@@ -1174,10 +1207,11 @@ aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
 ```
 
-Run the deploy only if the `head-bucket` check above succeeded:
+The deploy repeats the `head-bucket` check and runs only if it succeeds:
 
 ```bash
-aws cloudformation deploy \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
@@ -1191,6 +1225,7 @@ aws cloudformation deploy \
     MskEgressCidr="$HOST_SUBNET_CIDR"
     # Default SourceMode=git clones the public repo (no credentials). If the host
     # can't reach it, add:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
+    # (the host downloads it only from a bucket this account owns)
 ```
 
 First boot takes ~3–4 min: the host installs Python 3.12 + wheels over 443, runs

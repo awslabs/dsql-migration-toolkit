@@ -1010,9 +1010,18 @@ def ensure_plugin_bucket(
     account owns (a 403 to the owner-checked request, or ``BucketAlreadyExists``) is refused,
     never adopted, and so is any other failure: :class:`S3ProvisionError`.
     """
+    return _ensured_bucket(s3_client, account_id, region).name
+
+
+def _ensured_bucket(
+    s3_client: BotoSessionLike, account_id: str, region: str
+) -> OwnedBucket:
+    """:func:`ensure_plugin_bucket`'s bucket, bound to ``account_id`` and confirmed to be its
+    (:attr:`OwnedBucket.confirmed`), for the uploads that follow it."""
     bucket = plugin_bucket_name(account_id, region)
     try:
-        OwnedBucket(s3_client, bucket, account_id).ensure(region)
+        owned = OwnedBucket(s3_client, bucket, account_id)
+        owned.ensure(region)
     except BucketOwnershipError as exc:
         raise S3ProvisionError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -1020,7 +1029,7 @@ def ensure_plugin_bucket(
             f"Could not check or create plugin bucket '{bucket}': "
             f"{(str(exc).splitlines() or [type(exc).__name__])[0]}"
         ) from exc
-    return bucket
+    return owned
 
 
 def _local_md5(path: Path) -> str:
@@ -1117,6 +1126,22 @@ def upload_plugin(
         owned = OwnedBucket(s3_client, bucket, expected_owner)
     except BucketOwnershipError as exc:
         raise S3ProvisionError(str(exc)) from exc
+    _upload_to(owned, key, local_path, on_progress=on_progress, local_sha256=local_sha256)
+
+
+def _upload_to(
+    owned: OwnedBucket,
+    key: str,
+    local_path: Path,
+    *,
+    on_progress: Optional[Callable[[str], None]] = None,
+    local_sha256: Optional[str] = None,
+) -> None:
+    """:func:`upload_plugin` into ``owned`` (``local_path`` is a file). A 403 is the bucket's
+    refusal only while no owner-checked request has reached it
+    (:func:`~dsql_migrator.core.s3_ownership.refusal_text`): in the bucket
+    :func:`ensure_and_upload_plugins` has just confirmed, it is the error it is."""
+    s3_client = owned.client
 
     def _log(msg: str) -> None:
         if on_progress is not None:
@@ -1202,7 +1227,8 @@ def ensure_and_upload_plugins(
     Raises :class:`S3ProvisionError` on any unrecoverable failure.
     """
     account_id = get_account_id(sts_client)
-    bucket = ensure_plugin_bucket(s3_client, account_id, region)
+    owned = _ensured_bucket(s3_client, account_id, region)
+    bucket = owned.name
     deb_path, deb_pg_path, sink_path, seeder_path = _artifact_paths()
 
     is_mysql = source_engine is SourceType.MYSQL
@@ -1242,9 +1268,8 @@ def ensure_and_upload_plugins(
     for base_key, path in wanted:
         sha256 = _artifact_sha256(path)
         keys[base_key] = _content_key(base_key, sha256)
-        upload_plugin(
-            s3_client, bucket, keys[base_key], path,
-            expected_owner=account_id, on_progress=on_progress, local_sha256=sha256,
+        _upload_to(
+            owned, keys[base_key], path, on_progress=on_progress, local_sha256=sha256
         )
 
     return PluginUploadResult(

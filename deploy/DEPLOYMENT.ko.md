@@ -422,7 +422,8 @@ S3 버킷이 필요합니다(콘솔은 이 문제를 자동으로 처리하므�
 만들거나, 이 계정/리전에 이미 있는 버킷을 재사용하세요. 새 버킷에는 무작위 접미사를 붙이세요: 계정 ID와
 리전만으로 만든 이름은 예측할 수 있어서, 다른 AWS 계정이 먼저 만들 수 있습니다. 그런 다음 이 계정이 그
 버킷을 소유하는지 확인하고, **확인이 실패하면 멈추세요** — CloudFormation은 그 버킷이 내주는 템플릿을 무엇이든
-배포합니다:
+배포합니다. 이 가이드에서 이 버킷으로 하는 모든 배포는 같은 명령 안에서 그 확인을 `&&`로 이어 다시 하므로,
+확인이 실패하면 배포는 실행되지 않습니다:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -435,7 +436,9 @@ echo "$TEMPLATE_BUCKET"  # 이름을 보관하세요: 이후 업데이트도 같
 ```
 
 ```bash
-aws cloudformation deploy \
+# 이 계정이 버킷을 소유할 때만 배포합니다: 아니면 head-bucket 확인이 실패합니다.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator \
   --region "$AWS_REGION" \
@@ -688,10 +691,10 @@ docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
 # $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷(이 템플릿은 CloudFormation 인라인
-# 업로드 한도 51,200바이트를 초과합니다). 이 확인이 성공할 때만 배포하세요:
-aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
-
-aws cloudformation deploy \
+# 업로드 한도 51,200바이트를 초과합니다). 이 계정이 버킷을 소유할 때만 배포합니다: 아니면
+# head-bucket 확인이 실패합니다.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
   --s3-bucket "$TEMPLATE_BUCKET" \
@@ -699,6 +702,11 @@ aws cloudformation deploy \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (나머지 파라미터를 다시 제공하거나 이전 값에 의존)
 ```
+
+확인이 실패하면 그 버킷으로 배포하지 마세요: 위 AWS CLI 배포 섹션처럼 새 버킷을 만들어 거기서
+배포하세요. 이 가이드의 이전 버전은 버킷 이름을 `mysql-dsql-migrator-templates-<account>-<region>`으로
+정했는데, 이 이름은 다른 AWS 계정이 먼저 만들 수 있습니다. 배포에 쓴 버킷을 다른 계정이 소유하고 있다면
+아래 보안 노트의 *이 계정에서 이전 버전을 실행했다면?*을 보세요.
 
 > [!IMPORTANT]
 > **PostgreSQL 소스에서 v0.1.503 이상으로 올릴 때는 전체 템플릿**(위처럼
@@ -736,10 +744,13 @@ aws cloudformation deploy \
 ### AI 보조 변환 활성화 (Optional)
 
 AI 보조는 opt-in이며 `bedrock:InvokeModel`과 `bedrock:InvokeModelWithResponseStream`을 **`anthropic.` 공급자로
-범위를 제한해** 부여합니다:
+범위를 제한해** 부여합니다. 이 오버라이드로 재배포하세요(`...`는 위 배포 명령의 나머지 부분). 템플릿 버킷에서,
+그 소유자 확인을 거쳐 배포합니다:
 
 ```bash
-aws cloudformation deploy ... \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy ... \
+  --s3-bucket "$TEMPLATE_BUCKET" \
   --parameter-overrides \
     EnableAiAssist=true \
     BedrockModelId=global.anthropic.claude-sonnet-5 \
@@ -876,7 +887,19 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   버킷을 먼저 만들 수 있음. 앱이 이 버킷에 보내는 모든 요청(CDC 플러그인·템플릿 업로드, 작업·세션 상태)은
   이 계정을 버킷의 예상 소유자로 지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 다른 계정에 있는 그
   이름의 버킷은 절대 사용하지 않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은
-  오류로 멈추고, 작업·세션 상태는 저장되지 않음(시작 시 활동 로그에 기록).
+  오류로 멈추고, 작업·세션 상태는 저장되지 않음(시작 시 활동 로그에 기록). `DSQL_MIGRATOR_JOB_STATE_BUCKET`
+  또는 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`으로 지정한 버킷도 마찬가지. 툴에는 플러그인 버킷의 다른
+  이름을 고르는 설정이 없으므로, 다른 계정이 그 이름의 버킷을 가지고 있는 동안에는 이 계정과 리전에서
+  Deploy CDC infrastructure를 실행할 수 없고, ECS Fargate에서는 작업·세션 상태가 저장되지 않음.
+- **이 계정에서 이전 버전을 실행했다면?** 소유자 확인 이전 버전은 다른 계정에 있는 그 이름의 버킷을, 그
+  버킷 정책이 허용하면 사용했고, 이 가이드의 이전 버전은 템플릿 버킷을 확인 없이
+  `mysql-dsql-migrator-templates-<account>-<region>`으로 만들었음. 두 이름을 이 계정의 관리자로
+  확인: `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>`는 이 계정이
+  버킷을 소유하면 성공하고, 그런 버킷이 없으면 404, 다른 계정이 소유하면 403으로 응답함. 둘 중 하나라도 다른
+  계정이 소유한다면 거기서 온 것을 신뢰하지 말 것: CDC 인프라의 커넥터 플러그인·오프셋 시더·템플릿
+  (플러그인 버킷), 앱 스택의 템플릿(템플릿 버킷), 그리고 ECS Fargate에서 복원된 작업·세션 상태. CDC
+  인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을 검토한 뒤, 이 계정이 소유한 버킷에서 이 버전으로
+  다시 배포할 것.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.
@@ -954,7 +977,9 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
   [호스트를 MSK 9098에 허용](#5-호스트를-msk-9098에-허용-cdc만) 참고).
 - **호스트가 앱 소스를 가져오는 방법.** 기본값(`SourceMode=git`)은 공개 저장소를 HTTPS로
   클론합니다 — 자격증명 불필요. 호스트 네트워크가 저장소에 닿지 못하면, 체크아웃 tarball을
-  S3에 올려 `SourceMode=s3`(`SourceS3Uri`)를 사용하세요.
+  이 계정이 소유한 버킷에 올려 `SourceMode=s3`(`SourceS3Uri`)를 사용하세요: 호스트는 이 계정이
+  소유한 버킷에서만 내려받으므로(`aws s3api get-object --expected-bucket-owner`), 다른 계정에
+  있는 그 이름의 버킷은 거부됩니다.
 
 <hr style="border: none; height: 1px; background-color: #d0d7de; margin: 1.5em 0;">
 
@@ -967,7 +992,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `DsqlClusterArn` | 예 | — | 타깃 DSQL 클러스터(`dsql:DbConnect` 범위). |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | 하나 필수 | `""` | 소스 DB로의 호스트 egress를 개방(원시 CIDR보다 SG 선호). |
 | `SourceMode` | 아니오 | `git` | `git`(공개 HTTPS로 `SourceRepoUrl@SourceRepoRef` 클론) 또는 `s3`(`SourceS3Uri` tarball). |
-| `SourceS3Uri` | `s3`면 필수 | `""` | 저장소 루트의 `s3://…/source.tar.gz` — 임시 "내 로컬 복사본 실행" 경로. |
+| `SourceS3Uri` | `s3`면 필수 | `""` | 저장소 루트의 `s3://…/source.tar.gz` — 임시 "내 로컬 복사본 실행" 경로. 버킷은 이 계정의 것이어야 합니다: 호스트의 다운로드가 그것을 확인하고, 호스트 역할은 이 객체만 읽을 수 있습니다. |
 | `MskEgressCidr` | 아니오 | `0.0.0.0/0` | 인프로세스 시드를 위해 호스트가 MSK 9098에 도달할 CIDR; 최소 권한을 위해 커넥터 서브넷 CIDR로 좁히기. |
 | `InstanceType` | 아니오 | `t3.large` | 컨트롤 플레인 호스트 크기. |
 | `StateVolumeSizeGiB` | 아니오 | `20` | 보존형 EBS 상태 볼륨; 대형 테이블 Full Load의 로컬 CSV 스필오버는 크게. |
@@ -1078,10 +1103,11 @@ aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
 ```
 
-위의 `head-bucket` 확인이 성공했을 때만 배포를 실행하세요:
+배포는 `head-bucket` 확인을 다시 하고, 그것이 성공할 때만 실행됩니다:
 
 ```bash
-aws cloudformation deploy \
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  && aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
   --region "$AWS_REGION" \
@@ -1095,6 +1121,7 @@ aws cloudformation deploy \
     MskEgressCidr="$HOST_SUBNET_CIDR"
     # 기본 SourceMode=git은 공개 저장소를 클론합니다(자격증명 불필요). 호스트가 저장소에
     # 닿지 못하면 추가:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
+    # (호스트는 이 계정이 소유한 버킷에서만 내려받습니다)
 ```
 
 첫 부팅은 약 3~4분: 호스트가 443으로 Python 3.12 + wheel을 설치하고,

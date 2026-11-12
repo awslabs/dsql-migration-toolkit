@@ -355,7 +355,8 @@ def test_the_dialog_probe_lists_the_statements_or_says_it_cannot():
 
 def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, backstop_raises=False,
                      exclude=False, cancel_in_overlay=False, swap_target=False,
-                     account_unreadable=False, seen=None):
+                     account_unreadable=False, template_refused=False, seen=None,
+                     deployer=None, template="T"):
     import dsql_migrator.config as _config
     import dsql_migrator.core.cdc_deployer as _dep
     import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
@@ -380,6 +381,16 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
                 )
             return "111122223333"
 
+        def preflight_template(self, body):  # stages the template before anything changes
+            order.append(("template", body))
+            if template_refused:
+                from dsql_migrator.core.cdc_stack_deployer import CdcDeployError
+
+                raise CdcDeployError(
+                    "The cdc-stack template was not staged, so the stack was not changed: S3 "
+                    "bucket 'b' is owned by another AWS account, or this identity cannot reach it."
+                )
+
     def _run(*_a, **kw):
         order.append("run_cdc_start")
         if run_raises:
@@ -387,14 +398,14 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
 
     def _build(*_a, **_k):
         order.append("deployer")
-        deployer = _Deployer()
+        built = deployer if deployer is not None else _Deployer()
         if seen is not None:
-            seen["deployer"] = deployer
-        return deployer
+            seen["deployer"] = built
+        return built
 
     monkeypatch.setattr(_dep, "build_cdc_stack_deployer", _build)
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
-    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "T")
+    monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: template)
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
 
     def _fk(*a, **k):
@@ -474,9 +485,10 @@ def test_the_overlay_runs_after_the_backstops_and_before_the_deployer(monkeypatc
     # The deployer is built (and describes the stack) BEFORE the overlay, so the
     # exclusion-set staleness refusal runs before anything changes; connectors are only
     # created by run_cdc_start, after the overlay. The account that names the template's
-    # bucket (and must own it) is read right after the deployer is built.
-    assert order == ["classify", "on_cdc_start", "submit", "fk", "deployer", "account", "overlay",
-                     "run_cdc_start", "on_cdc_start"]
+    # bucket (and must own it) is read right after the deployer is built, and the template
+    # is staged in that bucket before the overlay too.
+    assert order == ["classify", "on_cdc_start", "submit", "fk", "deployer", "account",
+                     ("template", "T"), "overlay", "run_cdc_start", "on_cdc_start"]
 
 
 def test_a_start_that_cannot_read_its_account_stops_before_anything_changes(monkeypatch):
@@ -485,9 +497,46 @@ def test_a_start_that_cannot_read_its_account_stops_before_anything_changes(monk
     # the overlay ALTERed the target and the Start failed later with "a deploy-wiring bug".
     order, error = _drive_start_cdc(monkeypatch, account_unreadable=True)
     assert isinstance(error, RuntimeError)
-    assert str(error).startswith("Start CDC blocked: Could not read this identity's AWS account ID")
+    pointer, notice = str(error).split("\n", 1)
+    assert pointer.startswith("Start CDC blocked: The AWS account of this identity could not")
+    assert "Could not read this identity's AWS account ID" in notice  # the CDC card's notice
     assert "overlay" not in order and "run_cdc_start" not in order
     assert order[-1] == "on_cdc_start"
+
+
+def test_a_start_whose_template_cannot_be_staged_stops_before_anything_changes(monkeypatch):
+    # FAILS WITHOUT THE FIX: the template was first staged inside run_cdc_start's update,
+    # after the overlay had ALTERed the target and written the ledger.
+    order, error = _drive_start_cdc(monkeypatch, template_refused=True, exclude=True)
+    assert isinstance(error, RuntimeError)
+    pointer, notice = str(error).split("\n", 1)
+    assert pointer.startswith("Start CDC blocked: The CDC template could not be staged in S3.")
+    assert "owned by another AWS account" in notice
+    assert ("template", "T") in order
+    # The overlay that ALTERs the target and writes the ledger never ran, nor did the Start.
+    assert "overlay" not in order and "run_cdc_start" not in order
+
+
+def test_a_start_against_another_accounts_bucket_changes_nothing(monkeypatch):
+    # The REAL deployer, its template (over the inline limit) and a bucket by the managed name
+    # that another account owns: refused at the preflight, before the overlay.
+    from types import SimpleNamespace as _NS
+
+    from dsql_migrator.core.cdc_stack_deployer import CdcStackDeployer
+    from tests.test_s3_bucket_owner import _BIG, OwnerCheckingS3, _foreign, _Sts
+
+    s3 = OwnerCheckingS3()
+    theirs = _foreign(s3)
+    real = CdcStackDeployer(
+        "us-east-1",
+        session=_NS(client=lambda name, region_name=None: {"s3": s3, "sts": _Sts()}[name]),
+    )
+    order, error = _drive_start_cdc(monkeypatch, deployer=real, template=_BIG, exclude=True)
+    assert isinstance(error, RuntimeError)
+    assert "mysql-dsql-migrator-plugins-111122223333-us-east-1" in str(error)
+    assert "a PutObject request" in str(error) and "s3:PutObject" in str(error)
+    assert "overlay" not in order and "run_cdc_start" not in order
+    assert s3.ops() == ["PutObject"] and theirs.objects == {} and s3.violations == []
 
 
 def test_a_start_with_overlay_columns_marks_the_ledger_in_use_before_submit(monkeypatch):

@@ -9618,20 +9618,35 @@ def _start_cdc_deploy(
         # stages it in S3 via TemplateURL, in the tool's managed bucket for the deployer's own
         # account and region (the bucket the infra deploy created). The deployer reads that
         # account once, and its upload asserts it as the bucket's owner, so a bucket another
-        # account holds under that name is refused. The template cannot be staged without the
-        # account, so a Start that cannot read it stops here, before anything changes.
+        # account holds under that name is refused. Both stop the Start HERE, before anything
+        # changes: a Start that cannot read the account, and a template that cannot be staged
+        # -- staged once now (preflight_template), ahead of the overlay below (it ALTERs the
+        # target and writes the ledger) and of run_cdc_start's Kafka prep; the update stages
+        # it again, owner-checked, right before its call. Through _start_refusal like the
+        # other worker refusals: the job keeps 300 characters, and the fix comes last.
+        from dsql_migrator.core.cdc_deployer import CdcDeployError
         from dsql_migrator.core.s3_ownership import BucketOwnershipError
         from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
 
         try:
             deployer.template_s3_bucket = _pbucket(deployer.caller_account_id(), region)
         except BucketOwnershipError as exc:
-            _log_cdc_event(
-                "start blocked: S3 bucket owner unknown",
-                status=ActivityStatus.FAILURE,
-                detail=str(exc),
-            )
-            raise RuntimeError(f"Start CDC blocked: {exc}") from exc
+            raise _start_refusal(
+                migration_state,
+                ("error", "", "The AWS account of this identity could not be read", str(exc)),
+                getattr(handle, "job_id", None),
+            ) from exc
+        template_body = _read_cdc_template_body()
+        _preflight = getattr(deployer, "preflight_template", None)
+        if callable(_preflight):
+            try:
+                _preflight(template_body)
+            except CdcDeployError as exc:
+                raise _start_refusal(
+                    migration_state,
+                    ("error", "", "The CDC template could not be staged in S3", str(exc)),
+                    getattr(handle, "job_id", None),
+                ) from exc
         # The exclusion-set staleness checks BEFORE anything changes (the overlay below
         # ALTERs the target and writes the ledger): judged against a fresh describe here,
         # and again by run_cdc_start against its own.
@@ -9662,7 +9677,6 @@ def _start_cdc_deploy(
         _apply_start_cdc_overlay(handle, **_overlay_plan)
         if getattr(handle, "cancelled", False):
             return
-        template_body = _read_cdc_template_body()
         # SeedMode is derived ENGINE-AWARE above (FIX 4): a PostgreSQL source forces
         # "external" (its stack is always SeedMode=External) so the in-process Kafka prep
         # runs; MySQL keeps the host config ("Host is the mode": the in-VPC EC2 host sets
@@ -9670,10 +9684,7 @@ def _start_cdc_deploy(
         # Recorded BEFORE the Start: if it fails after the seeder wrote this offset, a later
         # Start must not offer an earlier one (seed_refused_by_an_earlier_offer).
         migration_state.note_cdc_offered_seed(seed)
-        from dsql_migrator.core.cdc_deployer import (
-            CdcDeployError,
-            history_missing_after_failure,
-        )
+        from dsql_migrator.core.cdc_deployer import history_missing_after_failure
 
         # MySQL: a failed connector create is diagnosed from its worker log, read with the
         # APP's identity (TaskRole / instance role, which may read the connector log

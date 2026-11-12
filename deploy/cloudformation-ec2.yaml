@@ -181,10 +181,14 @@ Parameters:
   SourceS3Uri:
     Type: String
     Default: ""
+    AllowedPattern: ^(s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/.+)?$
+    ConstraintDescription: an s3://bucket/key URI, or empty
     Description: >
-      s3:// URI of the app source tarball (.tar.gz of the repo root). Required when
-      SourceMode=s3; the host runs `aws s3 cp` then extracts with --strip-components=1.
-      Ignored when SourceMode=git.
+      s3://bucket/key of the app source tarball (.tar.gz of the repo root), in a bucket
+      THIS account owns. Required when SourceMode=s3; the host downloads it with
+      `aws s3api get-object --expected-bucket-owner` (a bucket by that name in another
+      account is refused) and extracts it with --strip-components=1, and the host role may
+      read only that object. Ignored when SourceMode=git.
 
   SourceRepoUrl:
     Type: String
@@ -350,6 +354,19 @@ Rules:
           gets egress to the source database on SourceDbPort. With both empty the host
           has no route to the source DB and connections time out.
 
+  # SourceMode=s3 fetches the source from SourceS3Uri at first boot, and the host role's
+  # read grant names that object: without it the host has nothing to run.
+  SourceS3UriForS3Mode:
+    RuleCondition:
+      Fn::Equals: [Ref: SourceMode, "s3"]
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals: [Ref: SourceS3Uri, ""]
+        AssertDescription: >-
+          SourceMode=s3 needs SourceS3Uri: the s3://bucket/key of the source tarball, in a
+          bucket this account owns.
+
 Conditions:
   # SourceSecretArn is optional: set only to reuse an existing Secrets Manager
   # secret. When empty (username/password auth in the UI), the read-source-secret
@@ -386,6 +403,10 @@ Conditions:
     Fn::Not:
       - Fn::Equals: [Ref: KeyName, ""]
 
+  # SourceMode=s3: the host reads its source tarball (SourceS3Uri) at first boot.
+  UseS3Source:
+    Fn::Equals: [Ref: SourceMode, "s3"]
+
 Resources:
   # Stable secret used to sign the UI's browser-session cookie
   # (DSQL_MIGRATOR_STORAGE_SECRET). Auto-generated once and held in Secrets
@@ -414,10 +435,11 @@ Resources:
   # Host role: the app's own runtime permissions (least privilege). Identical to
   # the Fargate task role's policies (dsql-connect, read-source-secret [when a
   # source secret is reused], provision-cdc-source-secret, cdc-deploy-discovery),
-  # PLUS the two extras this EC2 mode needs: cdc-external-seed (the in-process MSK
-  # offset seed the Fargate stack delegated to an in-VPC seeder Lambda) and
+  # PLUS the extras this EC2 mode needs: cdc-external-seed (the in-process MSK
+  # offset seed the Fargate stack delegated to an in-VPC seeder Lambda),
   # read-storage-secret (user-data fetches the cookie secret itself, since there is
-  # no ECS execution role to inject it). Trust is ec2.amazonaws.com (via the
+  # no ECS execution role to inject it) and, with SourceMode=s3, read-source-tarball
+  # (user-data downloads the app source). Trust is ec2.amazonaws.com (via the
   # instance profile) instead of ecs-tasks.amazonaws.com.
   HostRole:
     Type: AWS::IAM::Role
@@ -473,6 +495,30 @@ Resources:
                     Action: secretsmanager:GetSecretValue
                     Resource:
                       Ref: SourceSecretArn
+            - Ref: AWS::NoValue
+        # SourceMode=s3 only: read the one source tarball the startup script downloads
+        # (SourceS3Uri). The download asserts that this account owns its bucket; the
+        # resource is that object alone.
+        - Fn::If:
+            - UseS3Source
+            - PolicyName: read-source-tarball
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Sid: GetSourceTarball
+                    Effect: Allow
+                    Action: s3:GetObject
+                    Resource:
+                      Fn::Sub:
+                        - arn:${AWS::Partition}:s3:::${SourceObject}
+                        # s3://bucket/key -> bucket/key. The trailing "s3://" keeps index
+                        # 1 present for any value, so the split never fails to resolve.
+                        - SourceObject:
+                            Fn::Select:
+                              - 1
+                              - Fn::Split:
+                                  - "s3://"
+                                  - Fn::Join: ["", [Ref: SourceS3Uri, "s3://"]]
             - Ref: AWS::NoValue
         - PolicyName: provision-cdc-source-secret
           PolicyDocument:
@@ -1358,7 +1404,14 @@ Resources:
             install -d -o dsqlapp -g dsqlapp -m 0755 /opt/dsql-migrator
             SOURCE_MODE="${SourceMode}"
             if [ "${!SOURCE_MODE}" = "s3" ]; then
-              aws s3 cp "${SourceS3Uri}" /tmp/dsql-src.tar.gz --region ${AWS::Region}
+              # s3api get-object, not `aws s3 cp`: it asserts that THIS account owns the
+              # bucket (--expected-bucket-owner), so a bucket by that name in another
+              # account answers 403 and its tarball never runs here as root.
+              SRC_PATH="${SourceS3Uri}"
+              SRC_PATH="${!SRC_PATH#s3://}"
+              aws s3api get-object --region ${AWS::Region} \
+                --bucket "${!SRC_PATH%%/*}" --key "${!SRC_PATH#*/}" \
+                --expected-bucket-owner ${AWS::AccountId} /tmp/dsql-src.tar.gz
               tar -xzf /tmp/dsql-src.tar.gz -C /opt/dsql-migrator --strip-components=1
               chown -R dsqlapp:dsqlapp /opt/dsql-migrator
             else

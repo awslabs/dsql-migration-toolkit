@@ -32,7 +32,9 @@ import io
 import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,15 +82,23 @@ _SRC = Path(__file__).resolve().parents[1] / "src" / "dsql_migrator"
 # ---------------------------------------------------------------------------
 
 
-def _error(operation: str, code: str, status: int) -> ClientError:
+def _error(operation: str, code: str, status: int, message: str = "") -> ClientError:
     """A botocore ClientError as S3 sends it (a HEAD has no body: its code is the status)."""
     return ClientError(
         {
-            "Error": {"Code": code, "Message": code},
+            "Error": {"Code": code, "Message": message or code},
             "ResponseMetadata": {"HTTPStatusCode": status},
         },
         operation,
     )
+
+
+# The IAM action each S3 operation the tool sends is authorized by.
+_ACTIONS = {
+    "HeadBucket": "s3:ListBucket", "ListObjectsV2": "s3:ListBucket",
+    "HeadObject": "s3:GetObject", "GetObject": "s3:GetObject",
+    "PutObject": "s3:PutObject", "DeleteObject": "s3:DeleteObject",
+}
 
 
 class _Bucket:
@@ -142,6 +152,8 @@ class OwnerCheckingS3:
         # CreateBucket answers BucketAlreadyOwnedByYou yet HeadBucket answers 403 (an
         # identity that may create the bucket but not list it).
         self.head_denied = False
+        # Operations this identity's IAM policy denies, in a bucket it owns too (403).
+        self.iam_denied: set[str] = set()
 
     # -- set-up ---------------------------------------------------------------
     def bucket(self, name: str, owner: Optional[str] = None, **kw) -> _Bucket:
@@ -165,6 +177,16 @@ class OwnerCheckingS3:
         )
         if denied or (head and self.head_denied and operation == "HeadBucket"):
             raise _error(operation, "403" if head else "AccessDenied", 403)
+        if operation in self.iam_denied:
+            action = _ACTIONS[operation]
+            raise _error(
+                operation, "403" if head else "AccessDenied", 403,
+                "" if head else (
+                    f"User: arn:aws:sts::{self.caller}:assumed-role/app/task is not authorized "
+                    f"to perform: {action} because no identity-based policy allows the "
+                    f"{action} action"
+                ),
+            )
         return bucket
 
     # -- the S3 API the tool uses --------------------------------------------
@@ -231,8 +253,13 @@ class ManagedOwnerCheckingS3(OwnerCheckingS3):
     ExtraArgs), so upload_plugin takes its managed-upload path."""
 
     def upload_file(self, Filename, Bucket, Key, ExtraArgs=None, Config=None):  # noqa: N803
+        from boto3.exceptions import S3UploadFailedError
+
         params = {"Bucket": Bucket, "Key": Key, **(ExtraArgs or {})}
-        bucket = self._reach("PutObject", params)
+        try:
+            bucket = self._reach("PutObject", params)
+        except ClientError as exc:  # as boto3 reports a failed managed upload
+            raise S3UploadFailedError(f"Failed to upload {Filename} to {Bucket}/{Key}: {exc}")
         bucket.objects.pop(Key, None)
         bucket.objects[Key] = (Path(Filename).read_bytes(), dict(params.get("Metadata") or {}))
 
@@ -852,6 +879,176 @@ def test_a_small_template_needs_no_bucket_and_no_account() -> None:
     assert s3.calls == []
 
 
+def test_the_template_preflight_stages_it_once_and_the_update_stages_it_again() -> None:
+    # Start CDC stages the template before it changes anything (preflight_template); the
+    # update stages it again, owner-checked, right before UpdateStack.
+    s3 = OwnerCheckingS3()
+    s3.bucket(_BUCKET)
+    deployer, cfn = _deployer(s3)
+    deployer.preflight_template(None)  # UsePreviousTemplate: nothing to stage
+    deployer.preflight_template("small")  # sent inline: no bucket needed
+    assert s3.calls == []
+    deployer.preflight_template(_BIG)
+    deployer.preflight_template(_BIG)  # this deployer staged one there: not again
+    assert s3.ops() == ["PutObject"]
+    deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
+    assert s3.ops() == ["PutObject", "PutObject"] and "update_stack" in cfn.calls
+    assert s3.violations == []
+
+
+def test_a_template_preflight_in_another_accounts_bucket_is_the_refusal() -> None:
+    s3 = OwnerCheckingS3()
+    theirs = _foreign(s3)
+    deployer, cfn = _deployer(s3)
+    for _ in range(2):  # a refusal confirms nothing: the next preflight tries again
+        with pytest.raises(CdcDeployError) as exc:
+            deployer.preflight_template(_BIG)
+        _assert_refusal(str(exc.value))
+    assert s3.ops() == ["PutObject", "PutObject"]
+    assert theirs.objects == {} and cfn.calls == [] and s3.violations == []
+
+
+@pytest.mark.parametrize("seed_mode", ["lambda", "external"])
+def test_start_cdc_refuses_another_accounts_template_bucket_before_the_kafka_prep(
+    seed_mode: str,
+) -> None:
+    # FAILS WITHOUT THE FIX: the template was first staged in submit_update, after the
+    # in-process Kafka prep (SeedMode=External: EC2 hosts, every PostgreSQL source) had
+    # created the topics and seeded connect-offsets. run_cdc_start now stages it while it
+    # validates, before anything changes.
+    from dsql_migrator.core.cdc import (
+        DebeziumSourceConfig,
+        SinkConnectorConfig,
+        build_cdc_stack_params,
+    )
+    from dsql_migrator.core.cdc_deployer import run_cdc_start
+    from tests import test_g25_s3_deploy as g25
+
+    cfn = g25._FakeCfn(g25._deployed("mysql", "content"))
+    s3 = OwnerCheckingS3(caller=g25._ACCOUNT)
+    theirs = s3.bucket(g25._BUCKET, _THEM, lets_me_in=True)
+    session = g25._FakeSession(cfn)
+    session._clients.update({"s3": s3, "sts": _Sts(g25._ACCOUNT)})
+    deployer = CdcStackDeployer(g25._REGION, session=session)
+    deployer.template_s3_bucket = g25._BUCKET
+    params = build_cdc_stack_params(
+        DebeziumSourceConfig(name="mysql-source", table_include_list=["shop.orders"]),
+        SinkConnectorConfig(name="mysql-sink", topics=["shop.orders"], dlq_topic="dsql-sink-dlq"),
+        target_endpoint="c.dsql.us-east-1.on.aws",
+        stack_name=g25._STACK,
+    )
+    seeded: list = []
+    handle = g25._Handle()
+    with pytest.raises(CdcDeployError) as exc:
+        run_cdc_start(
+            handle, stack_name=g25._STACK, params=params, deployer=deployer,
+            on_log=lambda _ts, _msg: None, template_body=_BIG, seed_mode=seed_mode,
+            seed_fn=lambda *a, **k: seeded.append(k) or "seeded",
+            connector_timeout_seconds=5.0, poll_interval_seconds=0.0, sleep=lambda _s: None,
+        )
+    _assert_refusal(str(exc.value), g25._BUCKET)
+    assert seeded == [] and cfn.updates == [] and theirs.objects == {}
+    assert s3.ops() == ["PutObject"] and s3.violations == []
+    # Stopped while validating: the bootstrap brokers were never even read.
+    stages = {c.chunk_id: str(c.status) for c in handle.job.chunks}
+    assert stages["validate_params"] == "IN_PROGRESS" and stages["fetch_bootstrap"] == "PENDING"
+
+
+# ---------------------------------------------------------------------------
+# What a refusal says, and a 403 on a bucket this account is shown to own
+# ---------------------------------------------------------------------------
+
+
+def test_a_refusal_names_the_refused_request_its_permission_and_s3s_answer(
+    tmp_path: Path,
+) -> None:
+    # FAILS WITHOUT THE FIX: every refusal pointed at "HeadBucket needs s3:ListBucket" and
+    # dropped S3's own error -- Start CDC's included, whose CdcDeployRole has no
+    # s3:ListBucket (its owner check is the template's PutObject).
+    s3 = OwnerCheckingS3()
+    _foreign(s3)
+    deployer, _cfn = _deployer(s3)
+    with pytest.raises(CdcDeployError) as staged:
+        deployer.preflight_template(_BIG)
+    with pytest.raises(S3ProvisionError) as ensured:
+        ensure_plugin_bucket(s3, _ME, _REGION)
+    managed = ManagedOwnerCheckingS3()
+    _foreign(managed)
+    artifact = tmp_path / "a.zip"
+    artifact.write_bytes(b"x")
+    with pytest.raises(S3ProvisionError) as uploaded:
+        upload_plugin(managed, _BUCKET, "cdc-plugins/0/a.zip", artifact, expected_owner=_ME)
+    for text, operation, permission in (
+        (str(staged.value), "PutObject", "s3:PutObject"),
+        (str(ensured.value), "HeadBucket", "s3:ListBucket"),
+        (str(uploaded.value), "PutObject", "s3:PutObject"),  # s3transfer's wrapped error
+    ):
+        _assert_refusal(text)
+        assert f"a {operation} request" in text, text
+        assert f"allows {permission} on it" in text, text
+        assert f"when calling the {operation} operation" in text, text  # S3's answer
+        assert "Versions of the tool before this check" in text, text
+    assert "s3:ListBucket" not in str(staged.value)
+
+
+@pytest.mark.parametrize("operation", ["PutObject", "GetObject", "DeleteObject"])
+def test_a_403_on_a_bucket_this_account_is_shown_to_own_is_not_another_accounts(
+    operation: str, caplog
+) -> None:
+    # FAILS WITHOUT THE FIX: once the owner-checked HeadBucket had shown the bucket is this
+    # account's, a 403 (IAM, a KMS key policy, an SCP) was still logged at ERROR as the
+    # ownership refusal, kept in bucket_refusal and told the operator to delete the bucket.
+    s3 = OwnerCheckingS3()
+    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    jobs.save(_job("j1"), None)  # creates the bucket and shows it is this account's
+    sessions.save(SessionSnapshot(session_id="s1"))
+    s3.iam_denied = {operation}
+    with caplog.at_level(logging.WARNING):
+        jobs.save(_job("j1", "DONE"), None)
+        jobs.delete("j9")
+        if operation == "GetObject":
+            assert sessions.load("s1") is None  # unreadable: nothing restored
+        sessions.save(SessionSnapshot(session_id="s2"))
+        sessions.delete("s2")
+    assert jobs.bucket_refusal is None and sessions.bucket_refusal is None
+    records = [r for r in caplog.records if r.name.startswith("dsql_migrator.core")]
+    assert records and all(r.levelno == logging.WARNING for r in records)
+    assert not [r for r in records if "another AWS account" in r.getMessage()]
+    assert any("AccessDenied" in (r.exc_text or "") for r in records)  # S3's own answer
+    assert s3.violations == []
+
+
+def test_a_confirmed_buckets_403_is_reported_as_it_is_by_the_ledger_and_deployer() -> None:
+    s3 = OwnerCheckingS3()
+    s3.bucket(_BUCKET)
+    ledger = S3OverlayLedger(_BUCKET, s3_client=s3, sts_client=_Sts(), sleep=lambda _s: None)
+    ledger.put_tables("k", {"shop.docs": _ledger_record()})  # the PUT shows it is ours
+    deployer, cfn = _deployer(s3)
+    deployer.preflight_template(_BIG)
+    s3.iam_denied = {"GetObject", "PutObject"}
+    read = ledger.read("k")
+    assert read.status == "unreadable"
+    assert "AccessDenied" in (read.error or "") and "another AWS account" not in read.error
+    with pytest.raises(CdcDeployError) as exc:
+        deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
+    assert "could not upload it to S3 bucket" in str(exc.value)
+    assert "AccessDenied" in str(exc.value) and "another AWS account" not in str(exc.value)
+    assert "update_stack" not in cfn.calls
+
+
+def test_the_plugin_uploads_after_the_bucket_is_confirmed_report_a_403_as_it_is(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _artifacts(tmp_path, monkeypatch)
+    s3 = OwnerCheckingS3()
+    s3.iam_denied = {"PutObject"}
+    with pytest.raises(S3ProvisionError) as exc:
+        ensure_and_upload_plugins(s3, _Sts(), _REGION)
+    assert str(exc.value).startswith("Failed to upload cdc-plugins/"), exc.value
+    assert "AccessDenied" in str(exc.value) and "another AWS account" not in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # Job state (Fargate: DSQL_MIGRATOR_JOB_STATE_BUCKET is the managed bucket's name)
 # ---------------------------------------------------------------------------
@@ -1085,10 +1282,11 @@ _GUIDES = ("DEPLOYMENT.md", "DEPLOYMENT.ko.md", "DEPLOYMENT.ja.md")
 _TEMPLATE_OWNER_CHECK = (
     'aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"'
 )
+_REPO = _SRC.parents[1]
 
 
 def _guide(name: str) -> str:
-    return (_SRC.parents[1] / "deploy" / name).read_text(encoding="utf-8")
+    return (_REPO / "deploy" / name).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("name", _GUIDES)
@@ -1106,26 +1304,242 @@ def test_the_guides_template_bucket_is_unpredictable_and_owner_checked(name: str
     assert set(names) == {"mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)"}
     # At most 63 characters, S3's limit: 30 + a 12-digit account + 1 + 8 hex digits.
     assert len("mysql-dsql-migrator-templates-") + 12 + 1 + 8 <= 63
-    # Every deploy from the bucket has an owner check of its own before it.
-    deploys = [m.start() for m in re.finditer(r'--s3-bucket "\$TEMPLATE_BUCKET"', text)]
-    checks = [m.start() for m in re.finditer(re.escape(_TEMPLATE_OWNER_CHECK), text)]
-    assert len(deploys) == 3, name  # the app stack, its image update, the EC2 stack
-    previous = 0
-    for at in deploys:
-        assert any(previous < check < at for check in checks), (name, at)
-        previous = at
+    # Every deploy from the bucket is chained to an owner check of its own (what that does
+    # when the check fails: test_every_deploy_and_teardown_runs_only_after_its_owner_check).
+    chained = f"{_TEMPLATE_OWNER_CHECK} \\\n  && aws cloudformation deploy"
+    deploys = re.findall(r'--s3-bucket "\$TEMPLATE_BUCKET"', text)
+    # The app stack, its image update, its AI-assist redeploy and the EC2 stack.
+    assert len(deploys) == 4, name
+    assert text.count(chained) == 4, name
     # The coding-agent prompts ask for the same.
     flat = " ".join(text.split())
     assert flat.count("aws s3api head-bucket --expected-bucket-owner") == 2, name
+    # ...and the operator who still has the old guide's predictable bucket is told what to do.
+    assert text.count("mysql-dsql-migrator-templates-<account>-<region>") == 2, name
 
 
 @pytest.mark.parametrize("name", _GUIDES)
 def test_the_owner_checked_commands_are_ones_the_cli_has(name: str) -> None:
-    # `aws s3 mb`, `aws s3 rb` and `aws cloudformation deploy` take no expected owner, so the
-    # check is s3api's head-bucket; no guide passes the option to a command without it.
+    # `aws s3 mb`, `aws s3 rb`, `aws s3 cp` and `aws cloudformation deploy` take no expected
+    # owner, so the check is an s3api command that does (head-bucket; get-object, the EC2
+    # host's source download); no guide passes the option to a command without it.
     text = _guide(name)
     uses = [m.start() for m in re.finditer("--expected-bucket-owner", text)]
-    assert len(uses) >= 7, (name, len(uses))
+    assert len(uses) >= 10, (name, len(uses))
     for at in uses:
         command = text[text.rindex("aws ", 0, at):at]
-        assert command.startswith("aws s3api head-bucket"), (name, command)
+        assert command.startswith(("aws s3api head-bucket", "aws s3api get-object")), (
+            name, command
+        )
+
+
+# What a pasted guide command runs: bash, with no `set -e` (as an interactive paste), and a
+# stub `aws` whose owner check fails or passes. Nothing else is on PATH, so nothing real runs.
+_FENCED_BASH = re.compile(r"^```bash\n(.*?)^```$", re.M | re.S)
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_STUB_AWS = r"""#!/bin/sh
+{ printf 'aws'; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+case "$1 $2" in
+  "sts get-caller-identity") echo "$STUB_ACCOUNT" ;;
+  "s3api head-bucket")
+    if [ "$STUB_OWNER_OK" != 1 ]; then
+      echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2
+      exit 254
+    fi ;;
+esac
+exit 0
+"""
+
+
+def _stub_bin(tmp_path: Path, scripts: dict[str, str]) -> Path:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, body in scripts.items():
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    return bin_dir
+
+
+def _logging_stub(name: str, output: str = "") -> str:
+    """A stub command that records its arguments and prints ``output``."""
+    return (
+        "#!/bin/sh\n"
+        f"{{ printf '{name}'; for a in \"$@\"; do printf '\\t%s' \"$a\"; done; printf '\\n'; }}"
+        ' >> "$STUB_LOG"\n'
+        + (f"echo {output}\n" if output else "")
+    )
+
+
+def _paste(tmp_path: Path, command: str, *, owner_ok: bool) -> list[list[str]]:
+    """Run ``command`` as a pasted guide block; the stub commands it called, with their
+    arguments."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir = _stub_bin(tmp_path, {
+        "aws": _STUB_AWS,
+        "docker": _logging_stub("docker"),
+        "openssl": _logging_stub("openssl", "1a2b3c4d"),
+    })
+    log = tmp_path / "calls.log"
+    log.write_text("")
+    env = {
+        "PATH": str(bin_dir), "HOME": str(tmp_path), "STUB_LOG": str(log),
+        "STUB_OWNER_OK": "1" if owner_ok else "0", "STUB_ACCOUNT": _ME,
+        "ACCOUNT": _ME, "AWS_REGION": _REGION, "ECR_REPO": "mysql-dsql-migrator",
+        "TEMPLATE_BUCKET": f"mysql-dsql-migrator-templates-{_ME}-1a2b3c4d",
+    }
+    subprocess.run(
+        [bash, "--noprofile", "--norc"], input=command, env=env, capture_output=True,
+        text=True, timeout=60, check=False,
+    )
+    return [line.split("\t") for line in log.read_text().splitlines()]
+
+
+def _arg(call: list[str], flag: str) -> str:
+    return call[call.index(flag) + 1]
+
+
+def _gated_commands(text: str) -> tuple[list[str], list[str]]:
+    """The guide's commands that deploy from a bucket (fenced blocks with
+    ``aws cloudformation deploy --s3-bucket``) and that delete one (``aws s3 rb``, fenced
+    or inline)."""
+    blocks = _FENCED_BASH.findall(text)
+    deploys = [b for b in blocks if "aws cloudformation deploy" in b and "--s3-bucket" in b]
+    deletes = [b for b in blocks if "aws s3 rb" in b]
+    deletes += [c for c in _INLINE_CODE.findall(text) if "aws s3 rb " in c and "&&" in c]
+    return deploys, deletes
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("name", [*_GUIDES, "cdc-stack/README.md"])
+def test_every_deploy_and_teardown_runs_only_after_its_owner_check(
+    name: str, tmp_path: Path
+) -> None:
+    # FAILS WITHOUT THE FIX: the image update kept the check and the deploy in one block,
+    # with only a comment between them, so a pasted block deployed after a 403; the AI-assist
+    # redeploy and the cdc-stack README's manual deploy had no check at all. Each command now
+    # runs as pasted: the owner check fails -> nothing is deployed or deleted; it passes ->
+    # the deploy or delete runs, against the very bucket the check named.
+    text = _guide(name)
+    deploys, deletes = _gated_commands(text)
+    assert (len(deploys), len(deletes)) == ((1, 0) if name.startswith("cdc-stack") else (4, 2))
+    for command in deploys + deletes:
+        acts = ("cloudformation", "deploy") if command in deploys else ("s3", "rb")
+        refused = _paste(tmp_path, command, owner_ok=False)
+        checks = [c for c in refused if c[1:3] == ["s3api", "head-bucket"]]
+        assert checks and all(
+            _arg(c, "--expected-bucket-owner") in (_ME, "<account>") for c in checks
+        ), command
+        assert not [c for c in refused if tuple(c[1:3]) == acts], command
+        ran = [c for c in _paste(tmp_path, command, owner_ok=True) if tuple(c[1:3]) == acts]
+        assert len(ran) == 1, command
+        target = _arg(ran[0], "--s3-bucket") if acts[0] == "cloudformation" else ran[0][3]
+        assert target.removeprefix("s3://") == _arg(checks[-1], "--bucket"), command
+
+
+# ---------------------------------------------------------------------------
+# The single EC2 host's source download (SourceMode=s3)
+# ---------------------------------------------------------------------------
+
+_SOURCE_URI = "s3://my-src-bucket/builds/2026/dsql-src.tar.gz"
+
+
+def _fn_sub(text: str, values: dict[str, str]) -> str:
+    """CloudFormation's Fn::Sub: ``${Name}`` is the value, ``${!Literal}`` is ``${Literal}``."""
+    return re.sub(r"\$\{(?!!)([^}]+)\}", lambda m: values[m.group(1)], text).replace("${!", "${")
+
+
+def _source_fetch_script() -> str:
+    """The user data's SourceMode branch, as the host runs it (rendered, under set -e)."""
+    from tests.test_ec2_appstack import _user_data
+
+    script = _user_data()
+    start = script.index('SOURCE_MODE="${SourceMode}"')
+    branch = script[start:script.index("\nfi\n", start) + len("\nfi\n")]
+    return "set -euo pipefail\n" + _fn_sub(branch, {
+        "SourceMode": "s3", "SourceS3Uri": _SOURCE_URI, "AWS::Region": _REGION,
+        "AWS::AccountId": _ME, "SourceRepoRef": "main", "SourceRepoUrl": "https://example.invalid/r.git",
+    })
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("owner_ok", [True, False])
+def test_the_ec2_host_downloads_its_source_only_from_a_bucket_this_account_owns(
+    owner_ok: bool, tmp_path: Path
+) -> None:
+    # FAILS WITHOUT THE FIX: the user data ran `aws s3 cp "${SourceS3Uri}"`, which cannot
+    # assert an owner, and then ran the tarball as root -- from a bucket by that name in
+    # another account too. It is now one s3api get-object that names this account as the
+    # bucket's owner; when S3 refuses it (403), set -e stops the script before tar.
+    get_object = (
+        "#!/bin/sh\n"
+        "{ printf 'aws'; for a in \"$@\"; do printf '\\t%s' \"$a\"; done; printf '\\n'; }"
+        ' >> "$STUB_LOG"\n'
+        f"[ {1 if owner_ok else 0} = 1 ] || exit 254\n"
+    )
+    bin_dir = _stub_bin(tmp_path, {
+        "aws": get_object, "tar": _logging_stub("tar"), "chown": _logging_stub("chown"),
+        "sudo": _logging_stub("sudo"),
+    })
+    log = tmp_path / "calls.log"
+    log.write_text("")
+    done = subprocess.run(
+        [shutil.which("bash"), "--noprofile", "--norc"], input=_source_fetch_script(),
+        env={"PATH": str(bin_dir), "HOME": str(tmp_path), "STUB_LOG": str(log)},
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    calls = [line.split("\t") for line in log.read_text().splitlines()]
+    assert calls[0] == [
+        "aws", "s3api", "get-object", "--region", _REGION,
+        "--bucket", "my-src-bucket", "--key", "builds/2026/dsql-src.tar.gz",
+        "--expected-bucket-owner", _ME, "/tmp/dsql-src.tar.gz",
+    ]
+    if owner_ok:
+        assert done.returncode == 0, done.stderr
+        assert [c[0] for c in calls] == ["aws", "tar", "chown"]
+    else:
+        assert done.returncode != 0
+        assert [c[0] for c in calls] == ["aws"]  # nothing extracted, nothing run
+
+
+def test_the_ec2_host_role_may_read_only_the_source_tarball() -> None:
+    # The guide's SourceMode=s3 example (s3://$TEMPLATE_BUCKET/...) was denied: the host
+    # role's only S3 read was the plugin bucket. With SourceMode=s3 it may now read the one
+    # object SourceS3Uri names (and nothing with SourceMode=git); the download asserts that
+    # this account owns its bucket.
+    from tests.test_ec2_appstack import _load, _user_data
+
+    doc = _load()
+    # No high-level `aws s3` command (cp, sync, ...) is left: none can assert an owner.
+    commands = [line for line in _user_data().splitlines() if not line.strip().startswith("#")]
+    assert not [line for line in commands if re.search(r"\baws s3 ", line)]
+    assert doc["Conditions"]["UseS3Source"] == {"Fn::Equals": [{"Ref": "SourceMode"}, "s3"]}
+    (grant,) = [
+        p["Fn::If"] for p in doc["Resources"]["HostRole"]["Properties"]["Policies"]
+        if isinstance(p, dict) and "Fn::If" in p and p["Fn::If"][0] == "UseS3Source"
+    ]
+    assert grant[2] == {"Ref": "AWS::NoValue"}
+    assert grant[1]["PolicyName"] == "read-source-tarball"
+    (statement,) = grant[1]["PolicyDocument"]["Statement"]
+    assert statement["Effect"] == "Allow" and statement["Action"] == "s3:GetObject"
+    template, variables = statement["Resource"]["Fn::Sub"]
+    assert template == "arn:${AWS::Partition}:s3:::${SourceObject}"
+    index, (delimiter, joined) = (
+        variables["SourceObject"]["Fn::Select"][0],
+        variables["SourceObject"]["Fn::Select"][1]["Fn::Split"],
+    )
+    assert joined == {"Fn::Join": ["", [{"Ref": "SourceS3Uri"}, "s3://"]]}
+
+    def resolve(uri: str) -> str:  # Fn::Select / Fn::Split / Fn::Join, as CloudFormation
+        return (uri + "s3://").split(delimiter)[index]
+
+    assert resolve(_SOURCE_URI) == "my-src-bucket/builds/2026/dsql-src.tar.gz"
+    assert resolve("") == ""  # resolves for SourceMode=git's empty default too
+    # A SourceMode=s3 deploy needs a URI, of that shape.
+    rule = doc["Rules"]["SourceS3UriForS3Mode"]
+    assert rule["RuleCondition"] == {"Fn::Equals": [{"Ref": "SourceMode"}, "s3"]}
+    pattern = doc["Parameters"]["SourceS3Uri"]["AllowedPattern"]
+    for ok in ("", _SOURCE_URI, "s3://a.b-c/k"):
+        assert re.fullmatch(pattern, ok), ok
+    for bad in ("s3://bucket", "s3://bucket/", "https://bucket/k", "s3://Bucket/k", "bucket/k"):
+        assert not re.fullmatch(pattern, bad), bad
