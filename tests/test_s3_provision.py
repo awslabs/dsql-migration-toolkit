@@ -22,39 +22,61 @@ from dsql_migrator.core.s3_provision import (
 )
 
 
+_ACCOUNT = "123456789012"
+
+
 class _FakeS3:
-    def __init__(self, *, bucket_exists=False, head_object=None, fail_create=None):
+    """Every request but CreateBucket must assert ``_ACCOUNT`` as the bucket's owner (the
+    bucket is this account's); one that does not fails, as S3 refuses it."""
+
+    def __init__(self, *, bucket_exists=False, head_object=None, fail_create=None, foreign=False):
         self._bucket_exists = bucket_exists
         self._head_object = head_object
         self._fail_create = fail_create
+        self._foreign = foreign  # the bucket by this name is another account's
         self.calls: list[tuple[str, dict]] = []
 
+    def _owner_checked(self, op: str, kw: dict) -> None:
+        self.calls.append((op, kw))
+        if kw.get("ExpectedBucketOwner") != _ACCOUNT:
+            raise RuntimeError(f"AccessDenied: {op} without this account as the expected owner")
+        if self._foreign:
+            raise RuntimeError("403 Forbidden")  # what S3 answers when the owner differs
+
     def head_bucket(self, **kw):
-        self.calls.append(("head_bucket", kw))
+        self._owner_checked("head_bucket", kw)
         if not self._bucket_exists:
             raise RuntimeError("404 Not Found")
         return {}
 
     def create_bucket(self, **kw):
         self.calls.append(("create_bucket", kw))
+        if self._fail_create and "BucketAlreadyOwnedByYou" not in self._fail_create:
+            raise RuntimeError(self._fail_create)
+        self._bucket_exists = True  # created now, or ours already
         if self._fail_create:
             raise RuntimeError(self._fail_create)
         return {}
 
     def head_object(self, **kw):
-        self.calls.append(("head_object", kw))
+        self._owner_checked("head_object", kw)
         if self._head_object is None:
             raise RuntimeError("404")
         return self._head_object
 
     def put_object(self, **kw):
-        self.calls.append(("put_object", kw))
+        self._owner_checked("put_object", kw)
         return {}
 
 
 class _FakeSts:
     def get_caller_identity(self):
-        return {"Account": "123456789012"}
+        return {"Account": _ACCOUNT}
+
+
+def _upload(s3, *args, **kwargs) -> None:
+    """upload_plugin into a bucket this account owns."""
+    upload_plugin(s3, *args, expected_owner=_ACCOUNT, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -80,35 +102,56 @@ def test_get_account_id() -> None:
 
 def test_ensure_bucket_noop_when_exists() -> None:
     s3 = _FakeS3(bucket_exists=True)
-    name = ensure_plugin_bucket(s3, "1", "us-east-1")
-    assert name == "mysql-dsql-migrator-plugins-1-us-east-1"
+    name = ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
+    assert name == f"mysql-dsql-migrator-plugins-{_ACCOUNT}-us-east-1"
     assert not any(c[0] == "create_bucket" for c in s3.calls)
+    # The probe asserted this account as the owner: a 200 now means it is ours.
+    assert s3.calls == [("head_bucket", {"Bucket": name, "ExpectedBucketOwner": _ACCOUNT})]
 
 
 def test_ensure_bucket_creates_when_absent_us_east_1() -> None:
     s3 = _FakeS3(bucket_exists=False)
-    ensure_plugin_bucket(s3, "1", "us-east-1")
+    ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
     create = next(c for c in s3.calls if c[0] == "create_bucket")
     assert "CreateBucketConfiguration" not in create[1]
+    # ...and checked again, as this account's, once created.
+    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket", "head_bucket"]
 
 
 def test_ensure_bucket_creates_with_constraint_other_region() -> None:
     s3 = _FakeS3(bucket_exists=False)
-    ensure_plugin_bucket(s3, "1", "eu-west-1")
+    ensure_plugin_bucket(s3, _ACCOUNT, "eu-west-1")
     create = next(c for c in s3.calls if c[0] == "create_bucket")
     assert create[1]["CreateBucketConfiguration"]["LocationConstraint"] == "eu-west-1"
 
 
 def test_ensure_bucket_already_owned_is_ok() -> None:
     s3 = _FakeS3(bucket_exists=False, fail_create="BucketAlreadyOwnedByYou: x")
-    assert ensure_plugin_bucket(s3, "1", "us-east-1").startswith("mysql-dsql-migrator-plugins")
+    assert ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1").startswith(
+        "mysql-dsql-migrator-plugins"
+    )
+    # Ours, and still shown to be ours by the owner-checked HeadBucket after it.
+    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket", "head_bucket"]
 
 
 def test_ensure_bucket_other_account_raises() -> None:
+    # BucketAlreadyExists is a hard error, never an adoption: the name is another account's.
     s3 = _FakeS3(bucket_exists=False, fail_create="BucketAlreadyExists: taken")
     with pytest.raises(S3ProvisionError) as exc:
-        ensure_plugin_bucket(s3, "1", "us-east-1")
-    assert "another account" in str(exc.value)
+        ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
+    assert "already exists in another AWS account" in str(exc.value)
+    assert "AWS Support" in str(exc.value)
+    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket"]
+
+
+def test_ensure_bucket_owned_by_another_account_is_refused_not_adopted() -> None:
+    # FAILS WITHOUT THE FIX: a HeadBucket that answered 200 returned the bucket, whoever owned
+    # it. With this account asserted as the owner, another account's bucket answers 403.
+    s3 = _FakeS3(bucket_exists=True, foreign=True)
+    with pytest.raises(S3ProvisionError) as exc:
+        ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
+    assert "owned by another AWS account" in str(exc.value)
+    assert [c[0] for c in s3.calls] == ["head_bucket"]  # no create is tried
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +172,7 @@ def test_upload_skips_when_size_and_etag_match(tmp_path: Path) -> None:
     # digest is the protocol, not a security primitive.
     etag = hashlib.md5(data, usedforsecurity=False).hexdigest()  # noqa: S324
     s3 = _FakeS3(head_object={"ContentLength": len(data), "ETag": f'"{etag}"'})
-    upload_plugin(s3, "b", "k", p)
+    _upload(s3, "b", "k", p)
     assert not any(c[0] == "put_object" for c in s3.calls)
 
 
@@ -158,7 +201,7 @@ def test_a_same_size_multipart_object_with_other_content_is_uploaded(tmp_path: P
         }
     )
     logs: list[str] = []
-    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    _upload(s3, "b", "k", p, on_progress=logs.append)
     puts = _puts(s3)
     assert len(puts) == 1
     assert puts[0]["Metadata"] == {"sha256": _sha256(data)}
@@ -171,7 +214,7 @@ def test_a_same_size_object_without_the_hash_is_uploaded_once(tmp_path: Path) ->
     data = b"x" * 100
     p = _write(tmp_path, data)
     legacy = _FakeS3(head_object={"ContentLength": 100, "ETag": '"abc-3"'})
-    upload_plugin(legacy, "b", "k", p)
+    _upload(legacy, "b", "k", p)
     puts = _puts(legacy)
     assert len(puts) == 1
     assert puts[0]["Metadata"] == {"sha256": _sha256(data)}
@@ -184,7 +227,7 @@ def test_a_same_size_object_without_the_hash_is_uploaded_once(tmp_path: Path) ->
         }
     )
     logs: list[str] = []
-    upload_plugin(stamped, "b", "k", p, on_progress=logs.append)
+    _upload(stamped, "b", "k", p, on_progress=logs.append)
     assert _puts(stamped) == []
     assert logs == [_SKIP_LOG]
 
@@ -198,14 +241,14 @@ def test_the_hash_covers_every_byte_of_a_multi_chunk_artifact(tmp_path: Path) ->
     mib = 1024 * 1024
     old = b"x" * mib + b"old tail"
     first = _FakeS3(head_object=None)
-    upload_plugin(first, "b", "k", _write(tmp_path, old))
+    _upload(first, "b", "k", _write(tmp_path, old))
     (stamp,) = [put["Metadata"] for put in _puts(first)]
     assert stamp == {"sha256": _sha256(old)}
 
     new = b"x" * mib + b"new tail"  # the rebuild: same size, same first MiB
     s3 = _FakeS3(head_object={"ContentLength": len(new), "ETag": '"abc-2"', "Metadata": stamp})
     logs: list[str] = []
-    upload_plugin(s3, "b", "k", _write(tmp_path, new), on_progress=logs.append)
+    _upload(s3, "b", "k", _write(tmp_path, new), on_progress=logs.append)
     puts = _puts(s3)
     assert len(puts) == 1
     assert puts[0]["Metadata"] == {"sha256": _sha256(new)}
@@ -223,7 +266,7 @@ def test_upload_skips_when_size_and_stored_sha256_match(tmp_path: Path) -> None:
         }
     )
     logs: list[str] = []
-    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    _upload(s3, "b", "k", p, on_progress=logs.append)
     assert _puts(s3) == []
     assert logs == [_SKIP_LOG]
 
@@ -238,7 +281,7 @@ def test_a_matching_hash_does_not_skip_a_different_size(tmp_path: Path) -> None:
             "Metadata": {"sha256": _sha256(data)},
         }
     )
-    upload_plugin(s3, "b", "k", p)
+    _upload(s3, "b", "k", p)
     assert len(_puts(s3)) == 1
 
 
@@ -249,7 +292,7 @@ def test_a_same_size_single_part_object_with_another_md5_is_uploaded(tmp_path: P
     other = hashlib.md5(b"HELLO WORLD", usedforsecurity=False).hexdigest()  # noqa: S324
     s3 = _FakeS3(head_object={"ContentLength": len(data), "ETag": f'"{other}"'})
     logs: list[str] = []
-    upload_plugin(s3, "b", "k", p, on_progress=logs.append)
+    _upload(s3, "b", "k", p, on_progress=logs.append)
     assert len(_puts(s3)) == 1
     assert _SKIP_LOG not in logs
 
@@ -274,20 +317,25 @@ def test_upload_file_receives_the_hash_as_user_metadata(tmp_path: Path) -> None:
             )
 
     s3 = _ManagedS3(head_object=None)
-    upload_plugin(s3, "b", "k", p)
+    _upload(s3, "b", "k", p)
     (call,) = [c[1] for c in s3.calls if c[0] == "upload_file"]
     assert call["Filename"] == str(p)
     assert (call["Bucket"], call["Key"]) == ("b", "k")
-    assert call["ExtraArgs"] == {"Metadata": {"sha256": _sha256(data)}}
+    assert call["ExtraArgs"] == {
+        "Metadata": {"sha256": _sha256(data)},
+        "ExpectedBucketOwner": _ACCOUNT,
+    }
     assert _puts(s3) == []
 
 
 def test_boto3_accepts_metadata_on_a_managed_upload() -> None:
     # upload_file rejects an ExtraArgs key outside ALLOWED_UPLOAD_ARGS ("Invalid extra_args
     # key"), which would fail EVERY deploy's upload: pin it against the installed s3transfer.
+    # The expected bucket owner rides the same ExtraArgs.
     from s3transfer.manager import TransferManager
 
     assert "Metadata" in TransferManager.ALLOWED_UPLOAD_ARGS
+    assert "ExpectedBucketOwner" in TransferManager.ALLOWED_UPLOAD_ARGS
 
 
 def test_a_local_read_failure_is_an_s3_provision_error(tmp_path: Path, monkeypatch) -> None:
@@ -299,7 +347,7 @@ def test_a_local_read_failure_is_an_s3_provision_error(tmp_path: Path, monkeypat
     monkeypatch.setattr(s3_provision, "_local_sha256", _unreadable)
     s3 = _FakeS3(head_object=None)
     with pytest.raises(S3ProvisionError) as exc:
-        upload_plugin(s3, "b", "k", p)
+        _upload(s3, "b", "k", p)
     assert "Input/output error" in str(exc.value)
     assert _puts(s3) == []
 
@@ -307,14 +355,14 @@ def test_a_local_read_failure_is_an_s3_provision_error(tmp_path: Path, monkeypat
 def test_upload_when_size_differs(tmp_path: Path) -> None:
     p = _write(tmp_path, b"hello world")
     s3 = _FakeS3(head_object={"ContentLength": 5, "ETag": '"zzz"'})
-    upload_plugin(s3, "b", "k", p)
+    _upload(s3, "b", "k", p)
     assert any(c[0] == "put_object" for c in s3.calls)
 
 
 def test_upload_when_object_absent(tmp_path: Path) -> None:
     p = _write(tmp_path, b"data")
     s3 = _FakeS3(head_object=None)
-    upload_plugin(s3, "b", "k", p)
+    _upload(s3, "b", "k", p)
     puts = _puts(s3)
     assert len(puts) == 1
     assert puts[0]["Metadata"] == {"sha256": _sha256(b"data")}
@@ -323,7 +371,7 @@ def test_upload_when_object_absent(tmp_path: Path) -> None:
 def test_upload_missing_local_file_raises(tmp_path: Path) -> None:
     s3 = _FakeS3(head_object=None)
     with pytest.raises(S3ProvisionError):
-        upload_plugin(s3, "b", "k", tmp_path / "does-not-exist.bin")
+        _upload(s3, "b", "k", tmp_path / "does-not-exist.bin")
 
 
 # ---------------------------------------------------------------------------

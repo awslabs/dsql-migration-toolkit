@@ -1442,6 +1442,29 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
 
 
 
+def _report_refused_state_buckets(job_store: object, session_store: object) -> None:
+    """Record in the activity log each durable store whose S3 bucket was refused at startup.
+
+    A store's restore and prune at startup are its first requests to the bucket. A bucket it
+    refused (another account owns a bucket by that name, this identity cannot reach it, or
+    its account could not be read) gets no state and gives none back, so nothing is saved or
+    restored. The store logged it at ERROR already; the activity log is where the operator
+    reads what the app did, so it is recorded there too, with the bucket and what to do.
+    A SQLite store has no bucket and reports nothing.
+    """
+    from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
+
+    for state, store in (("Job state", job_store), ("Session state", session_store)):
+        refusal = getattr(store, "bucket_refusal", None)
+        if refusal:
+            log_activity(
+                ActivityCategory.SYSTEM,
+                f"{state} is not saved: S3 bucket refused",
+                status=ActivityStatus.FAILURE,
+                detail=refusal,
+            )
+
+
 def _build_overlay_ledger(config, s3_cls, sqlite_cls):
     """The overlay ledger for this deployment: S3 with a session-state bucket (durable
     across a task replacement), else the local SQLite session-state file."""
@@ -1549,15 +1572,14 @@ def main() -> None:
     # task's EPHEMERAL /tmp SQLite file. Local dev (no bucket) keeps the on-disk
     # SQLite store. Both satisfy the JobStore protocol, so JobManager is unchanged.
     if config.job_state_bucket:
-        JOB_MANAGER.attach_store(
-            S3JobStore(
-                config.job_state_bucket,
-                region=config.aws_region,
-                aws_profile=config.aws_profile,
-            )
+        _job_store: object = S3JobStore(
+            config.job_state_bucket,
+            region=config.aws_region,
+            aws_profile=config.aws_profile,
         )
     else:
-        JOB_MANAGER.attach_store(SqliteJobStore(config.job_state_path))
+        _job_store = SqliteJobStore(config.job_state_path)
+    JOB_MANAGER.attach_store(_job_store)
     # Bound growth: drop all but the most recent completed jobs (resumable/active
     # jobs are never pruned).
     JOB_MANAGER.prune_terminal(_KEEP_DONE_JOBS)
@@ -1596,6 +1618,7 @@ def main() -> None:
     else:
         SESSION_STATE_STORE = SqliteSessionStateStore(config.session_state_path)
     SESSION_STATE_STORE.prune(_KEEP_SESSIONS)
+    _report_refused_state_buckets(_job_store, SESSION_STATE_STORE)
     # The overlay ledger lives beside the session state (its own S3 prefix / SQLite
     # table, outside both stores' prunes). No I/O until a run reads it.
     OVERLAY_LEDGER = _build_overlay_ledger(config, S3OverlayLedger, SqliteOverlayLedger)

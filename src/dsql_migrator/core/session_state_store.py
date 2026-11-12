@@ -48,6 +48,11 @@ from dsql_migrator.core.models import (
     ValidationReport,
     WorkflowState,
 )
+from dsql_migrator.core.s3_ownership import (
+    OwnedBucket,
+    refusal_text,
+    session_caller_account,
+)
 
 
 class SessionSnapshot(BaseModel):
@@ -538,6 +543,14 @@ class S3SessionStateStore:
     which stalled every session's page. Saves of one session coalesce (only the newest
     is written); :meth:`load` reads a pending one; :meth:`delete` and :meth:`prune` wait
     for the writer first, so a Start over is never undone by a late upload.
+
+    **Bucket ownership (fail closed).** The bucket's name is derived (the app template sets
+    it to the managed plugin bucket's), so another account can own a bucket by that name.
+    Every request asserts the caller's own account (``sts:GetCallerIdentity``, read once)
+    as the bucket's owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`): a bucket
+    another account owns gets no snapshot and gives none back (a reconnecting browser starts
+    fresh rather than restoring what that account wrote), and the refusal is logged at ERROR
+    and kept in :attr:`bucket_refusal` (the app's startup reports it).
     """
 
     def __init__(
@@ -548,6 +561,7 @@ class S3SessionStateStore:
         aws_profile: Optional[str] = None,
         prefix: str = "sessions/",
         s3_client: object = None,
+        sts_client: object = None,
         background: bool = False,
     ) -> None:
         self._bucket = bucket
@@ -556,6 +570,13 @@ class S3SessionStateStore:
         self._prefix = prefix if prefix.endswith("/") else prefix + "/"
         self._lock = threading.Lock()
         self._client = s3_client  # injected in tests; else built lazily
+        # The account that must own the bucket: sts:GetCallerIdentity of the same
+        # credential context (``sts_client`` is the test seam), read once.
+        self._owner = session_caller_account(aws_profile, region, sts_client=sts_client)
+        self._owned: Optional[OwnedBucket] = None
+        #: Why the bucket was last refused (another account owns it, this identity cannot
+        #: reach it, or its account could not be read); ``None`` once it is usable.
+        self.bucket_refusal: Optional[str] = None
         self._ensured = False
         self._background = background
         # session id -> its newest snapshot not yet uploaded, and the one being uploaded.
@@ -588,29 +609,38 @@ class S3SessionStateStore:
             return key[len(self._prefix) : -len(".json")]
         return None
 
+    def _ops(self) -> OwnedBucket:
+        """The bucket bound to the account that must own it: every request through it
+        asserts that account (raises ``BucketOwnershipError`` while it cannot be read)."""
+        owned = self._owned
+        if owned is None:
+            owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+            self._owned = owned
+        return owned
+
     def _ensure_bucket(self) -> None:
-        """Create the bucket if absent (idempotent). Caller must hold ``_lock``."""
+        """Create the bucket if absent and confirm this account owns it (idempotent): a
+        bucket another account owns raises ``BucketOwnershipError`` and is never used.
+        Caller must hold ``_lock``."""
         if self._ensured:
             return
-        client = self._s3()
-        try:
-            client.head_bucket(Bucket=self._bucket)
-            self._ensured = True
-            return
-        except Exception:  # noqa: BLE001 - not found / no access; try to create
-            pass
-        try:
-            if self._region and self._region != "us-east-1":
-                client.create_bucket(
-                    Bucket=self._bucket,
-                    CreateBucketConfiguration={"LocationConstraint": self._region},
-                )
-            else:
-                client.create_bucket(Bucket=self._bucket)
-        except Exception as exc:  # noqa: BLE001
-            if "BucketAlreadyOwnedByYou" not in str(exc):
-                raise
+        self._ops().ensure(self._region)
         self._ensured = True
+        self.bucket_refusal = None
+
+    def _log_refusal(self, message: str, exc: BaseException) -> bool:
+        """Log ``exc`` at ERROR, with what to do about it, when it is the bucket being refused
+        (``message`` says which call failed); ``False`` for any other error."""
+        refusal = refusal_text(exc, self._owned)
+        if refusal is None:
+            return False
+        self.bucket_refusal = refusal
+        _LOGGER.error(
+            "%s: session state is not saved to or restored from this bucket, so a "
+            "reconnecting browser starts over after a restart. %s",
+            message, refusal,
+        )
+        return True
 
     @staticmethod
     def _is_absent(exc: Exception) -> bool:
@@ -648,20 +678,22 @@ class S3SessionStateStore:
             payload = snapshot.model_dump_json()
             with self._lock:
                 self._ensure_bucket()
-            self._s3().put_object(
-                Bucket=self._bucket,
-                Key=self._key(snapshot.session_id),
-                Body=payload.encode("utf-8"),
+            self._ops().put(
+                self._key(snapshot.session_id),
+                payload.encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception:  # noqa: BLE001 - best-effort; must never break the UI
-            _LOGGER.warning(
-                "Could not persist session %s to s3://%s (resume may not work "
-                "after a restart)",
-                snapshot.session_id,
-                self._bucket,
-                exc_info=True,
-            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; must never break the UI
+            if not self._log_refusal(
+                f"Could not persist session {snapshot.session_id} to s3://{self._bucket}", exc
+            ):
+                _LOGGER.warning(
+                    "Could not persist session %s to s3://%s (resume may not work "
+                    "after a restart)",
+                    snapshot.session_id,
+                    self._bucket,
+                    exc_info=True,
+                )
 
     def _drain(self) -> None:
         """The writer thread: upload each session's newest pending snapshot, in turn."""
@@ -713,9 +745,13 @@ class S3SessionStateStore:
             except Exception:  # noqa: BLE001 - fall back to what S3 holds
                 pass
         try:
-            obj = self._s3().get_object(Bucket=self._bucket, Key=self._key(session_id))
+            obj = self._ops().get(self._key(session_id))
             payload = obj["Body"].read().decode("utf-8")
         except Exception as exc:  # noqa: BLE001
+            if self._log_refusal(
+                f"Could not read session {session_id} from s3://{self._bucket}", exc
+            ):
+                return None
             if not self._is_absent(exc):
                 _LOGGER.warning(
                     "Could not read session %s from s3://%s",
@@ -740,14 +776,17 @@ class S3SessionStateStore:
                     timeout=30,
                 )
         try:
-            self._s3().delete_object(Bucket=self._bucket, Key=self._key(session_id))
-        except Exception:  # noqa: BLE001 - best-effort
-            _LOGGER.warning(
-                "Could not delete session %s from s3://%s",
-                session_id,
-                self._bucket,
-                exc_info=True,
-            )
+            self._ops().delete(self._key(session_id))
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            if not self._log_refusal(
+                f"Could not delete session {session_id} from s3://{self._bucket}", exc
+            ):
+                _LOGGER.warning(
+                    "Could not delete session %s from s3://%s",
+                    session_id,
+                    self._bucket,
+                    exc_info=True,
+                )
 
     def prune(self, keep_most_recent: int) -> list[str]:
         if self._background:
@@ -755,11 +794,10 @@ class S3SessionStateStore:
         try:
             with self._lock:
                 self._ensure_bucket()
-            client = self._s3()
+            ops = self._ops()
             objects: list[tuple[str, datetime]] = []
             epoch = datetime.min.replace(tzinfo=timezone.utc)
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+            for page in ops.pages(self._prefix):
                 for obj in page.get("Contents", []):
                     objects.append((obj["Key"], obj.get("LastModified") or epoch))
             # Newest first; keep the most-recent N, delete the older remainder.
@@ -767,15 +805,16 @@ class S3SessionStateStore:
             keep = max(keep_most_recent, 0)
             deleted: list[str] = []
             for key, _ in objects[keep:]:
-                client.delete_object(Bucket=self._bucket, Key=key)
+                ops.delete(key)
                 session_id = self._session_id_from_key(key)
                 if session_id is not None:
                     deleted.append(session_id)
             return deleted
-        except Exception:  # noqa: BLE001 - best-effort; skip pruning on error
-            _LOGGER.warning(
-                "Could not prune sessions in s3://%s", self._bucket, exc_info=True
-            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; skip pruning on error
+            if not self._log_refusal(f"Could not prune sessions in s3://{self._bucket}", exc):
+                _LOGGER.warning(
+                    "Could not prune sessions in s3://%s", self._bucket, exc_info=True
+                )
             return []
 
 

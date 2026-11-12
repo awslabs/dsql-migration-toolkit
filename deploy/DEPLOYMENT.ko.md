@@ -246,7 +246,9 @@ deploy/DEPLOYMENT.md("Deploy on ECS Fargate")를 따라 이 저장소의 ECS Far
    internal ALB(VPN/peering으로 접근) vs internet-facing + Cognito 로그인, 그리고 AI 보조
    (Amazon Bedrock) 활성화 여부.
 5. 내가 OK하면 배포해 — 스택 이름은 소문자로 28자 이하; --s3-bucket으로 템플릿을 스테이징하고
-   (CloudFormation의 51,200바이트 인라인 한도를 초과함); --capabilities CAPABILITY_IAM
+   (CloudFormation의 51,200바이트 인라인 한도를 초과함), 그 버킷은 이름 끝에 무작위 접미사를
+   붙이고 `aws s3api head-bucket --expected-bucket-owner`로 이 계정 소유임을 먼저 확인해(아니면
+   멈춰); --capabilities CAPABILITY_IAM
    CAPABILITY_NAMED_IAM를 사용해. CREATE_COMPLETE를 기다린 뒤, AppUrl 출력값과 접속 방법을
    출력해(ALB는 기본적으로 internal).
 
@@ -417,12 +419,19 @@ export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 
 이 템플릿은 CloudFormation의 인라인 업로드 한도(51,200바이트)를 초과해서, CLI가 이를 스테이징할
 S3 버킷이 필요합니다(콘솔은 이 문제를 자동으로 처리하므로 권장 경로인 이유이기도 합니다). 한 번만
-만들거나, 이 계정/리전에 이미 있는 버킷을 재사용하세요:
+만들거나, 이 계정/리전에 이미 있는 버킷을 재사용하세요. 새 버킷에는 무작위 접미사를 붙이세요: 계정 ID와
+리전만으로 만든 이름은 예측할 수 있어서, 다른 AWS 계정이 먼저 만들 수 있습니다. 그런 다음 이 계정이 그
+버킷을 소유하는지 확인하고, **확인이 실패하면 멈추세요** — CloudFormation은 그 버킷이 내주는 템플릿을 무엇이든
+배포합니다:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# 새 버킷. 소유한 버킷을 재사용하려면 TEMPLATE_BUCKET을 그 이름으로 정하고 "s3 mb"는 건너뛰세요.
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# 이 계정이 버킷을 소유하지 않으면 실패합니다. 실패하면 이 버킷으로 배포하지 마세요.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+echo "$TEMPLATE_BUCKET"  # 이름을 보관하세요: 이후 업데이트도 같은 버킷에서 배포합니다
 ```
 
 ```bash
@@ -678,6 +687,10 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
+# $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷(이 템플릿은 CloudFormation 인라인
+# 업로드 한도 51,200바이트를 초과합니다). 이 확인이 성공할 때만 배포하세요:
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
@@ -685,8 +698,6 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (나머지 파라미터를 다시 제공하거나 이전 값에 의존)
-  # $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷
-  # (이 템플릿은 CloudFormation 인라인 업로드 한도 51,200바이트를 초과합니다)
 ```
 
 > [!IMPORTANT]
@@ -802,8 +813,11 @@ UI에서 AI를 켜고 **Verify AI access**를 실행하세요. 모델이 지금 
 >    때문에 어떤 스택도 소유하지 않고, 어떤 `delete-stack`으로도 지워지지 않습니다. 이 버킷은 배포가
 >    업로드한 모든 CDC 플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB — 정리하는 것은
 >    없음)과, ECS Fargate에서는 저장된 세션·작업 상태를 보관합니다. 이 계정·리전의 모든 도구 배포가 함께
->    쓰므로, 그중 어느 것도 더 이상 쓰지 않을 때만 삭제하세요. 삭제는 되돌릴 수 없습니다:
->    `aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+>    쓰므로, 그중 어느 것도 더 이상 쓰지 않을 때만 삭제하세요. 삭제는 되돌릴 수 없고 이름을 풀어 줍니다:
+>    도구는 다음에 필요할 때 같은 이름으로 버킷을 다시 만들며, 그사이 다른 계정이 그 이름으로 만든 버킷은
+>    거부합니다. 이 계정이 소유할 때만 삭제하세요 — 소유하지 않으면 `head-bucket` 확인이 실패하고 아무것도
+>    삭제되지 않습니다:
+>    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **잔여 확인** — `mysql-dsql-*` 또는 `dsql-cdc-*` CloudFormation 스택이 남지 않았는지
 >    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    그리고 직접 만든 **Route 53** 레코드와 **CodeBuild 소스 S3 버킷**.
@@ -858,6 +872,11 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   `sessions/` 프리픽스에 기록해, 인프로세스 재시작뿐 아니라 Fargate **태스크 교체**(재배포)까지 견딤. 위의 안정적
   쿠키 시크릿과 함께, 재연결한 브라우저가 Step 1(Evaluation) 재실행 없이 워크벤치를 재개. 비밀 아님만(Property 7) —
   소스 DB 비밀번호는 Connect 화면에서 다시 입력.
+- **관리형 버킷 소유권**: 플러그인 버킷의 이름은 계정 ID와 리전으로 정해지므로, 다른 AWS 계정이 그 이름의
+  버킷을 먼저 만들 수 있음. 앱이 이 버킷에 보내는 모든 요청(CDC 플러그인·템플릿 업로드, 작업·세션 상태)은
+  이 계정을 버킷의 예상 소유자로 지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 다른 계정에 있는 그
+  이름의 버킷은 절대 사용하지 않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은
+  오류로 멈추고, 작업·세션 상태는 저장되지 않음(시작 시 활동 로그에 기록).
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.
@@ -1004,7 +1023,9 @@ deploy/DEPLOYMENT.md("Run on a single EC2 host")를 따라 이 저장소의 단�
    쓸지 여부(서브넷 선택과 MskEgressCidr에 영향), SourceMode git(기본; 공개 저장소를 클론) vs
    s3, 그리고 AI 보조(Amazon Bedrock) 활성화 여부.
 4. 내가 OK하면 배포해 — --s3-bucket으로 템플릿을 스테이징하고(CloudFormation의 51,200바이트
-   인라인 한도를 초과함); --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM를 사용해; 스택
+   인라인 한도를 초과함), 그 버킷은 이름 끝에 무작위 접미사를 붙이고 `aws s3api head-bucket
+   --expected-bucket-owner`로 이 계정 소유임을 먼저 확인해(아니면 멈춰);
+   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM를 사용해; 스택
    이름은 mysql-dsql-migrator-ec2로(dsql-cdc- 또는 mysql-dsql-cdc-로 시작하면 안 됨).
    CREATE_COMPLETE를 기다린 뒤, UI에 SSM 포트포워드로 접속하는 방법을 알려줘.
 
@@ -1048,10 +1069,18 @@ export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
 # 이 템플릿은 CloudFormation 인라인 업로드 한도(51,200바이트)를 초과해서, CLI가
-# 스테이징할 S3 버킷이 필요합니다. 한 번만 만들거나, 이미 있는 버킷을 재사용하세요:
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# 스테이징할 S3 버킷이 필요합니다. 한 번만 만들거나, 이미 있는 버킷을 재사용하세요
+# (TEMPLATE_BUCKET을 그 이름으로 정하고 "s3 mb"는 건너뛰기). 무작위 접미사가 있으면 다른
+# AWS 계정이 그 이름을 먼저 만들 수 없습니다.
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# 이 계정이 버킷을 소유하지 않으면 실패합니다. 실패하면 아래 배포를 실행하지 마세요.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+```
 
+위의 `head-bucket` 확인이 성공했을 때만 배포를 실행하세요:
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
@@ -1231,10 +1260,15 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 CDC를 배포했다면 앱이 플러그인 버킷 `mysql-dsql-migrator-plugins-<account>-<region>`도 만들었습니다.
 어떤 스택도 소유하지 않으므로 이 버킷도 남고, 그 내용을 정리하는 것도 없습니다: 배포가 업로드한 모든 CDC
 플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB)을 보관합니다. 이 계정·리전의 모든 도구 배포가 함께
-쓰므로, 그중 어느 것도 더 이상 쓰지 않게 되면 깨끗이 정리하기 위해 삭제하세요(되돌릴 수 없습니다):
+쓰므로, 그중 어느 것도 더 이상 쓰지 않게 되면 깨끗이 정리하기 위해 삭제하세요. 되돌릴 수 없고 이름을 풀어
+줍니다: 도구는 다음에 필요할 때 같은 이름으로 버킷을 다시 만들며, 그사이 다른 계정이 그 이름으로 만든 버킷은
+거부합니다. 이 계정이 소유할 때만 삭제하세요 — 소유하지 않으면 `head-bucket` 확인이 실패하고 아무것도 삭제되지
+않습니다:
 
 ```bash
-aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
 ```
 
 ---

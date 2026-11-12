@@ -507,7 +507,10 @@ with exact commands is
    part of any stack, so `delete-stack` won't remove it — delete it manually if you want a
    truly clean slate (`aws s3 rb` with `--force`; it cannot be undone, and every
    deployment of the tool in that account and region shares the bucket, so only once none
-   of them is in use). It keeps a copy of every version of a CDC plugin file that a deploy
+   of them is in use). Delete it only after `aws s3api head-bucket --expected-bucket-owner`
+   with your account ID confirms that this account owns it: the name follows from the
+   account ID and Region, so a bucket by that name can belong to another account (the tool
+   refuses to use one). It keeps a copy of every version of a CDC plugin file that a deploy
    uploaded (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each), and nothing prunes
    them; on ECS Fargate it also holds the saved session and job state. Also remove any
    **Route 53** records you added by hand. Then confirm no `mysql-dsql-*` or `dsql-cdc-*`

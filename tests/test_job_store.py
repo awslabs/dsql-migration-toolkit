@@ -30,6 +30,25 @@ class _S3Error(Exception):
         self.response = {"Error": {"Code": code}}
 
 
+# The account that owns the fakes' buckets: every request must assert it as the owner
+# (ExpectedBucketOwner, a required keyword below), as the stores read it from STS.
+_OWNER = "123456789012"
+
+
+class _OwnerSts:
+    def get_caller_identity(self):
+        return {"Account": _OWNER}
+
+
+_OWNER_STS = _OwnerSts()
+
+
+def _owned(owner: str) -> None:
+    """A request reaches the fakes' buckets only as their owner's (S3 answers 403 otherwise)."""
+    if owner != _OWNER:
+        raise _S3Error("AccessDenied", "the expected bucket owner differs")
+
+
 class _Body:
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -42,7 +61,8 @@ class _FakePaginator:
     def __init__(self, objects: dict) -> None:
         self._objects = objects
 
-    def paginate(self, *, Bucket, Prefix=""):  # noqa: N803
+    def paginate(self, *, Bucket, ExpectedBucketOwner, Prefix=""):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         contents = [
             {"Key": key, "LastModified": meta[1]}
             for key, meta in self._objects.items()
@@ -62,15 +82,19 @@ class _FakeS3:
         self.created_buckets: list[str] = []
         self.put_count = 0
 
-    def head_bucket(self, *, Bucket):  # noqa: N803
+    def head_bucket(self, *, Bucket, ExpectedBucketOwner):  # noqa: N803
         if Bucket not in self._buckets:
             raise _S3Error("404", "Not Found")
+        _owned(ExpectedBucketOwner)
 
-    def create_bucket(self, *, Bucket, **_kw):  # noqa: N803
+    def create_bucket(self, *, Bucket, **_kw):  # noqa: N803 - takes no expected owner
         self._buckets.add(Bucket)
         self.created_buckets.append(Bucket)
 
-    def put_object(self, *, Bucket, Key, Body, Metadata=None, **_kw):  # noqa: N803
+    def put_object(  # noqa: N803
+        self, *, Bucket, Key, Body, ExpectedBucketOwner, Metadata=None, **_kw
+    ):
+        _owned(ExpectedBucketOwner)
         if self._put_error is not None:
             raise self._put_error
         self._clock += 1
@@ -78,19 +102,22 @@ class _FakeS3:
         lm = datetime(2026, 7, 11, 0, 0, 0, self._clock, tzinfo=timezone.utc)
         self._objects[Key] = (bytes(Body), lm, dict(Metadata or {}))
 
-    def get_object(self, *, Bucket, Key):  # noqa: N803
+    def get_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         if Key not in self._objects:
             raise _S3Error("NoSuchKey", "Not Found")
         body, _, _ = self._objects[Key]
         return {"Body": _Body(body)}
 
-    def head_object(self, *, Bucket, Key):  # noqa: N803
+    def head_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         if Key not in self._objects:
             raise _S3Error("NoSuchKey", "Not Found")
         _, _, meta = self._objects[Key]
         return {"Metadata": meta}
 
-    def delete_object(self, *, Bucket, Key):  # noqa: N803
+    def delete_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         self._objects.pop(Key, None)
 
     def get_paginator(self, _name):
@@ -120,7 +147,9 @@ def _job(job_id: str, status: str, chunks: list[tuple]) -> MigrationJob:
 
 
 def _store(fake: _FakeS3, clock=None) -> S3JobStore:
-    return S3JobStore("b", s3_client=fake, clock=clock, min_write_interval_seconds=5.0)
+    return S3JobStore(
+        "b", sts_client=_OWNER_STS, s3_client=fake, clock=clock, min_write_interval_seconds=5.0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +173,7 @@ def test_s3_job_store_round_trips_job_and_error() -> None:
 
 def test_s3_job_store_creates_bucket_when_absent() -> None:
     fake = _FakeS3(buckets=())
-    store = S3JobStore("b", region="ap-northeast-2", s3_client=fake)
+    store = S3JobStore("b", region="ap-northeast-2", sts_client=_OWNER_STS, s3_client=fake)
     store.save(_job("j1", "RUNNING", [("orders", "IN_PROGRESS", 0)]), None)
     assert "b" in fake.created_buckets
     assert store.load_all()[0].job.job_id == "j1"

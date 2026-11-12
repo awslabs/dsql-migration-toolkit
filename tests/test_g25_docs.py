@@ -677,6 +677,11 @@ def test_the_sink_readme_and_the_plugin_history_describe_the_g25_hold() -> None:
 
 _PLUGIN_BUCKET = "mysql-dsql-migrator-plugins-<account>-<region>"
 _RB = f'aws s3 rb "s3://{_PLUGIN_BUCKET}" --force --region "$AWS_REGION"'
+# The delete runs only once this account is shown to own the bucket: its name follows from
+# the account ID and Region, so a bucket by that name can be another account's.
+_OWNER_CHECK = (
+    f'aws s3api head-bucket --bucket "{_PLUGIN_BUCKET}" --expected-bucket-owner "<account>"'
+)
 
 
 def _section(text: str, heading: str, end: str) -> str:
@@ -709,6 +714,9 @@ def test_the_teardown_guides_delete_the_plugin_bucket_no_stack_owns(suffix: str)
         assert _PLUGIN_BUCKET in block, suffix
         assert "cdc-plugins/<hash>/<file>" in block, suffix
         assert _RB in block, suffix
+        # The owner check gates the delete: `check && delete`, the check first.
+        joined = " ".join(block.replace("\\\n", " ").split())
+        assert f"{_OWNER_CHECK} && {_RB}" in joined, suffix
     # The order deletes, then checks for, the DEFAULT cdc-stack name as well as a legacy one.
     assert "--stack-name dsql-cdc-stack" in fargate, suffix
     assert "starts_with(StackName,\\`dsql-cdc-\\`)" in fargate, suffix
@@ -723,6 +731,8 @@ def test_faq_q31_teardown_names_the_default_cdc_stack_and_how_to_remove_the_buck
     assert "`dsql-cdc-*`" in q31, lang
     assert "`aws s3 rb`" in q31 and "`--force`" in q31, lang
     assert _PLUGIN_BUCKET.replace("<account>-<region>", "") in q31, lang
+    # ...only after the owner check confirms the bucket is this account's.
+    assert "`aws s3api head-bucket --expected-bucket-owner`" in q31, lang
 
 
 _ROOT_REPAIR = {

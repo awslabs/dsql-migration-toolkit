@@ -45,7 +45,7 @@ from dsql_migrator.ui.data_migration._full_load_engine import (
     _TableWorkerArgs,
 )
 
-from tests.test_job_store import _FakeS3
+from tests.test_job_store import _OWNER_STS, _FakeS3
 from tests.test_ui_data_migration import _RetryHandle, _inputs, _tables
 from tests.test_ui_validation import _no_identity_columns, _record_real_boto3_sessions
 
@@ -93,7 +93,7 @@ def test_recreated_tables_round_trip_through_both_job_stores(tmp_path):
     lite = SqliteJobStore(str(tmp_path / "jobs.sqlite"))
     lite.save(job, None)
     assert [p.job.recreated_tables for p in lite.load_all()] == [["db.t"]]
-    s3 = S3JobStore("b", s3_client=_FakeS3(buckets=("b",)))
+    s3 = S3JobStore("b", sts_client=_OWNER_STS, s3_client=_FakeS3(buckets=("b",)))
     s3.save(job, None)
     assert [p.job.recreated_tables for p in s3.load_all()] == [["db.t"]]
 

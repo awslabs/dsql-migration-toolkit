@@ -44,6 +44,12 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from dsql_migrator.core.column_exclusion import set_digest
+from dsql_migrator.core.s3_ownership import (
+    BucketOwnershipError,
+    OwnedBucket,
+    refusal_text,
+    session_caller_account,
+)
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import TargetConnectionConfig
@@ -606,16 +612,25 @@ class S3OverlayLedger(_BlobLedger):
     network errors are retried and then read ``unreadable`` (a write raises). The client
     is built lazily (no network at construction); the bucket is ensured by the session
     store at startup, never here.
+
+    The bucket's name is derived, so another account can own a bucket by that name: every
+    request asserts the caller's own account (``sts:GetCallerIdentity``, read once) as its
+    owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`). A bucket another account
+    owns -- or an account that cannot be read -- reads ``unreadable`` and fails a write, with
+    the refusal (:class:`~dsql_migrator.core.s3_ownership.BucketOwnershipError`) as the error.
     """
 
     def __init__(self, bucket: str, *, region: Optional[str] = None, aws_profile: Optional[str] = None,
-                 prefix: str = LEDGER_PREFIX, s3_client=None, **kwargs) -> None:
+                 prefix: str = LEDGER_PREFIX, s3_client=None, sts_client=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._bucket = bucket
         self._region = region
         self._aws_profile = aws_profile
         self._prefix = prefix
         self._client = s3_client
+        # The account that must own the bucket (``sts_client`` is the test seam), read once.
+        self._owner = session_caller_account(aws_profile, region, sts_client=sts_client)
+        self._owned = None
 
     def _s3(self):
         if self._client is None:
@@ -624,25 +639,47 @@ class S3OverlayLedger(_BlobLedger):
             self._client = build_session(self._aws_profile).client("s3", region_name=self._region)
         return self._client
 
+    def _ops(self) -> OwnedBucket:
+        """The bucket bound to the account that must own it (raises BucketOwnershipError
+        while that account cannot be read)."""
+        if self._owned is None:
+            self._owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+        return self._owned
+
     def _object_key(self, key: str) -> str:
         return f"{self._prefix}{key}.json"
 
+    @staticmethod
+    def _refused(exc: BaseException, ops: OwnedBucket) -> BaseException:
+        """``exc`` as the bucket's refusal when it is one (a 403 to the owner-checked request),
+        so a read's ``unreadable`` error and a write's failure say what to do."""
+        refusal = refusal_text(exc, ops)
+        return BucketOwnershipError(refusal) if refusal is not None else exc
+
     def _get(self, key):
+        ops = self._ops()
         try:
-            obj = self._s3().get_object(Bucket=self._bucket, Key=self._object_key(key))
+            obj = ops.get(self._object_key(key))
         except Exception as exc:  # noqa: BLE001 - classify below
             code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
             if code == "NoSuchKey":
                 return None
-            raise
+            refused = self._refused(exc, ops)
+            if refused is exc:
+                raise
+            raise refused from exc
         body = obj["Body"].read()
         return body.decode("utf-8") if isinstance(body, bytes) else str(body)
 
     def _put(self, key, raw):
-        self._s3().put_object(
-            Bucket=self._bucket, Key=self._object_key(key),
-            Body=raw.encode("utf-8"), ContentType="application/json",
-        )
+        ops = self._ops()
+        try:
+            ops.put(self._object_key(key), raw.encode("utf-8"), ContentType="application/json")
+        except Exception as exc:  # noqa: BLE001 - classify below
+            refused = self._refused(exc, ops)
+            if refused is exc:
+                raise
+            raise refused from exc
 
 
 class SqliteOverlayLedger:

@@ -44,7 +44,7 @@ from dsql_migrator.core.overlay_ledger import (
 )
 from dsql_migrator.core.target_introspector import ColumnNullFacts as F
 
-from tests.test_job_store import _S3Error
+from tests.test_job_store import _OWNER, _OWNER_STS, _S3Error
 from tests.test_job_store import _FakeS3 as _JobFakeS3
 
 T0 = datetime(2026, 9, 29, 0, 0, tzinfo=timezone.utc)
@@ -219,7 +219,8 @@ class _S3:
         self.get_errors, self.put_errors, self.puts = [], [], 0
         self.tamper = None
 
-    def get_object(self, *, Bucket, Key):  # noqa: N803
+    def get_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        assert ExpectedBucketOwner == _OWNER  # every request asserts the bucket's owner
         if self.get_errors:
             raise self.get_errors.pop(0)
         if Key not in self.objects:
@@ -227,7 +228,8 @@ class _S3:
         body = self.objects[Key]
         return {"Body": type("B", (), {"read": lambda _self: body})()}
 
-    def put_object(self, *, Bucket, Key, Body, ContentType=None):  # noqa: N803
+    def put_object(self, *, Bucket, Key, Body, ExpectedBucketOwner, ContentType=None):  # noqa: N803
+        assert ExpectedBucketOwner == _OWNER
         self.puts += 1
         if self.put_errors:
             raise self.put_errors.pop(0)
@@ -236,7 +238,7 @@ class _S3:
 
 def _stores(tmp_path):
     return [InMemoryOverlayLedger(**NO_SLEEP), SqliteOverlayLedger(str(tmp_path / "s.sqlite"), **NO_SLEEP),
-            S3OverlayLedger("b", s3_client=_S3(), **NO_SLEEP)]
+            S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=_S3(), **NO_SLEEP)]
 
 
 def test_every_store_round_trips_deletes_and_reads_zero_tables_as_absent(tmp_path):
@@ -255,15 +257,21 @@ def test_s3_only_no_such_key_is_absent():
     for code in ("AccessDenied", "NoSuchBucket", "InternalError", "SlowDown"):
         s3 = _S3()
         s3.get_errors = [_S3Error(code)] * 3
-        read = S3OverlayLedger("b", s3_client=s3, **NO_SLEEP).read("k")
-        assert read.status == "unreadable" and code in read.error, code
+        read = S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=s3, **NO_SLEEP).read("k")
+        assert read.status == "unreadable", code
+        if code == "AccessDenied":
+            # An owner-checked read that is refused: the bucket is another account's, or
+            # this identity cannot reach it -- and the error says what to do.
+            assert "owned by another AWS account" in read.error
+        else:
+            assert code in read.error, code
     s3 = _S3()
     s3.get_errors = [TimeoutError("read timed out")] * 3
-    assert S3OverlayLedger("b", s3_client=s3, **NO_SLEEP).read("k").status == "unreadable"
+    assert S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=s3, **NO_SLEEP).read("k").status == "unreadable"
     s3 = _S3()
     s3.get_errors = [_S3Error("SlowDown")]  # one throttle, then the retry reads absent
-    assert S3OverlayLedger("b", s3_client=s3, **NO_SLEEP).read("k").status == "absent"
-    ledger = S3OverlayLedger("b", s3_client=_S3(), **NO_SLEEP)
+    assert S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=s3, **NO_SLEEP).read("k").status == "absent"
+    ledger = S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=_S3(), **NO_SLEEP)
     ledger.put_tables("k", {"shop.docs": _rec(a="1")})
     assert list(ledger._s3().objects) == [f"{LEDGER_PREFIX}k.json"]
 
@@ -272,12 +280,12 @@ def test_s3_put_rejected_raises_after_exactly_max_attempts_and_a_bad_readback_ra
     s3 = _S3()
     s3.put_errors = [_S3Error("AccessDenied")] * 5
     with pytest.raises(OverlayLedgerError, match="ledger write failed"):
-        S3OverlayLedger("b", s3_client=s3, max_attempts=3, **NO_SLEEP).put_tables("k", {"shop.docs": _rec(a="1")})
+        S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=s3, max_attempts=3, **NO_SLEEP).put_tables("k", {"shop.docs": _rec(a="1")})
     assert s3.puts == 3
     s3 = _S3()
     s3.tamper = lambda body: body.replace(b'"1"', b'"2"')
     with pytest.raises(OverlayLedgerError, match="did not read back as written"):
-        S3OverlayLedger("b", s3_client=s3, **NO_SLEEP).put_tables("k", {"shop.docs": _rec(a="1")})
+        S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=s3, **NO_SLEEP).put_tables("k", {"shop.docs": _rec(a="1")})
 
 
 def test_corrupt_and_newer_payloads_are_unreadable_and_never_overwritten(tmp_path):
@@ -423,12 +431,13 @@ def test_s3_session_and_job_prunes_never_delete_the_ledger():
     from dsql_migrator.core.session_state_store import S3SessionStateStore
 
     fake = _JobFakeS3(buckets=("b",))
-    ledger = S3OverlayLedger("b", s3_client=fake, **NO_SLEEP)
+    ledger = S3OverlayLedger("b", sts_client=_OWNER_STS, s3_client=fake, **NO_SLEEP)
     ledger.put_tables("k", {"shop.docs": _rec(a="1")})
-    fake.put_object(Bucket="b", Key="sessions/s1.json", Body=b"{}")
-    fake.put_object(Bucket="b", Key="jobs/j1.json", Body=b"{}", Metadata={"status": "DONE"})
-    assert S3SessionStateStore("b", s3_client=fake).prune(0) == ["s1"]
-    assert S3JobStore("b", s3_client=fake).prune_terminal(0) == ["j1"]
+    fake.put_object(Bucket="b", Key="sessions/s1.json", Body=b"{}", ExpectedBucketOwner=_OWNER)
+    fake.put_object(Bucket="b", Key="jobs/j1.json", Body=b"{}", Metadata={"status": "DONE"},
+                    ExpectedBucketOwner=_OWNER)
+    assert S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake).prune(0) == ["s1"]
+    assert S3JobStore("b", sts_client=_OWNER_STS, s3_client=fake).prune_terminal(0) == ["j1"]
     assert f"{LEDGER_PREFIX}k.json" in fake._objects
     assert ledger.read("k").status == "present"
 

@@ -20,6 +20,8 @@ from dsql_migrator.core.cdc_deployer import (
     CdcStackDeployer,
 )
 
+_ACCOUNT = "123456789012"
+
 
 class _FakeClient:
     def __init__(self, responses: dict[str, Any], *, raise_on: dict[str, Exception] | None = None):
@@ -95,6 +97,11 @@ class _FakeClient:
         self.calls.append(("put_object", kw))
         self._maybe_raise("put_object")
         return self._responses.get("put_object", {})
+
+    def get_caller_identity(self, **kw: Any) -> Any:
+        # The deployer's own account: the owner its template upload asserts.
+        self.calls.append(("get_caller_identity", kw))
+        return {"Account": _ACCOUNT}
 
     def delete_stack(self, **kw: Any) -> Any:
         self.calls.append(("delete_stack", kw))
@@ -257,6 +264,7 @@ def test_submit_update_sends_the_given_template_instead_of_the_previous_one() ->
     put = next(c for c in client2.calls if c[0] == "put_object")
     update2 = next(c for c in client2.calls if c[0] == "update_stack")
     assert put[1]["Body"] in (big, big.encode("utf-8"))
+    assert put[1]["ExpectedBucketOwner"] == _ACCOUNT  # the bucket must be this account's
     assert "TemplateURL" in update2[1] and "TemplateBody" not in update2[1]
     assert "UsePreviousTemplate" not in update2[1]
 
@@ -497,6 +505,7 @@ def test_create_stack_oversize_template_uses_template_url() -> None:
     put = next(c for c in client.calls if c[0] == "put_object")
     assert put[1]["Bucket"] == "mysql-dsql-migrator-plugins-acct-us-east-1"
     assert put[1]["Key"] == "cdc-plugins/cdc-stack.yaml"
+    assert put[1]["ExpectedBucketOwner"] == _ACCOUNT
     create = next(c for c in client.calls if c[0] == "create_stack")
     assert "TemplateBody" not in create[1]
     assert create[1]["TemplateURL"].endswith("cdc-plugins/cdc-stack.yaml")

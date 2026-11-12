@@ -32,6 +32,7 @@ from dsql_migrator.core.session_state_store import (
     SessionSnapshot,
     SqliteSessionStateStore,
 )
+from tests.test_session_persistence import _OWNER, _OWNER_STS
 
 _LOGGER_NAME = "dsql_migrator.core.session_state_store"
 _VALUE = "VALUE-NEVER-LOGGED"
@@ -100,17 +101,21 @@ class _Body:
 
 
 class _S3Holding:
-    """An S3 double holding one object another version wrote."""
+    """An S3 double holding one object another version wrote, in a bucket this account owns
+    (every request asserts it)."""
 
     def __init__(self, key: str, payload: str) -> None:
         self._objects = {key: payload.encode("utf-8")}
 
-    def get_object(self, *, Bucket, Key):  # noqa: N803
+    def get_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        assert ExpectedBucketOwner == _OWNER
         return {"Body": _Body(self._objects[Key])}
 
 
 def _s3_with(payload: str) -> S3SessionStateStore:
-    return S3SessionStateStore("b", s3_client=_S3Holding("sessions/later.json", payload))
+    return S3SessionStateStore(
+        "b", sts_client=_OWNER_STS, s3_client=_S3Holding("sessions/later.json", payload)
+    )
 
 
 @pytest.mark.parametrize("store_kind", ["sqlite", "s3"])

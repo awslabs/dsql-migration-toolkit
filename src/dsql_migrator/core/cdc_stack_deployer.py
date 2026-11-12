@@ -32,6 +32,13 @@ from dsql_migrator.core.cdc import (
     CDC_STACK_NAME_PREFIX,
 )
 from dsql_migrator.core.cdc_coords import validate_binlog_file
+from dsql_migrator.core.s3_ownership import (
+    BucketOwnershipError,
+    CallerAccount,
+    OwnedBucket,
+    is_missing,
+    refusal_text,
+)
 
 # Stack statuses from which an UpdateStack can safely start. Anything in an
 # *_IN_PROGRESS / ROLLBACK / FAILED state means a deploy is unsafe right now.
@@ -266,6 +273,9 @@ class CdcStackDeployer:
         # The caller sets this to the managed plugin bucket NAME (already provisioned
         # for the connector artifacts) so the deployer can stage the template there.
         self.template_s3_bucket: Optional[str] = None
+        # This deployer's own account (sts:GetCallerIdentity), read once: the owner the
+        # template upload asserts, and the account Start CDC names the bucket after.
+        self._caller_account = CallerAccount(lambda: self._client("sts"))
 
     @property
     def region(self) -> str:
@@ -275,6 +285,15 @@ class CdcStackDeployer:
     def _client(self, service_name: str) -> object:
         session = self._session or build_session(self._aws_profile)
         return session.client(service_name, region_name=self._region)
+
+    def caller_account_id(self) -> str:
+        """This deployer's own AWS account ID (``sts:GetCallerIdentity``, read once).
+
+        The expected owner of the managed bucket the template is staged in: the upload
+        asserts it, so a bucket another account owns is refused. Raises
+        :class:`~dsql_migrator.core.s3_ownership.BucketOwnershipError` when it cannot be read.
+        """
+        return self._caller_account.get()
 
     # CloudFormation's hard limit for an inline TemplateBody (bytes).
     _MAX_INLINE_TEMPLATE_BYTES = 51200
@@ -287,6 +306,13 @@ class CdcStackDeployer:
         as ``TemplateURL`` (CloudFormation allows up to ~460 KB via S3). Requires
         :attr:`template_s3_bucket` to be set for the oversize path; raises a clear
         :class:`CdcDeployError` otherwise.
+
+        CloudFormation reads a TemplateURL by name and runs it with CAPABILITY_NAMED_IAM, and
+        the URL cannot say who must own the bucket. So the upload asserts this deployer's own
+        account as the bucket's owner (:meth:`caller_account_id`): in a bucket another account
+        owns it fails, and :class:`CdcDeployError` stops the deploy before the stack is
+        created or updated. A bucket cannot change owner without being deleted, so the object
+        CloudFormation then reads is the one uploaded here.
         """
         if len(template_body.encode("utf-8")) <= self._MAX_INLINE_TEMPLATE_BYTES:
             return {"TemplateBody": template_body}
@@ -297,21 +323,39 @@ class CdcStackDeployer:
                 "bucket name must be passed to the deployer for the TemplateURL path."
             )
         key = "cdc-plugins/cdc-stack.yaml"
-        s3 = self._client("s3")
-        s3.put_object(  # type: ignore[attr-defined]
-            Bucket=self.template_s3_bucket,
-            Key=key,
-            Body=template_body.encode("utf-8"),
-        )
+        bucket_name = self.template_s3_bucket
+        not_staged = "The cdc-stack template was not staged, so the stack was not changed"
+        try:
+            bucket = OwnedBucket(self._client("s3"), bucket_name, self.caller_account_id())
+        except BucketOwnershipError as exc:
+            raise CdcDeployError(f"{not_staged}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - e.g. no S3 client for this session
+            raise CdcDeployError(
+                f"{not_staged}: {(str(exc).splitlines() or [type(exc).__name__])[0]}"
+            ) from exc
+        try:
+            bucket.put(key, template_body.encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - classified into an actionable refusal
+            refusal = refusal_text(exc, bucket)
+            if refusal is not None:
+                raise CdcDeployError(f"{not_staged}: {refusal}") from exc
+            if is_missing(exc):
+                raise CdcDeployError(
+                    f"{not_staged}: S3 bucket '{bucket_name}' does not exist. Deploy CDC "
+                    "infrastructure creates it; if it was deleted after that, delete the CDC "
+                    "infrastructure and deploy it again."
+                ) from exc
+            raise CdcDeployError(
+                f"{not_staged}: could not upload it to S3 bucket '{bucket_name}': "
+                f"{(str(exc).splitlines() or [type(exc).__name__])[0]}"
+            ) from exc
         # Use the REGION-SPECIFIC virtual-hosted S3 endpoint, not the global
         # ``s3.amazonaws.com`` (which targets us-east-1): a bucket outside us-east-1
         # (e.g. ap-northeast-2) accessed via the global endpoint returns S3
         # PermanentRedirect, and CloudFormation rejects/relocates the TemplateURL.
         # The managed plugin bucket is created in this deployer's region, so the
         # endpoint must match it.
-        url = (
-            f"https://{self.template_s3_bucket}.s3.{self._region}.amazonaws.com/{key}"
-        )
+        url = f"https://{bucket_name}.s3.{self._region}.amazonaws.com/{key}"
         return {"TemplateURL": url}
 
     def stack_has_resource(self, stack_name: str, logical_id: str) -> Optional[bool]:
@@ -560,11 +604,14 @@ class CdcStackDeployer:
             key = p.get("ParameterKey")
             if key and key not in override_keys:
                 param_list.append({"ParameterKey": key, "UsePreviousValue": True})
+        # Staged BEFORE the update call, outside its error wrapping: a template that could
+        # not be staged (the bucket refused, say) is reported as itself -- UpdateStack was
+        # never sent -- with _template_kwargs' own CdcDeployError.
+        if template_body is not None:
+            template_kwargs = self._template_kwargs(template_body)
+        else:
+            template_kwargs = {"UsePreviousTemplate": True}
         try:
-            if template_body is not None:
-                template_kwargs = self._template_kwargs(template_body)
-            else:
-                template_kwargs = {"UsePreviousTemplate": True}
             client.update_stack(  # type: ignore[attr-defined]
                 StackName=stack_name,
                 **template_kwargs,
@@ -876,12 +923,15 @@ class CdcStackDeployer:
         param_list = [
             {"ParameterKey": key, "ParameterValue": value} for key, value in parameters
         ]
+        # Staged before the create call, outside its error handling (as in submit_update): a
+        # template that could not be staged is reported as itself, never as "already exists".
+        template_kwargs = self._template_kwargs(template_body)
         try:
             client.create_stack(  # type: ignore[attr-defined]
                 StackName=stack_name,
                 Parameters=param_list,
                 Capabilities=["CAPABILITY_NAMED_IAM"],
-                **self._template_kwargs(template_body),
+                **template_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             if "AlreadyExistsException" in str(exc) or "already exists" in str(exc):

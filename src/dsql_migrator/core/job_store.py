@@ -35,6 +35,11 @@ from datetime import datetime, timezone
 from typing import Optional, Protocol
 
 from dsql_migrator.core.models import MigrationJob
+from dsql_migrator.core.s3_ownership import (
+    OwnedBucket,
+    refusal_text,
+    session_caller_account,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -215,6 +220,14 @@ class S3JobStore:
     a persistence failure degrades resume without breaking the live migration UI.
     Concurrency: boto3 clients are thread-safe; the coalescing bookkeeping and the
     lazy client build / one-time bucket ensure are guarded by ``_lock``.
+
+    **Bucket ownership (fail closed).** The bucket's name is derived (the app template sets
+    it to the managed plugin bucket's), so another account can own a bucket by that name.
+    Every request asserts the caller's own account (``sts:GetCallerIdentity``, read once)
+    as the bucket's owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`): a bucket
+    another account owns gets no job state and gives none back, and the refusal is logged
+    at ERROR and kept in :attr:`bucket_refusal` (the app's startup reports it). The store
+    then behaves as with any unusable bucket: nothing is saved, nothing is restored.
     """
 
     def __init__(
@@ -225,6 +238,7 @@ class S3JobStore:
         aws_profile: Optional[str] = None,
         prefix: str = "jobs/",
         s3_client: object = None,
+        sts_client: object = None,
         min_write_interval_seconds: float = 5.0,
         clock=None,
     ) -> None:
@@ -234,6 +248,13 @@ class S3JobStore:
         self._prefix = prefix if prefix.endswith("/") else prefix + "/"
         self._lock = threading.Lock()
         self._client = s3_client  # injected in tests; else built lazily
+        # The account that must own the bucket: sts:GetCallerIdentity of the same
+        # credential context (``sts_client`` is the test seam), read once.
+        self._owner = session_caller_account(aws_profile, region, sts_client=sts_client)
+        self._owned: Optional[OwnedBucket] = None
+        #: Why the bucket was last refused (another account owns it, this identity cannot
+        #: reach it, or its account could not be read); ``None`` once it is usable.
+        self.bucket_refusal: Optional[str] = None
         self._ensured = False
         self._min_interval = float(min_write_interval_seconds)
         self._clock = clock or time.monotonic
@@ -266,29 +287,38 @@ class S3JobStore:
             return key[len(self._prefix) : -len(".json")]
         return None
 
+    def _ops(self) -> OwnedBucket:
+        """The bucket bound to the account that must own it: every request through it
+        asserts that account (raises ``BucketOwnershipError`` while it cannot be read)."""
+        owned = self._owned
+        if owned is None:
+            owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+            self._owned = owned
+        return owned
+
     def _ensure_bucket(self) -> None:
-        """Create the bucket if absent (idempotent). Caller must hold ``_lock``."""
+        """Create the bucket if absent and confirm this account owns it (idempotent): a
+        bucket another account owns raises ``BucketOwnershipError`` and is never used.
+        Caller must hold ``_lock``."""
         if self._ensured:
             return
-        client = self._s3()
-        try:
-            client.head_bucket(Bucket=self._bucket)
-            self._ensured = True
-            return
-        except Exception:  # noqa: BLE001 - not found / no access; try to create
-            pass
-        try:
-            if self._region and self._region != "us-east-1":
-                client.create_bucket(
-                    Bucket=self._bucket,
-                    CreateBucketConfiguration={"LocationConstraint": self._region},
-                )
-            else:
-                client.create_bucket(Bucket=self._bucket)
-        except Exception as exc:  # noqa: BLE001
-            if "BucketAlreadyOwnedByYou" not in str(exc):
-                raise
+        self._ops().ensure(self._region)
         self._ensured = True
+        self.bucket_refusal = None
+
+    def _log_refusal(self, message: str, exc: BaseException) -> bool:
+        """Log ``exc`` at ERROR, with what to do about it, when it is the bucket being refused
+        (``message`` says which call failed); ``False`` for any other error."""
+        refusal = refusal_text(exc, self._owned)
+        if refusal is None:
+            return False
+        self.bucket_refusal = refusal
+        _LOGGER.error(
+            "%s: job state is not saved to or restored from this bucket, so an interrupted "
+            "Full Load cannot resume after a restart. %s",
+            message, refusal,
+        )
+        return True
 
     @staticmethod
     def _status_signature(job: MigrationJob) -> tuple:
@@ -320,10 +350,9 @@ class S3JobStore:
             body = json.dumps({"job": job.model_dump_json(), "error": error})
             with self._lock:
                 self._ensure_bucket()
-            self._s3().put_object(
-                Bucket=self._bucket,
-                Key=self._key(job.job_id),
-                Body=body.encode("utf-8"),
+            self._ops().put(
+                self._key(job.job_id),
+                body.encode("utf-8"),
                 ContentType="application/json",
                 Metadata={"status": str(job.status)},
             )
@@ -332,14 +361,17 @@ class S3JobStore:
             with self._lock:
                 self._last_sig[job.job_id] = sig
                 self._last_put[job.job_id] = self._clock()
-        except Exception:  # noqa: BLE001 - best-effort; must never break the UI
-            _LOGGER.warning(
-                "Could not persist job %s to s3://%s (resume may not work after a "
-                "restart)",
-                job.job_id,
-                self._bucket,
-                exc_info=True,
-            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; must never break the UI
+            if not self._log_refusal(
+                f"Could not persist job {job.job_id} to s3://{self._bucket}", exc
+            ):
+                _LOGGER.warning(
+                    "Could not persist job %s to s3://%s (resume may not work after a "
+                    "restart)",
+                    job.job_id,
+                    self._bucket,
+                    exc_info=True,
+                )
 
     def load_all(self) -> list[PersistedJob]:
         out: list[PersistedJob] = []
@@ -347,22 +379,21 @@ class S3JobStore:
         try:
             with self._lock:
                 self._ensure_bucket()
-            client = self._s3()
             entries: list[tuple[str, datetime]] = []
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+            for page in self._ops().pages(self._prefix):
                 for obj in page.get("Contents", []):
                     if self._job_id_from_key(obj["Key"]) is not None:
                         entries.append((obj["Key"], obj.get("LastModified") or epoch))
             entries.sort(key=lambda kv: kv[1])  # oldest update first (protocol)
-        except Exception:  # noqa: BLE001 - no store yet / transient; nothing to load
-            _LOGGER.warning(
-                "Could not list jobs in s3://%s", self._bucket, exc_info=True
-            )
+        except Exception as exc:  # noqa: BLE001 - no store yet / transient; nothing to load
+            if not self._log_refusal(f"Could not list jobs in s3://{self._bucket}", exc):
+                _LOGGER.warning(
+                    "Could not list jobs in s3://%s", self._bucket, exc_info=True
+                )
             return out
         for key, _ in entries:
             try:
-                obj = self._s3().get_object(Bucket=self._bucket, Key=key)
+                obj = self._ops().get(key)
                 data = json.loads(obj["Body"].read().decode("utf-8"))
                 job = MigrationJob.model_validate_json(data["job"])
                 out.append(PersistedJob(job=job, error=data.get("error")))
@@ -372,14 +403,17 @@ class S3JobStore:
 
     def delete(self, job_id: str) -> None:
         try:
-            self._s3().delete_object(Bucket=self._bucket, Key=self._key(job_id))
-        except Exception:  # noqa: BLE001 - best-effort
-            _LOGGER.warning(
-                "Could not delete job %s from s3://%s",
-                job_id,
-                self._bucket,
-                exc_info=True,
-            )
+            self._ops().delete(self._key(job_id))
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            if not self._log_refusal(
+                f"Could not delete job {job_id} from s3://{self._bucket}", exc
+            ):
+                _LOGGER.warning(
+                    "Could not delete job %s from s3://%s",
+                    job_id,
+                    self._bucket,
+                    exc_info=True,
+                )
         with self._lock:
             self._last_sig.pop(job_id, None)
             self._last_put.pop(job_id, None)
@@ -389,10 +423,9 @@ class S3JobStore:
         try:
             with self._lock:
                 self._ensure_bucket()
-            client = self._s3()
+            ops = self._ops()
             done: list[tuple[str, str, datetime]] = []  # (job_id, key, LastModified)
-            paginator = client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
+            for page in ops.pages(self._prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     job_id = self._job_id_from_key(key)
@@ -401,7 +434,7 @@ class S3JobStore:
                     # Read status from object metadata (cheap head) -- never delete a
                     # non-terminal (resumable) job, and skip a full download/parse.
                     try:
-                        head = client.head_object(Bucket=self._bucket, Key=key)
+                        head = ops.head_key(key)
                     except Exception:  # noqa: BLE001 - skip on transient head failure
                         continue
                     if (head.get("Metadata") or {}).get("status") == "DONE":
@@ -410,16 +443,17 @@ class S3JobStore:
             keep = max(keep_most_recent, 0)
             deleted: list[str] = []
             for job_id, key, _ in done[keep:]:
-                client.delete_object(Bucket=self._bucket, Key=key)
+                ops.delete(key)
                 with self._lock:
                     self._last_sig.pop(job_id, None)
                     self._last_put.pop(job_id, None)
                 deleted.append(job_id)
             return deleted
-        except Exception:  # noqa: BLE001 - best-effort; skip pruning on error
-            _LOGGER.warning(
-                "Could not prune jobs in s3://%s", self._bucket, exc_info=True
-            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; skip pruning on error
+            if not self._log_refusal(f"Could not prune jobs in s3://{self._bucket}", exc):
+                _LOGGER.warning(
+                    "Could not prune jobs in s3://%s", self._bucket, exc_info=True
+                )
             return []
 
 

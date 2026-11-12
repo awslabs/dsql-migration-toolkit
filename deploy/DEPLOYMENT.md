@@ -258,7 +258,9 @@ Steps:
    truly can't infer — chiefly: internal ALB (reach via VPN/peering) vs internet-facing
    + Cognito login, and whether to enable AI assist (Amazon Bedrock).
 5. On my OK, deploy — stack name lowercase and <=28 chars; stage the template with
-   --s3-bucket (it exceeds CloudFormation's 51,200-byte inline limit); use
+   --s3-bucket (it exceeds CloudFormation's 51,200-byte inline limit) in a bucket whose
+   name ends in a random suffix, after `aws s3api head-bucket --expected-bucket-owner`
+   confirms this account owns it (stop if it does not); use
    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM. Wait for CREATE_COMPLETE, then
    print the AppUrl output and how to reach it (the ALB is internal by default).
 
@@ -446,12 +448,19 @@ export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the CLI
 needs an S3 bucket to stage it (the Console handles this invisibly — one reason
 it's the recommended path). Create one once, or reuse a bucket you already have
-in this account/region:
+in this account/region. Give a new bucket a random suffix: a name built only from the
+account ID and Region is predictable, and another AWS account can create it first. Then
+confirm that this account owns the bucket, and **stop if that check fails** — CloudFormation
+would deploy whatever template that bucket hands it:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# A new bucket. To reuse one you own, set TEMPLATE_BUCKET to its name and skip "s3 mb".
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# Fails unless this account owns the bucket. Do not deploy from it if it fails.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+echo "$TEMPLATE_BUCKET"  # keep the name: a later update deploys from the same bucket
 ```
 
 ```bash
@@ -726,6 +735,10 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
+# $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above (the template
+# exceeds CloudFormation's 51,200-byte inline-upload limit). Deploy only if this succeeds:
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
@@ -733,8 +746,6 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (re-supply the other parameters, or rely on previous values)
-  # $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above
-  # (the template exceeds CloudFormation's 51,200-byte inline-upload limit)
 ```
 
 > [!IMPORTANT]
@@ -865,8 +876,11 @@ account yet*, accept the agreement as above and verify again.
 >    (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each; nothing prunes them) and, on
 >    ECS Fargate, the saved session and job state. Every deployment of the tool in this
 >    account and region shares it, so delete it only when none of them is still in use.
->    Deleting it cannot be undone:
->    `aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+>    Deleting it cannot be undone, and frees the name: the tool creates the bucket again
+>    under the same name when it next needs it, and refuses a bucket by that name that
+>    another account created meanwhile. Delete it only if this account owns it — the
+>    `head-bucket` check fails, and nothing is deleted, if it does not:
+>    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **Verify nothing is left** — no `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain
 >    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    plus any **Route 53** records and the **CodeBuild source S3 bucket** you created.
@@ -934,6 +948,14 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   above, a reconnecting browser resumes its workbench instead of re-running Step 1
   (Evaluation). Non-secret only (Property 7) — the source DB password is re-entered
   on the Connect screen.
+- **Managed bucket ownership**: the plugin bucket's name is derived from the account ID
+  and Region, so another AWS account could create a bucket with that name first. Every
+  request the app sends to it (the CDC plugin and template uploads, the job and session
+  state) names this account as the bucket's expected owner, which S3 refuses unless this
+  account owns the bucket. A bucket by that name in another account is never used:
+  Deploy CDC infrastructure and Start CDC stop with an error that names the bucket and
+  what to do, and the job and session state are not saved (the activity log records it
+  at startup).
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's
@@ -1095,7 +1117,9 @@ Steps:
    MskEgressCidr), SourceMode git (default; clones the public repo) vs s3, and whether
    to enable AI assist (Amazon Bedrock).
 4. On my OK, deploy — stage the template with --s3-bucket (it exceeds CloudFormation's
-   51,200-byte inline limit); use --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM;
+   51,200-byte inline limit) in a bucket whose name ends in a random suffix, after
+   `aws s3api head-bucket --expected-bucket-owner` confirms this account owns it (stop if
+   it does not); use --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM;
    name the stack mysql-dsql-migrator-ec2 (it must NOT start with dsql-cdc- or
    mysql-dsql-cdc-). Wait
    for CREATE_COMPLETE, then tell me how to reach the UI over an SSM port-forward.
@@ -1141,10 +1165,18 @@ export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
 # This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the CLI
-# needs an S3 bucket to stage it. Create one once, or reuse a bucket you already have:
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# needs an S3 bucket to stage it. Create one once, or reuse a bucket you already have
+# (set TEMPLATE_BUCKET to its name and skip "s3 mb"). The random suffix keeps another
+# AWS account from creating the name first.
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# Fails unless this account owns the bucket. Do not run the deploy below if it fails.
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+```
 
+Run the deploy only if the `head-bucket` check above succeeded:
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
@@ -1336,10 +1368,15 @@ If you deployed CDC, the app also created the plugin bucket
 nothing prunes it: it keeps every CDC plugin file a deploy uploaded
 (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each). Every deployment of the tool in this
 account and region shares it; once none of them is still in use, delete it for a clean
-slate (this cannot be undone):
+slate. This cannot be undone, and frees the name: the tool creates the bucket again under
+the same name when it next needs it, and refuses a bucket by that name that another account
+created meanwhile. Delete it only if this account owns it — the `head-bucket` check fails,
+and nothing is deleted, if it does not:
 
 ```bash
-aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
 ```
 
 ---

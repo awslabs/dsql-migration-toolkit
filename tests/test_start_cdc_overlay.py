@@ -354,7 +354,8 @@ def test_the_dialog_probe_lists_the_statements_or_says_it_cannot():
 
 
 def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, backstop_raises=False,
-                     exclude=False, cancel_in_overlay=False, swap_target=False):
+                     exclude=False, cancel_in_overlay=False, swap_target=False,
+                     account_unreadable=False, seen=None):
     import dsql_migrator.config as _config
     import dsql_migrator.core.cdc_deployer as _dep
     import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
@@ -368,15 +369,30 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
     class _Deployer:
         template_s3_bucket = ""
 
-        def _client(self, _svc):
-            return SimpleNamespace(get_caller_identity=lambda: {"Account": "111122223333"})
+        def caller_account_id(self):  # the bucket the template is staged in (STS, once)
+            order.append("account")
+            if account_unreadable:
+                from dsql_migrator.core.s3_ownership import BucketOwnershipError
+
+                raise BucketOwnershipError(
+                    "Could not read this identity's AWS account ID (sts:GetCallerIdentity: "
+                    "ExpiredToken)."
+                )
+            return "111122223333"
 
     def _run(*_a, **kw):
         order.append("run_cdc_start")
         if run_raises:
             raise RuntimeError("connector create failed")
 
-    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", lambda *a, **k: order.append("deployer") or _Deployer())
+    def _build(*_a, **_k):
+        order.append("deployer")
+        deployer = _Deployer()
+        if seen is not None:
+            seen["deployer"] = deployer
+        return deployer
+
+    monkeypatch.setattr(_dep, "build_cdc_stack_deployer", _build)
     monkeypatch.setattr(_dep, "run_cdc_start", _run)
     monkeypatch.setattr(_cdcui, "_read_cdc_template_body", lambda: "T")
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)
@@ -450,13 +466,28 @@ def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, bac
 
 
 def test_the_overlay_runs_after_the_backstops_and_before_the_deployer(monkeypatch):
-    order, error = _drive_start_cdc(monkeypatch)
+    seen: dict = {}
+    order, error = _drive_start_cdc(monkeypatch, seen=seen)
     assert error is None
+    # The template goes to the managed bucket of the deployer's own account and region.
+    assert seen["deployer"].template_s3_bucket == "mysql-dsql-migrator-plugins-111122223333-us-east-1"
     # The deployer is built (and describes the stack) BEFORE the overlay, so the
     # exclusion-set staleness refusal runs before anything changes; connectors are only
-    # created by run_cdc_start, after the overlay.
-    assert order == ["classify", "on_cdc_start", "submit", "fk", "deployer", "overlay", "run_cdc_start",
-                     "on_cdc_start"]
+    # created by run_cdc_start, after the overlay. The account that names the template's
+    # bucket (and must own it) is read right after the deployer is built.
+    assert order == ["classify", "on_cdc_start", "submit", "fk", "deployer", "account", "overlay",
+                     "run_cdc_start", "on_cdc_start"]
+
+
+def test_a_start_that_cannot_read_its_account_stops_before_anything_changes(monkeypatch):
+    # The template (over CloudFormation's inline limit) can only be staged in a bucket the
+    # deployer's own account is shown to own. Before, an unreadable account was swallowed:
+    # the overlay ALTERed the target and the Start failed later with "a deploy-wiring bug".
+    order, error = _drive_start_cdc(monkeypatch, account_unreadable=True)
+    assert isinstance(error, RuntimeError)
+    assert str(error).startswith("Start CDC blocked: Could not read this identity's AWS account ID")
+    assert "overlay" not in order and "run_cdc_start" not in order
+    assert order[-1] == "on_cdc_start"
 
 
 def test_a_start_with_overlay_columns_marks_the_ledger_in_use_before_submit(monkeypatch):

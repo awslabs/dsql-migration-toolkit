@@ -257,7 +257,9 @@ app-stack（deploy/cloudformation.yaml）を私の AWS アカウントにデプ�
    （VPN/ピアリングで到達）か internet-facing + Cognito ログインか、そして AI assist
    （Amazon Bedrock）を有効にするかどうか。
 5. 私の OK が出たらデプロイする — スタック名は小文字で 28 文字以内; テンプレートは
-   --s3-bucket でステージングする（CloudFormation の 51,200 バイトのインライン上限を超えるため）;
+   --s3-bucket でステージングする（CloudFormation の 51,200 バイトのインライン上限を超えるため）。
+   そのバケットは名前の末尾にランダムなサフィックスを付け、先に `aws s3api head-bucket
+   --expected-bucket-owner` でこのアカウントの所有であることを確認する（違えば止まる）;
    --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を使う。CREATE_COMPLETE を待ってから、
    AppUrl 出力とその到達方法を表示する（ALB はデフォルトで internal）。
 
@@ -444,12 +446,20 @@ export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 このテンプレートは CloudFormation のインライン アップロード上限(51,200 バイト)を超えて
 いるため、CLI がステージング用の S3 バケットを必要とします(Console はこれを裏側で
 自動的に処理するため、推奨パスになっています)。一度だけ作成するか、この
-アカウント/リージョンに既存のバケットがあれば再利用してください:
+アカウント/リージョンに既存のバケットがあれば再利用してください。新しいバケットには
+ランダムなサフィックスを付けてください: アカウント ID とリージョンだけで作った名前は予測でき、
+別の AWS アカウントが先に作成できます。そのうえでこのアカウントがバケットを所有していることを
+確認し、**確認が失敗したら止まってください** — CloudFormation はそのバケットが渡すテンプレートを
+何であれデプロイします:
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# 新しいバケット。所有するバケットを再利用する場合は TEMPLATE_BUCKET をその名前にし、"s3 mb" は飛ばします。
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# このアカウントがバケットを所有していなければ失敗します。失敗したらこのバケットからデプロイしないでください。
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+echo "$TEMPLATE_BUCKET"  # 名前を控えてください: 後の更新も同じバケットからデプロイします
 ```
 
 ```bash
@@ -724,6 +734,10 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
+# $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット(このテンプレートは
+# CloudFormation のインラインアップロード上限 51,200 バイトを超えています)。この確認が成功したときだけデプロイ:
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+
 aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
   --stack-name mysql-dsql-migrator --region "$AWS_REGION" \
@@ -731,8 +745,6 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides ContainerImageUri=$IMAGE_URI
   # (他のパラメータを再度指定するか、以前の値に依存する)
-  # $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット
-  # (このテンプレートは CloudFormation のインラインアップロード上限 51,200 バイトを超えています)
 ```
 
 > [!IMPORTANT]
@@ -864,8 +876,11 @@ yet* で拒否された場合は、上記のとおり契約を承諾してから
 >    したすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB。
 >    整理するものはありません）と、ECS Fargate では保存されたセッションとジョブの状態を保持します。
 >    このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
->    使用していないときにだけ削除してください。削除は元に戻せません:
->    `aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+>    使用していないときにだけ削除してください。削除は元に戻せず、名前を手放します: ツールは次に
+>    必要になったとき同じ名前でバケットを作り直し、その間に別のアカウントがその名前で作成した
+>    バケットは拒否します。このアカウントが所有している場合にだけ削除してください — 所有して
+>    いなければ `head-bucket` の確認が失敗し、何も削除されません:
+>    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **何も残っていないことを確認** — `mysql-dsql-*` または `dsql-cdc-*` の CloudFormation
 >    スタックが残っていないこと
 >    （`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`）、
@@ -929,6 +944,13 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   （再デプロイ）を越えて保持されます。上記の安定したクッキーシークレットと合わせて、再接続した
   ブラウザは Step 1（Evaluation）を再実行せずにワークベンチを再開します。非機密のみ（Property 7）—
   ソース DB のパスワードは Connect 画面で再入力します。
+- **管理バケットの所有権**: プラグインバケットの名前はアカウント ID とリージョンから決まるため、
+  別の AWS アカウントがその名前のバケットを先に作成できます。アプリがこのバケットに送るすべての
+  リクエスト（CDC プラグインとテンプレートのアップロード、ジョブとセッションの状態）は、このアカウントを
+  バケットの想定所有者として指定し、このアカウントがバケットを所有していなければ S3 が拒否します。別の
+  アカウントにあるその名前のバケットは決して使用しません: Deploy CDC infrastructure と Start CDC は
+  バケット名と対処方法を示すエラーで止まり、ジョブとセッションの状態は保存されません（起動時に
+  アクティビティログに記録されます）。
 - **監査証跡**: 構造化されたアクティビティログ（成功 + 失敗のタイムライン、UI から
   ダウンロード可能）は、シークレットではないフィールドのみを記録します — 行の値、
   パスワード、IAM トークンは決して記録しません。タスクの一時ディスク上でサイズ上限が
@@ -1086,7 +1108,9 @@ app-stack（deploy/cloudformation-ec2.yaml）を私の AWS アカウントにデ
    （サブネットの選択と MskEgressCidr に影響する）、SourceMode git（デフォルト; 公開リポジトリを
    クローンする）か s3 か、そして AI assist（Amazon Bedrock）を有効にするかどうか。
 4. 私の OK が出たらデプロイする — テンプレートは --s3-bucket でステージングする（CloudFormation の
-   51,200 バイトのインライン上限を超えるため）; --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を
+   51,200 バイトのインライン上限を超えるため）。そのバケットは名前の末尾にランダムなサフィックスを
+   付け、先に `aws s3api head-bucket --expected-bucket-owner` でこのアカウントの所有であることを
+   確認する（違えば止まる）; --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM を
    使う; スタック名は mysql-dsql-migrator-ec2 にする（dsql-cdc- または mysql-dsql-cdc- で始めてはいけない）。
    CREATE_COMPLETE を待ってから、SSM ポートフォワードで UI に到達する方法を私に伝える。
 
@@ -1132,10 +1156,17 @@ export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID
 
 # このテンプレートは CloudFormation のインラインアップロード上限(51,200 バイト)を超えて
 # いるため、CLI がステージング用の S3 バケットを必要とします。一度だけ作成するか、既存の
-# バケットがあれば再利用してください:
-export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$AWS_REGION
-aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+# バケットがあれば再利用してください（TEMPLATE_BUCKET をその名前にし、"s3 mb" は飛ばします）。
+# ランダムなサフィックスがあれば、別の AWS アカウントがその名前を先に作成することはできません。
+export TEMPLATE_BUCKET=mysql-dsql-migrator-templates-$ACCOUNT-$(openssl rand -hex 4)
+aws s3 mb "s3://$TEMPLATE_BUCKET" --region "$AWS_REGION"
+# このアカウントがバケットを所有していなければ失敗します。失敗したら下のデプロイを実行しないでください。
+aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT"
+```
 
+上の `head-bucket` の確認が成功したときだけデプロイを実行してください:
+
+```bash
 aws cloudformation deploy \
   --template-file deploy/cloudformation-ec2.yaml \
   --stack-name mysql-dsql-migrator-ec2 \
@@ -1321,10 +1352,15 @@ CDC をデプロイした場合、アプリはプラグインバケット `mysql
 も作成しています。どのスタックも所有しないためこのバケットも残り、整理するものもありません: デプロイが
 アップロードしたすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB）を
 保持します。このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
-使用していない状態になったら、クリーンな状態にするために削除してください（元に戻せません）:
+使用していない状態になったら、クリーンな状態にするために削除してください。元に戻せず、名前を手放します:
+ツールは次に必要になったとき同じ名前でバケットを作り直し、その間に別のアカウントがその名前で作成した
+バケットは拒否します。このアカウントが所有している場合にだけ削除してください — 所有していなければ
+`head-bucket` の確認が失敗し、何も削除されません:
 
 ```bash
-aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
 ```
 
 ---

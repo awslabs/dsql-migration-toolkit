@@ -9614,6 +9614,24 @@ def _start_cdc_deploy(
         deployer = build_cdc_stack_deployer(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )
+        # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the deployer
+        # stages it in S3 via TemplateURL, in the tool's managed bucket for the deployer's own
+        # account and region (the bucket the infra deploy created). The deployer reads that
+        # account once, and its upload asserts it as the bucket's owner, so a bucket another
+        # account holds under that name is refused. The template cannot be staged without the
+        # account, so a Start that cannot read it stops here, before anything changes.
+        from dsql_migrator.core.s3_ownership import BucketOwnershipError
+        from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
+
+        try:
+            deployer.template_s3_bucket = _pbucket(deployer.caller_account_id(), region)
+        except BucketOwnershipError as exc:
+            _log_cdc_event(
+                "start blocked: S3 bucket owner unknown",
+                status=ActivityStatus.FAILURE,
+                detail=str(exc),
+            )
+            raise RuntimeError(f"Start CDC blocked: {exc}") from exc
         # The exclusion-set staleness checks BEFORE anything changes (the overlay below
         # ALTERs the target and writes the ledger): judged against a fresh describe here,
         # and again by run_cdc_start against its own.
@@ -9644,15 +9662,6 @@ def _start_cdc_deploy(
         _apply_start_cdc_overlay(handle, **_overlay_plan)
         if getattr(handle, "cancelled", False):
             return
-        # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the deployer
-        # stages it in S3 via TemplateURL. Derive the bucket name from the deterministic
-        # naming convention (same bucket the infra deploy created).
-        from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
-        try:
-            _acct = deployer._client("sts").get_caller_identity()["Account"]  # type: ignore[attr-defined]
-            deployer.template_s3_bucket = _pbucket(_acct, region)
-        except Exception:  # noqa: BLE001 — best-effort; a later step fails with a clear message
-            pass
         template_body = _read_cdc_template_body()
         # SeedMode is derived ENGINE-AWARE above (FIX 4): a PostgreSQL source forces
         # "external" (its stack is always SeedMode=External) so the in-process Kafka prep

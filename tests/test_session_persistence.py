@@ -206,6 +206,25 @@ class _S3Error(Exception):
         self.response = {"Error": {"Code": code}}
 
 
+# The account that owns the fakes' buckets: every request must assert it as the owner
+# (ExpectedBucketOwner, a required keyword below), as the store reads it from STS.
+_OWNER = "123456789012"
+
+
+class _OwnerSts:
+    def get_caller_identity(self):
+        return {"Account": _OWNER}
+
+
+_OWNER_STS = _OwnerSts()
+
+
+def _owned(owner: str) -> None:
+    """A request reaches the fakes' buckets only as their owner's (S3 answers 403 otherwise)."""
+    if owner != _OWNER:
+        raise _S3Error("AccessDenied", "the expected bucket owner differs")
+
+
 class _Body:
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -218,7 +237,8 @@ class _FakePaginator:
     def __init__(self, objects: dict) -> None:
         self._objects = objects
 
-    def paginate(self, *, Bucket, Prefix=""):  # noqa: N803
+    def paginate(self, *, Bucket, ExpectedBucketOwner, Prefix=""):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         contents = [
             {"Key": key, "LastModified": lm}
             for key, (_, lm) in self._objects.items()
@@ -239,28 +259,32 @@ class _FakeS3:
         self._clock = 0
         self.created_buckets: list[str] = []
 
-    def head_bucket(self, *, Bucket):  # noqa: N803
+    def head_bucket(self, *, Bucket, ExpectedBucketOwner):  # noqa: N803
         if Bucket not in self._buckets:
             raise _S3Error("404", "Not Found")
+        _owned(ExpectedBucketOwner)
 
-    def create_bucket(self, *, Bucket, **_kw):  # noqa: N803
+    def create_bucket(self, *, Bucket, **_kw):  # noqa: N803 - takes no expected owner
         self._buckets.add(Bucket)
         self.created_buckets.append(Bucket)
 
-    def put_object(self, *, Bucket, Key, Body, **_kw):  # noqa: N803
+    def put_object(self, *, Bucket, Key, Body, ExpectedBucketOwner, **_kw):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         if self._put_error is not None:
             raise self._put_error
         self._clock += 1
         last_modified = datetime(2026, 7, 11, 0, 0, 0, self._clock, tzinfo=timezone.utc)
         self._objects[Key] = (bytes(Body), last_modified)
 
-    def get_object(self, *, Bucket, Key):  # noqa: N803
+    def get_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         if Key not in self._objects:
             raise _S3Error("NoSuchKey", "Not Found")
         body, _ = self._objects[Key]
         return {"Body": _Body(body)}
 
-    def delete_object(self, *, Bucket, Key):  # noqa: N803
+    def delete_object(self, *, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        _owned(ExpectedBucketOwner)
         self._objects.pop(Key, None)
 
     def get_paginator(self, _name):
@@ -269,7 +293,7 @@ class _FakeS3:
 
 def test_s3_session_store_round_trips_and_deletes() -> None:
     fake = _FakeS3(buckets=("b",))
-    store = S3SessionStateStore("b", s3_client=fake)
+    store = S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake)
     store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:orders"]))
 
     loaded = store.load("s1")
@@ -286,7 +310,7 @@ def test_s3_session_store_creates_bucket_when_absent() -> None:
     # Self-provisioning: if the managed bucket is not there yet, the store creates
     # it (idempotent) on first save -- no separate setup step for the customer.
     fake = _FakeS3(buckets=())
-    store = S3SessionStateStore("b", region="ap-northeast-2", s3_client=fake)
+    store = S3SessionStateStore("b", region="ap-northeast-2", sts_client=_OWNER_STS, s3_client=fake)
     store.save(SessionSnapshot(session_id="s1"))
     assert "b" in fake.created_buckets
     assert store.load("s1") is not None
@@ -294,7 +318,7 @@ def test_s3_session_store_creates_bucket_when_absent() -> None:
 
 def test_s3_session_store_prune_keeps_most_recent() -> None:
     fake = _FakeS3(buckets=("b",))
-    store = S3SessionStateStore("b", s3_client=fake)
+    store = S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake)
     for sid in ("old1", "old2", "new1"):  # saved in order -> new1 is most recent
         store.save(SessionSnapshot(session_id=sid))
 
@@ -308,7 +332,7 @@ def test_s3_session_store_save_is_best_effort_on_error() -> None:
     # A transient S3 error on save must be swallowed so the live UI never breaks;
     # persistence merely degrades (a later load finds nothing).
     fake = _FakeS3(buckets=("b",), put_error=_S3Error("SlowDown", "throttled"))
-    store = S3SessionStateStore("b", s3_client=fake)
+    store = S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake)
     store.save(SessionSnapshot(session_id="s1"))  # must NOT raise
     assert store.load("s1") is None
 
@@ -323,7 +347,7 @@ def test_s3_session_store_save_swallows_serialization_error() -> None:
             raise ValueError("cannot serialize")
 
     fake = _FakeS3(buckets=("b",))
-    store = S3SessionStateStore("b", s3_client=fake)
+    store = S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake)
     store.save(_BoomSnapshot())  # must NOT raise
     assert store.load("s1") is None  # nothing was written
 
@@ -347,7 +371,7 @@ def test_a_background_s3_store_uploads_off_the_caller_and_coalesces() -> None:
     import time
 
     fake = _SlowS3(buckets=("b",))
-    store = S3SessionStateStore("b", s3_client=fake, background=True)
+    store = S3SessionStateStore("b", sts_client=_OWNER_STS, s3_client=fake, background=True)
     started = time.monotonic()
     store.save(SessionSnapshot(session_id="s1", generated_node_ids=["table:a"]))
     # The first PUT is in flight (held by the gate) before the next saves queue.
@@ -2543,7 +2567,9 @@ def test_a_flush_that_times_out_names_the_unwritten_sessions(caplog) -> None:
             gate.wait(5)
             return super().put_object(**kwargs)
 
-    store = S3SessionStateStore("b", s3_client=_HeldS3(buckets=("b",)), background=True)
+    store = S3SessionStateStore(
+        "b", sts_client=_OWNER_STS, s3_client=_HeldS3(buckets=("b",)), background=True
+    )
     store.save(SessionSnapshot(session_id="s9", generated_node_ids=["table:a"]))
     with caplog.at_level(logging.WARNING, logger="dsql_migrator.core.session_state_store"):
         assert store.flush(timeout=0.05) is False

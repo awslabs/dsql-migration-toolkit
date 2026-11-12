@@ -82,23 +82,28 @@ def _expected_key(base_key: str, path: Path) -> str:
 
 
 class _Bucket:
-    """One unversioned bucket shared by every build: a write replaces the object."""
+    """One unversioned bucket shared by every build: a write replaces the object. It is this
+    account's, and every request must say so (``ExpectedBucketOwner``; a missing one is a
+    TypeError, as for a request S3 would not let through)."""
 
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, dict]] = {}
         self.puts: list[str] = []
 
-    def head_bucket(self, **_kw):
+    def head_bucket(self, *, Bucket, ExpectedBucketOwner):  # noqa: N803
+        assert ExpectedBucketOwner == _ACCOUNT
         return {}
 
-    def head_object(self, Bucket, Key):  # noqa: N803
+    def head_object(self, Bucket, Key, ExpectedBucketOwner):  # noqa: N803
+        assert ExpectedBucketOwner == _ACCOUNT
         if Key not in self.objects:
             raise RuntimeError("404 Not Found")
         body, metadata = self.objects[Key]
         # A multipart-style ETag, so a skip has to rest on the stamped SHA-256.
         return {"ContentLength": len(body), "ETag": '"0f-2"', "Metadata": dict(metadata)}
 
-    def put_object(self, Bucket, Key, Body, Metadata=None):  # noqa: N803
+    def put_object(self, Bucket, Key, Body, ExpectedBucketOwner, Metadata=None):  # noqa: N803
+        assert ExpectedBucketOwner == _ACCOUNT
         self.objects[Key] = (bytes(Body), dict(Metadata or {}))
         self.puts.append(Key)
         return {}
@@ -142,10 +147,15 @@ def test_a_managed_upload_is_told_to_use_one_put(tmp_path: Path) -> None:
 
     artifact = tmp_path / "a.zip"
     artifact.write_bytes(b"x" * 10)
-    upload_plugin(_Managed(), _BUCKET, "cdc-plugins/0123/a.zip", artifact)
+    upload_plugin(
+        _Managed(), _BUCKET, "cdc-plugins/0123/a.zip", artifact, expected_owner=_ACCOUNT
+    )
     ((key, extra_args, config),) = received
     assert key == "cdc-plugins/0123/a.zip"
-    assert extra_args == {"Metadata": {"sha256": _sha256(b"x" * 10)}}
+    assert extra_args == {
+        "Metadata": {"sha256": _sha256(b"x" * 10)},
+        "ExpectedBucketOwner": _ACCOUNT,
+    }
     assert config is not None
     assert config.multipart_threshold == s3_provision._SINGLE_PUT_THRESHOLD
 
@@ -223,11 +233,17 @@ def test_a_real_boto3_upload_above_8_mib_is_one_put_object(
     artifact = tmp_path / "dsql-sink-connector.zip"
     with artifact.open("wb") as fh:
         fh.truncate(9 * 1024 * 1024)
-    upload_plugin(client, _BUCKET, "cdc-plugins/0123/dsql-sink-connector.zip", artifact)
+    upload_plugin(
+        client, _BUCKET, "cdc-plugins/0123/dsql-sink-connector.zip", artifact,
+        expected_owner=_ACCOUNT,
+    )
 
     assert [name for name, _ in calls] == ["HeadObject", "PutObject"]
     put = calls[1][1]
     assert put["headers"]["x-amz-meta-sha256"] == _sha256(artifact.read_bytes())
+    # Both requests assert that this account owns the bucket.
+    for _name, params in calls:
+        assert params["headers"]["x-amz-expected-bucket-owner"] == _ACCOUNT
     # Streamed from the file, never read into memory whole.
     assert not isinstance(put["body"], (bytes, bytearray))
     assert connects == []
@@ -454,7 +470,9 @@ def test_another_builds_upload_cannot_change_what_the_az_retry_registers(
         if other_build == "pre-G25 fixed keys":
             # The deployed older app: it uploads to the fixed, shared keys.
             for base_key in (DEBEZIUM_PLUGIN_KEY, DSQL_SINK_PLUGIN_KEY, LAMBDA_SEEDER_KEY):
-                upload_plugin(bucket, _BUCKET, base_key, theirs[base_key])
+                upload_plugin(
+                    bucket, _BUCKET, base_key, theirs[base_key], expected_owner=_ACCOUNT
+                )
         else:
             _use(monkeypatch, theirs)
             try:

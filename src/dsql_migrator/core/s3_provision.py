@@ -14,9 +14,13 @@ only reference one set: the MySQL and PostgreSQL source plugins are mutually exc
 (``IsMySqlSource`` / ``IsPostgresSource``) and the offset-seeder Lambda seeds a MySQL
 binlog offset (``DeploySeederFunction`` ANDs ``IsMySqlSource``). The sink is shared.
 
-Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``
-(globally unique because the account id is in the name), so every tool build that deploys
-in an account and region shares it. Each artifact is therefore uploaded to a
+Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``,
+so every tool build that deploys in an account and region shares it. The account ID in the
+name does NOT make the bucket this account's: anyone who knows the ID can create a bucket
+with that name first, in their own account. So every request to the bucket asserts this
+account as its owner (``ExpectedBucketOwner``, through
+:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`), and a bucket another account owns is
+refused (:class:`S3ProvisionError`), never adopted. Each artifact is uploaded to a
 CONTENT-ADDRESSED key, ``cdc-plugins/<first 16 hex digits of its SHA-256>/<name>``: the
 key a deploy hands to its cdc-stack names the bytes that deploy hashed, and no other build
 writes different bytes there. Uploads are idempotent (skipped only when the object's size
@@ -39,6 +43,12 @@ from typing import Callable, Optional
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import SourceType
+from dsql_migrator.core.s3_ownership import (
+    BucketOwnershipError,
+    OwnedBucket,
+    caller_account_id,
+    refusal_text,
+)
 
 # The artifacts' BASE keys. An upload goes to the content-addressed key derived from one
 # (_content_key: cdc-plugins/<sha256[:16]>/<name>), which is what PluginUploadResult and the
@@ -939,17 +949,21 @@ def build_sts_client(
 
 
 def get_account_id(sts_client: BotoSessionLike) -> str:
-    """Return the caller's AWS account id via ``sts:GetCallerIdentity``."""
+    """Return the caller's AWS account id via ``sts:GetCallerIdentity``: the account in the
+    managed bucket's name AND the owner every request to the bucket asserts.
+    :class:`S3ProvisionError` when it cannot be read (the bucket is then not used at all)."""
     try:
-        return str(sts_client.get_caller_identity()["Account"])  # type: ignore[attr-defined]
-    except Exception as exc:  # noqa: BLE001
-        raise S3ProvisionError(
-            f"Could not resolve the AWS account id: {str(exc).splitlines()[0]}"
-        ) from exc
+        return caller_account_id(sts_client)
+    except BucketOwnershipError as exc:
+        raise S3ProvisionError(str(exc)) from exc
 
 
 def plugin_bucket_name(account_id: str, region: str) -> str:
-    """Return the deterministic managed-plugin bucket name for this identity."""
+    """Return the deterministic managed-plugin bucket name for this identity.
+
+    Predictable from the account ID and Region, so the name says nothing about who owns the
+    bucket: every request to it goes through an
+    :class:`~dsql_migrator.core.s3_ownership.OwnedBucket` bound to the caller's own account."""
     return f"mysql-dsql-migrator-plugins-{account_id}-{region}"
 
 
@@ -986,38 +1000,25 @@ def _artifact_paths() -> tuple[Path, Path, Path, Path]:
 def ensure_plugin_bucket(
     s3_client: BotoSessionLike, account_id: str, region: str
 ) -> str:
-    """Return the managed plugin bucket name, creating it if absent.
+    """Return the managed plugin bucket name, creating it if absent; ``account_id`` (the
+    caller's own, from :func:`get_account_id`) must own it.
 
-    ``head_bucket`` to probe existence; on a miss, ``create_bucket`` with the
-    region's quirk handled (us-east-1 rejects a ``LocationConstraint``). A bucket
-    we already own is fine (idempotent); a name owned by another account, or any
-    other failure, raises :class:`S3ProvisionError`.
+    :meth:`OwnedBucket.ensure <dsql_migrator.core.s3_ownership.OwnedBucket.ensure>`: an
+    owner-checked ``head_bucket``; on a 404, ``create_bucket`` with the region's quirk
+    handled (us-east-1 rejects a ``LocationConstraint``), then the owner-checked
+    ``head_bucket`` again. A bucket we already own is fine (idempotent). A name another
+    account owns (a 403 to the owner-checked request, or ``BucketAlreadyExists``) is refused,
+    never adopted, and so is any other failure: :class:`S3ProvisionError`.
     """
     bucket = plugin_bucket_name(account_id, region)
     try:
-        s3_client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
-        return bucket  # already exists and we can reach it
-    except Exception:  # noqa: BLE001 - not found / no access; try to create
-        pass
-    try:
-        if region == "us-east-1":
-            s3_client.create_bucket(Bucket=bucket)  # type: ignore[attr-defined]
-        else:
-            s3_client.create_bucket(  # type: ignore[attr-defined]
-                Bucket=bucket,
-                CreateBucketConfiguration={"LocationConstraint": region},
-            )
+        OwnedBucket(s3_client, bucket, account_id).ensure(region)
+    except BucketOwnershipError as exc:
+        raise S3ProvisionError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        if "BucketAlreadyOwnedByYou" in msg:
-            return bucket  # race / prior create; we own it
-        if "BucketAlreadyExists" in msg:
-            raise S3ProvisionError(
-                f"S3 bucket '{bucket}' already exists in another account. "
-                "This should not happen (the account id is in the name)."
-            ) from exc
         raise S3ProvisionError(
-            f"Could not create plugin bucket '{bucket}': {msg.splitlines()[0]}"
+            f"Could not check or create plugin bucket '{bucket}': "
+            f"{(str(exc).splitlines() or [type(exc).__name__])[0]}"
         ) from exc
     return bucket
 
@@ -1084,11 +1085,17 @@ def upload_plugin(
     key: str,
     local_path: Path,
     *,
+    expected_owner: str,
     on_progress: Optional[Callable[[str], None]] = None,
     local_sha256: Optional[str] = None,
 ) -> None:
     """Upload ``local_path`` to ``s3://bucket/key``, skipping only when the object is
     PROVEN to hold the same bytes.
+
+    Every request asserts ``expected_owner`` (the caller's own account ID) as the bucket's
+    owner, through :class:`~dsql_migrator.core.s3_ownership.OwnedBucket`. In a bucket another
+    account owns, the ``head_object`` and the upload both fail (403), so that account's
+    object can neither make the upload skip nor receive it.
 
     A cdc-stack CustomPlugin names no object version, so whatever the object holds is
     what a deploy registers; :func:`ensure_and_upload_plugins` passes the artifact's
@@ -1106,6 +1113,10 @@ def upload_plugin(
     """
     if not local_path.is_file():
         raise S3ProvisionError(f"Plugin artifact not found on disk: {local_path}")
+    try:
+        owned = OwnedBucket(s3_client, bucket, expected_owner)
+    except BucketOwnershipError as exc:
+        raise S3ProvisionError(str(exc)) from exc
 
     def _log(msg: str) -> None:
         if on_progress is not None:
@@ -1115,7 +1126,7 @@ def upload_plugin(
     if local_sha256 is None:
         local_sha256 = _artifact_sha256(local_path)
     try:
-        head = s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore[attr-defined]
+        head = owned.head_key(key)
         remote_size = int(head.get("ContentLength", -1))
         if remote_size == local_size:
             stored = str((head.get("Metadata") or {}).get(_SHA256_METADATA_KEY, ""))
@@ -1131,23 +1142,22 @@ def upload_plugin(
     metadata = {_SHA256_METADATA_KEY: local_sha256}
     _log(f"Uploading {key} ({local_size // (1024 * 1024)} MiB)…")
     try:
-        upload_file = getattr(s3_client, "upload_file", None)
-        if callable(upload_file):
+        if callable(getattr(s3_client, "upload_file", None)):
             from boto3.s3.transfer import TransferConfig  # local import, like aws_session
 
-            upload_file(
+            owned.upload(
                 str(local_path),
-                bucket,
                 key,
-                ExtraArgs={"Metadata": metadata},
-                Config=TransferConfig(multipart_threshold=_SINGLE_PUT_THRESHOLD),
+                extra_args={"Metadata": metadata},
+                config=TransferConfig(multipart_threshold=_SINGLE_PUT_THRESHOLD),
             )
         else:
             with local_path.open("rb") as fh:
-                s3_client.put_object(  # type: ignore[attr-defined]
-                    Bucket=bucket, Key=key, Body=fh.read(), Metadata=metadata
-                )
+                owned.put(key, fh.read(), Metadata=metadata)
     except Exception as exc:  # noqa: BLE001
+        refusal = refusal_text(exc, owned)
+        if refusal is not None:
+            raise S3ProvisionError(refusal) from exc
         raise S3ProvisionError(
             f"Failed to upload {key}: {str(exc).splitlines()[0]}"
         ) from exc
@@ -1183,6 +1193,12 @@ def ensure_and_upload_plugins(
     parameter can never name an artifact that is not in the bucket -- that is also what
     keeps the template's ``Fn::Equals [LambdaSeederS3Key, ""]`` truthful for a PostgreSQL
     stack without the params patcher needing to know anything about engines.
+
+    Every request to the bucket asserts the caller's own account (``sts:GetCallerIdentity``)
+    as its owner, so the bucket is used only once that account is shown to own it, and every
+    artifact lands there (a bucket cannot change owner without being deleted): the objects
+    the cdc-stack's CustomPlugins and seeder Lambda read by name are the ones uploaded here.
+
     Raises :class:`S3ProvisionError` on any unrecoverable failure.
     """
     account_id = get_account_id(sts_client)
@@ -1228,7 +1244,7 @@ def ensure_and_upload_plugins(
         keys[base_key] = _content_key(base_key, sha256)
         upload_plugin(
             s3_client, bucket, keys[base_key], path,
-            on_progress=on_progress, local_sha256=sha256,
+            expected_owner=account_id, on_progress=on_progress, local_sha256=sha256,
         )
 
     return PluginUploadResult(
