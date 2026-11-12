@@ -681,7 +681,10 @@ Evaluation → Schema Conversion → Data Migration → Validation → Cut over)
 
 ### 새 이미지 버전으로 업데이트
 
-새 태그를 빌드·푸시한 뒤 새 `ContainerImageUri`로 재배포합니다. ECS가 태스크를 롤링 교체합니다:
+새 태그를 빌드·푸시한 뒤 새 `ContainerImageUri`로 재배포합니다. ECS가 태스크를 롤링 교체합니다.
+`$TEMPLATE_BUCKET`은 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷이고(이 템플릿은 CloudFormation 인라인
+업로드 한도 51,200바이트를 초과합니다), 배포는 `head-bucket` 확인으로 이 계정이 그 버킷을 소유함이
+확인될 때만 실행됩니다:
 
 ```bash
 export IMAGE_TAG=0.1.1
@@ -690,9 +693,6 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
-# $TEMPLATE_BUCKET: 위 AWS CLI 배포 섹션에서 만든 스테이징 버킷(이 템플릿은 CloudFormation 인라인
-# 업로드 한도 51,200바이트를 초과합니다). 이 계정이 버킷을 소유할 때만 배포합니다: 아니면
-# head-bucket 확인이 실패합니다.
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
   && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
@@ -884,22 +884,39 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   쿠키 시크릿과 함께, 재연결한 브라우저가 Step 1(Evaluation) 재실행 없이 워크벤치를 재개. 비밀 아님만(Property 7) —
   소스 DB 비밀번호는 Connect 화면에서 다시 입력.
 - **관리형 버킷 소유권**: 플러그인 버킷의 이름은 계정 ID와 리전으로 정해지므로, 다른 AWS 계정이 그 이름의
-  버킷을 먼저 만들 수 있음. 앱이 이 버킷에 보내는 모든 요청(CDC 플러그인·템플릿 업로드, 작업·세션 상태)은
-  이 계정을 버킷의 예상 소유자로 지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 다른 계정에 있는 그
-  이름의 버킷은 절대 사용하지 않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은
-  오류로 멈추고, 작업·세션 상태는 저장되지 않음(시작 시 활동 로그에 기록). `DSQL_MIGRATOR_JOB_STATE_BUCKET`
-  또는 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`으로 지정한 버킷도 마찬가지. 툴에는 플러그인 버킷의 다른
-  이름을 고르는 설정이 없으므로, 다른 계정이 그 이름의 버킷을 가지고 있는 동안에는 이 계정과 리전에서
-  Deploy CDC infrastructure를 실행할 수 없고, ECS Fargate에서는 작업·세션 상태가 저장되지 않음.
+  버킷을 먼저 만들 수 있음. 앱이 이 버킷에 보내는 모든 요청(CDC 플러그인·템플릿 업로드, 그리고 ECS
+  Fargate에서는 작업·세션 상태와 컬럼 제외가 제거한 DEFAULT의 기록)은 이 계정을 버킷의 예상 소유자로
+  지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 다른 계정에 있는 그 이름의 버킷은 절대 사용하지
+  않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은 오류로 멈추고, 작업·세션
+  상태는 저장되지 않음(시작 시 활동 로그에 기록). 그 기록(오버레이 원장, 매뉴얼 §13.6)이 없으면, 제외된
+  컬럼이 있는 테이블을 포함한 Full Load는 시작되지 않음: Start 대화상자가 *Could not read the record of
+  excluded-column changes*를 표시하고 Start를 비활성화하며, 그런 테이블에 이른 실행은 그 테이블을
+  *cannot read the record of dropped DEFAULTs; nothing was changed on this table*로 실패시킴(활동 로그의
+  *overlay ledger unreadable* 항목이 거부된 버킷을 알려 줌). 제외된 컬럼이 없는 테이블만의 Full Load는
+  평소대로 실행됨. `DSQL_MIGRATOR_JOB_STATE_BUCKET` 또는 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`으로
+  지정한 버킷도 마찬가지(오버레이 원장은 세션 상태 버킷에 있음). 툴에는 플러그인 버킷의 다른 이름을 고르는
+  설정이 없으므로, 다른 계정이 그 이름의 버킷을 가지고 있는 동안에는 이 계정과 리전에서 Deploy CDC
+  infrastructure를 실행할 수 없고, ECS Fargate에서는 작업·세션 상태가 저장되지 않으며 제외된 컬럼이 있는
+  테이블을 포함한 Full Load를 실행할 수 없음.
 - **이 계정에서 이전 버전을 실행했다면?** 소유자 확인 이전 버전은 다른 계정에 있는 그 이름의 버킷을, 그
   버킷 정책이 허용하면 사용했고, 이 가이드의 이전 버전은 템플릿 버킷을 확인 없이
-  `mysql-dsql-migrator-templates-<account>-<region>`으로 만들었음. 두 이름을 이 계정의 관리자로
-  확인: `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>`는 이 계정이
-  버킷을 소유하면 성공하고, 그런 버킷이 없으면 404, 다른 계정이 소유하면 403으로 응답함. 둘 중 하나라도 다른
-  계정이 소유한다면 거기서 온 것을 신뢰하지 말 것: CDC 인프라의 커넥터 플러그인·오프셋 시더·템플릿
-  (플러그인 버킷), 앱 스택의 템플릿(템플릿 버킷), 그리고 ECS Fargate에서 복원된 작업·세션 상태. CDC
-  인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을 검토한 뒤, 이 계정이 소유한 버킷에서 이 버전으로
-  다시 배포할 것.
+  `mysql-dsql-migrator-templates-<account>-<region>`으로 만들었음. 두 이름을 이 계정의 관리자로, 앱
+  스택을 업데이트하기 전에 확인할 것: ECS Fargate에서는 앱이 시작할 때마다(v0.1.93 이후), 그 이름의
+  버킷이 없으면 이 계정에 플러그인 버킷을 만듦.
+  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>`는 지금 다른 계정이
+  버킷을 소유하면 403으로 응답함. 200(이 계정이 소유)과 404(그런 버킷 없음)만으로는 그 이름이 안전하다고
+  할 수 없음: 이전 버전이 그 이름을 쓰는 동안 다른 계정이 그 이름을 가지고 있다가 이후 버킷을 삭제했을 수
+  있음. 200은 이 계정의 버킷이 그 이름의 첫 사용 시점이나 그 전에 만들어졌을 때만 안전함(플러그인 버킷: 첫
+  Deploy CDC infrastructure 또는 ECS Fargate 앱 스택의 첫 시작으로, 둘 다 그 이름의 버킷이 없으면 버킷을
+  만듦; 템플릿 버킷: 그 버킷에서의 첫 배포). 그 시점은 이 계정의 CloudTrail에서 그 이름의 가장 최근
+  성공한 `CreateBucket` 이벤트(`BucketAlreadyExists` 같은 `errorCode`가 있는 이벤트는 아무것도 만들지
+  않았음; 콘솔의 Event history는 90일 보관)로, 또는 첫 사용 시점보다 늦지 않은 `aws s3api list-buckets`의
+  `CreationDate`로 알 수 있음(S3는 버킷 정책 편집 같은 버킷 변경 때 이 날짜를 뒤로 옮길 수 있으므로, 더
+  늦은 날짜로는 아무것도 증명되지 않음). 404는 그 이름을 아무것도 사용하지 않았을 때만 안전함. 둘 중
+  하나라도 다른 계정이 소유하거나 안전하다고 확인할 수 없다면 거기서 온 것을 신뢰하지 말 것: CDC 인프라의
+  커넥터 플러그인·오프셋 시더·템플릿(플러그인 버킷), 앱 스택의 템플릿(템플릿 버킷), 그리고 ECS Fargate에서
+  복원된 작업·세션 상태. CDC 인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을 검토한 뒤, 이 계정이
+  소유한 버킷에서 이 버전으로 다시 배포할 것.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.
@@ -992,7 +1009,7 @@ ALB도 없습니다. UI에는 **SSM 포트포워드**로 접속합니다(호스�
 | `DsqlClusterArn` | 예 | — | 타깃 DSQL 클러스터(`dsql:DbConnect` 범위). |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | 하나 필수 | `""` | 소스 DB로의 호스트 egress를 개방(원시 CIDR보다 SG 선호). |
 | `SourceMode` | 아니오 | `git` | `git`(공개 HTTPS로 `SourceRepoUrl@SourceRepoRef` 클론) 또는 `s3`(`SourceS3Uri` tarball). |
-| `SourceS3Uri` | `s3`면 필수 | `""` | 저장소 루트의 `s3://…/source.tar.gz` — 임시 "내 로컬 복사본 실행" 경로. 버킷은 이 계정의 것이어야 합니다: 호스트의 다운로드가 그것을 확인하고, 호스트 역할은 이 객체만 읽을 수 있습니다. |
+| `SourceS3Uri` | `s3`면 필수 | `""` | 저장소 루트의 `s3://…/source.tar.gz` — 임시 "내 로컬 복사본 실행" 경로. 버킷은 이 계정의 것이어야 합니다: 호스트의 다운로드가 그것을 확인합니다. `SourceMode=s3`는 호스트 역할에 이 객체 하나에 대한 `s3:GetObject` 권한을 추가합니다. |
 | `MskEgressCidr` | 아니오 | `0.0.0.0/0` | 인프로세스 시드를 위해 호스트가 MSK 9098에 도달할 CIDR; 최소 권한을 위해 커넥터 서브넷 CIDR로 좁히기. |
 | `InstanceType` | 아니오 | `t3.large` | 컨트롤 플레인 호스트 크기. |
 | `StateVolumeSizeGiB` | 아니오 | `20` | 보존형 EBS 상태 볼륨; 대형 테이블 Full Load의 로컬 CSV 스필오버는 크게. |

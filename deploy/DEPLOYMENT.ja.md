@@ -728,7 +728,10 @@ Schema Conversion → Data Migration → Validation → Cut over）に移動す�
 ### 新しいイメージバージョンへの更新
 
 新しいタグをビルドしてプッシュし、新しい `ContainerImageUri` で再デプロイします。
-ECS はタスクのローリング置き換えを実行します:
+ECS はタスクのローリング置き換えを実行します。`$TEMPLATE_BUCKET` は上の AWS CLI デプロイのセクションで
+作成したステージング用バケットで（このテンプレートは CloudFormation のインラインアップロード上限
+51,200 バイトを超えています）、デプロイは `head-bucket` の確認でこのアカウントがそのバケットを所有して
+いると確かめられたときだけ実行されます:
 
 ```bash
 export IMAGE_TAG=0.1.1
@@ -737,9 +740,6 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
-# $TEMPLATE_BUCKET: 上の AWS CLI デプロイのセクションで作成したステージング用バケット(このテンプレートは
-# CloudFormation のインラインアップロード上限 51,200 バイトを超えています)。このアカウントがバケットを
-# 所有しているときだけデプロイします: そうでなければ head-bucket の確認が失敗します。
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
   && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
@@ -958,26 +958,44 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   ソース DB のパスワードは Connect 画面で再入力します。
 - **管理バケットの所有権**: プラグインバケットの名前はアカウント ID とリージョンから決まるため、
   別の AWS アカウントがその名前のバケットを先に作成できます。アプリがこのバケットに送るすべての
-  リクエスト（CDC プラグインとテンプレートのアップロード、ジョブとセッションの状態）は、このアカウントを
-  バケットの想定所有者として指定し、このアカウントがバケットを所有していなければ S3 が拒否します。別の
-  アカウントにあるその名前のバケットは決して使用しません: Deploy CDC infrastructure と Start CDC は
-  バケット名と対処方法を示すエラーで止まり、ジョブとセッションの状態は保存されません（起動時に
-  アクティビティログに記録されます）。`DSQL_MIGRATOR_JOB_STATE_BUCKET` または
-  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` で指定したバケットも同じです。ツールにはプラグインバケットの別の
+  リクエスト（CDC プラグインとテンプレートのアップロード、そして ECS Fargate ではジョブとセッションの状態と、
+  列の除外が削除した DEFAULT の記録）は、このアカウントをバケットの想定所有者として指定し、このアカウントが
+  バケットを所有していなければ S3 が拒否します。別のアカウントにあるその名前のバケットは決して使用しません:
+  Deploy CDC infrastructure と Start CDC はバケット名と対処方法を示すエラーで止まり、ジョブとセッションの
+  状態は保存されません（起動時にアクティビティログに記録されます）。その記録（オーバーレイ台帳、マニュアル
+  §13.6）がないと、除外された列を持つテーブルを含む Full Load は開始されません: Start ダイアログが
+  *Could not read the record of excluded-column changes* と表示して Start を無効にし、そのような
+  テーブルに達した実行はそのテーブルを *cannot read the record of dropped DEFAULTs; nothing was changed
+  on this table* で失敗させます（アクティビティログの *overlay ledger unreadable* エントリが拒否された
+  バケットを示します）。除外された列のないテーブルだけの Full Load は通常どおり実行されます。
+  `DSQL_MIGRATOR_JOB_STATE_BUCKET` または `DSQL_MIGRATOR_SESSION_STATE_BUCKET` で指定したバケットも
+  同じです（オーバーレイ台帳はセッション状態のバケットにあります）。ツールにはプラグインバケットの別の
   名前を選ぶ設定がないため、別のアカウントがその名前のバケットを持っている間は、このアカウントと
   リージョンで Deploy CDC infrastructure を実行できず、ECS Fargate ではジョブとセッションの状態が
-  保存されません。
+  保存されず、除外された列を持つテーブルを含む Full Load を実行できません。
 - **このアカウントで以前のバージョンを実行した場合は?** 所有者の確認より前のバージョンは、別のアカウントに
   あるその名前のバケットを、そのバケットポリシーが許可していれば使用しました。また、このガイドの以前の版は
   テンプレートバケットを確認なしで `mysql-dsql-migrator-templates-<account>-<region>` として作成しました。
-  このアカウントの管理者として両方の名前を確認してください:
-  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` は、このアカウントが
-  バケットを所有していれば成功し、そのようなバケットがなければ 404、別のアカウントが所有していれば
-  403 を返します。どちらかを別のアカウントが所有している場合は、そこから来たものを信頼しないで
-  ください: CDC インフラのコネクタープラグイン・オフセットシーダー・テンプレート（プラグインバケット）、
-  アプリスタックのテンプレート（テンプレートバケット）、そして ECS Fargate で復元されたジョブと
-  セッションの状態です。CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認したうえで、
-  このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
+  このアカウントの管理者として、アプリスタックを更新する前に両方の名前を確認してください: ECS Fargate
+  では、アプリは起動するたびに（v0.1.93 以降）、その名前のバケットがなければこのアカウントに
+  プラグインバケットを作成します。
+  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` は、いま別のアカウントが
+  バケットを所有していれば 403 を返します。200（このアカウントが所有）と 404（そのようなバケットはない）
+  だけでは、その名前が安全だとは言えません: 以前のバージョンがその名前を使っていた間に別のアカウントが
+  その名前を持っていて、その後バケットを削除した可能性があります。200 で安全と言えるのは、このアカウントの
+  バケットがその名前の最初の使用の時点かそれより前に作成された場合だけです（プラグインバケット: 最初の
+  Deploy CDC infrastructure、または ECS Fargate のアプリスタックの最初の起動で、どちらもその名前の
+  バケットがなければバケットを作成します。テンプレートバケット: そのバケットからの最初のデプロイ）。その
+  時点は、このアカウントの CloudTrail にあるその名前の最新の成功した `CreateBucket` イベント
+  （`BucketAlreadyExists` などの `errorCode` があるイベントは何も作成していません。コンソールの Event
+  history は 90 日間保持）か、最初の使用の時点より後でない `aws s3api list-buckets` の `CreationDate` で
+  わかります（S3 はバケットポリシーの編集などバケットの変更でこの日付を後ろにずらすことがあるため、より後の
+  日付では何も証明できません）。404 で安全と言えるのは、その名前を何も使っていなかった場合だけです。
+  どちらかを別のアカウントが所有している場合、または安全だと確認できない場合は、そこから来たものを信頼
+  しないでください: CDC インフラのコネクタープラグイン・オフセットシーダー・テンプレート（プラグイン
+  バケット）、アプリスタックのテンプレート（テンプレートバケット）、そして ECS Fargate で復元された
+  ジョブとセッションの状態です。CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認した
+  うえで、このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
 - **監査証跡**: 構造化されたアクティビティログ（成功 + 失敗のタイムライン、UI から
   ダウンロード可能）は、シークレットではないフィールドのみを記録します — 行の値、
   パスワード、IAM トークンは決して記録しません。タスクの一時ディスク上でサイズ上限が
@@ -1081,7 +1099,7 @@ ECR も ALB もありません。UI には **SSM ポートフォワード**で�
 | `DsqlClusterArn` | はい | — | ターゲット DSQL クラスター（`dsql:DbConnect` のスコープ）。 |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | いずれか必須 | `""` | ソース DB へのホスト egress を開放（生の CIDR より SG を推奨）。 |
 | `SourceMode` | いいえ | `git` | `git`（公開 HTTPS で `SourceRepoUrl@SourceRepoRef` をクローン）または `s3`（`SourceS3Uri` の tarball）。 |
-| `SourceS3Uri` | `s3` の場合必須 | `""` | リポジトリルートの `s3://…/source.tar.gz` — 一時的な「ローカルコピーを実行」パス。バケットはこのアカウントのものである必要があります: ホストのダウンロードがそれを確認し、ホストロールが読み取れるのはこのオブジェクトだけです。 |
+| `SourceS3Uri` | `s3` の場合必須 | `""` | リポジトリルートの `s3://…/source.tar.gz` — 一時的な「ローカルコピーを実行」パス。バケットはこのアカウントのものである必要があります: ホストのダウンロードがそれを確認します。`SourceMode=s3` は、このオブジェクト 1 つに対する `s3:GetObject` の許可をホストロールに追加します。 |
 | `MskEgressCidr` | いいえ | `0.0.0.0/0` | インプロセスシードのためにホストが MSK 9098 に到達する CIDR。最小権限のためコネクタサブネット CIDR に絞る。 |
 | `InstanceType` | いいえ | `t3.large` | コントロールプレーンホストのサイズ。 |
 | `StateVolumeSizeGiB` | いいえ | `20` | 保持型 EBS 状態ボリューム。大きなテーブルの Full Load でローカル CSV がスピルする場合は大きく。 |

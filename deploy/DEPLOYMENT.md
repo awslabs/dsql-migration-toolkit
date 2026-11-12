@@ -730,7 +730,10 @@ variables, but the Settings dialog is the intended path.
 ### Update to a new image version
 
 Build and push a new tag, then redeploy with the new `ContainerImageUri`. ECS
-performs a rolling replacement of the task:
+performs a rolling replacement of the task. `$TEMPLATE_BUCKET` is the staging bucket from
+the AWS CLI deploy section above (the template exceeds the 51,200-byte CloudFormation
+inline-upload limit), and the deploy runs only if the `head-bucket` check confirms that this
+account owns it:
 
 ```bash
 export IMAGE_TAG=0.1.1
@@ -739,9 +742,6 @@ docker build -f deploy/Dockerfile -t "$ECR_REPO:$IMAGE_TAG" .
 docker tag "$ECR_REPO:$IMAGE_TAG" "$IMAGE_URI"
 docker push "$IMAGE_URI"
 
-# $TEMPLATE_BUCKET: the staging bucket from the AWS CLI deploy section above (the template
-# exceeds CloudFormation's 51,200-byte inline-upload limit). Deploys only if this account
-# owns the bucket: the head-bucket check fails otherwise.
 aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCOUNT" \
   && aws cloudformation deploy \
   --template-file deploy/cloudformation.yaml \
@@ -964,28 +964,49 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   on the Connect screen.
 - **Managed bucket ownership**: the plugin bucket's name is derived from the account ID
   and Region, so another AWS account could create a bucket with that name first. Every
-  request the app sends to it (the CDC plugin and template uploads, the job and session
-  state) names this account as the bucket's expected owner, which S3 refuses unless this
-  account owns the bucket. A bucket by that name in another account is never used:
-  Deploy CDC infrastructure and Start CDC stop with an error that names the bucket and
-  what to do, and the job and session state are not saved (the activity log records it
-  at startup). The same holds for a bucket set with `DSQL_MIGRATOR_JOB_STATE_BUCKET` or
-  `DSQL_MIGRATOR_SESSION_STATE_BUCKET`. The tool has no setting for another plugin bucket
-  name, so while another account holds a bucket by that name, Deploy CDC infrastructure
-  cannot run in this account and Region, and on ECS Fargate the job and session state are
-  not saved.
+  request the app sends to it (the CDC plugin and template uploads and, on ECS Fargate, the
+  job and session state and the record of the DEFAULTs that column exclusions drop) names
+  this account as the bucket's expected owner, which S3 refuses unless this account owns
+  the bucket. A bucket by that name in another account is never used: Deploy CDC
+  infrastructure and Start CDC stop with an error that names the bucket and what to do,
+  and the job and session state are not saved (the activity log records it at startup).
+  Without that record (the overlay ledger, manual §13.6), a Full Load that includes a
+  table with excluded columns does not start: its Start dialog says *Could not read the
+  record of excluded-column changes* and keeps Start disabled, and a run that reaches such a
+  table fails it with *cannot read the record of dropped DEFAULTs; nothing was changed on
+  this table* (the activity log's *overlay ledger unreadable* entry names the refused
+  bucket). A Full Load whose tables have no excluded columns runs as usual. The same holds
+  for a bucket set with `DSQL_MIGRATOR_JOB_STATE_BUCKET` or
+  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` (the overlay ledger is kept in the session state
+  bucket). The tool has no setting for another plugin bucket name, so while another account
+  holds a bucket by that name, Deploy CDC infrastructure cannot run in this account and
+  Region, and on ECS Fargate the job and session state are not saved and a Full Load that
+  includes a table with excluded columns cannot run.
 - **Ran an earlier version in this account?** Versions before the owner check used a
   bucket by that name in another account when its bucket policy let them in, and an earlier
   version of this guide created the template bucket as
-  `mysql-dsql-migrator-templates-<account>-<region>` without checking it. Check both names,
-  as an administrator of this account:
-  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` succeeds if this
-  account owns the bucket, answers 404 if there is no such bucket, and 403 if another account
-  owns it. If another account owns either, treat what came from it as untrusted: the CDC
-  infrastructure's connector plugins, offset seeder and template (the plugin bucket), the app
-  stack's template (the template bucket), and the job and session state restored on ECS
-  Fargate. Delete the CDC infrastructure, review the stacks' resources and their CloudTrail
-  history, and deploy again with this version from a bucket this account owns.
+  `mysql-dsql-migrator-templates-<account>-<region>` without checking it. Check both names
+  as an administrator of this account, and before you update the app stack: on ECS Fargate
+  every start of the app (v0.1.93 and later) creates the plugin bucket in this account when
+  no bucket by that name exists.
+  `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` answers 403 if
+  another account owns the bucket now. Its 200 (this account owns it) and its 404 (no such
+  bucket) do not clear the name by themselves: another account may have held it while an
+  earlier version used it, and deleted its bucket since. A 200 clears the name only if this
+  account's bucket was created no later than the first use of the name (the plugin bucket:
+  the first Deploy CDC infrastructure or the first start of an app stack on ECS Fargate,
+  either of which creates it when no bucket by that name exists; the template bucket: the
+  first deploy from it). This account's latest successful CloudTrail `CreateBucket` event for
+  the name shows when (one with an `errorCode` such as `BucketAlreadyExists` created nothing;
+  the console's Event history keeps 90 days), and so does a `CreationDate` from
+  `aws s3api list-buckets` no later than that first use (S3 can move this date later when the
+  bucket changes, such as a bucket policy edit, so a later date proves nothing). A 404 clears
+  the name only if nothing used it. If another account owns either name, or you cannot clear
+  it, treat what came from it as untrusted: the CDC infrastructure's connector plugins, offset
+  seeder and template (the plugin bucket), the app stack's template (the template bucket),
+  and the job and session state restored on ECS Fargate. Delete the CDC infrastructure,
+  review the stacks' resources and their CloudTrail history, and deploy again with this
+  version from a bucket this account owns.
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's
@@ -1091,7 +1112,7 @@ Template: **`deploy/cloudformation-ec2.yaml`**.
 | `DsqlClusterArn` | yes | — | Target DSQL cluster (scopes `dsql:DbConnect`). |
 | `SourceDbSecurityGroupId` / `SourceDbCidr` | one required | `""` | Opens host egress to the source DB (SG preferred over a raw CIDR). |
 | `SourceMode` | no | `git` | `git` (clone `SourceRepoUrl@SourceRepoRef` over public HTTPS) or `s3` (tarball from `SourceS3Uri`). |
-| `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. The bucket must be this account's: the host's download asserts it, and the host role may read only this object. |
+| `SourceS3Uri` | if `s3` | `""` | `s3://…/source.tar.gz` of the repo root — the temporary "run my local copy" path. The bucket must be this account's: the host's download asserts it. `SourceMode=s3` adds to the host role a grant of `s3:GetObject` on this one object. |
 | `MskEgressCidr` | no | `0.0.0.0/0` | CIDR the host may reach MSK on 9098 for the in-process seed; narrow to the connector subnet CIDR for least privilege. |
 | `InstanceType` | no | `t3.large` | Control-plane host size. |
 | `StateVolumeSizeGiB` | no | `20` | Retained EBS state volume; size up for a large-table Full Load's local CSV spillover. |
@@ -1197,7 +1218,7 @@ export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 export HOST_SUBNET_CIDR=$(aws ec2 describe-subnets --subnet-ids "$HOST_SUBNET_ID" \
   --region "$AWS_REGION" --query 'Subnets[0].CidrBlock' --output text)
 
-# This template exceeds CloudFormation's 51,200-byte inline-upload limit, so the CLI
+# This template exceeds the 51,200-byte CloudFormation inline-upload limit, so the CLI
 # needs an S3 bucket to stage it. Create one once, or reuse a bucket you already have
 # (set TEMPLATE_BUCKET to its name and skip "s3 mb"). The random suffix keeps another
 # AWS account from creating the name first.
@@ -1224,7 +1245,7 @@ aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCO
     SourceDbSecurityGroupId="$SOURCE_DB_SG" \
     MskEgressCidr="$HOST_SUBNET_CIDR"
     # Default SourceMode=git clones the public repo (no credentials). If the host
-    # can't reach it, add:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
+    # cannot reach it, add:  SourceMode=s3 SourceS3Uri=s3://$TEMPLATE_BUCKET/dsql-src.tar.gz
     # (the host downloads it only from a bucket this account owns)
 ```
 

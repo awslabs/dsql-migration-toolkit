@@ -80,8 +80,9 @@ The template exceeds CloudFormation's 51,200-byte inline limit, so the CLI stage
 bucket: the tool's plugin bucket, which `PluginBucketArn` names and the stack's connector
 plugins and offset seeder are read from. That bucket's name is derived from the account ID
 and Region, so another AWS account could own a bucket by that name: the deploy runs only if
-the `head-bucket` check confirms that this account owns it. Add `--no-execute-changeset` to
-inspect the change set without applying it.
+the `head-bucket` check confirms that this account owns it. Replace `...` with the other
+parameters (the template's `Parameters` section lists them), and add `--no-execute-changeset`
+to inspect the change set without applying it.
 
 ```bash
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -91,7 +92,7 @@ aws s3api head-bucket --bucket "$PLUGIN_BUCKET" --expected-bucket-owner "$ACCOUN
   --stack-name dsql-cdc-stack --region "$AWS_REGION" --capabilities CAPABILITY_NAMED_IAM \
   --s3-bucket "$PLUGIN_BUCKET" --s3-prefix cdc-plugins \
   --parameter-overrides PluginBucketArn="arn:aws:s3:::$PLUGIN_BUCKET" \
-    ...   # the rest: see the template's Parameters section
+    ...
 ```
 
 Prefer the in-app flow: it fills almost every parameter for you and avoids the

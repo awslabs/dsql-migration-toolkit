@@ -1138,9 +1138,9 @@ def _upload_to(
     local_sha256: Optional[str] = None,
 ) -> None:
     """:func:`upload_plugin` into ``owned`` (``local_path`` is a file). A 403 is the bucket's
-    refusal only while no owner-checked request has reached it
+    refusal unless the bucket is confirmed and an owner-checked HeadBucket still reaches it
     (:func:`~dsql_migrator.core.s3_ownership.refusal_text`): in the bucket
-    :func:`ensure_and_upload_plugins` has just confirmed, it is the error it is."""
+    :func:`ensure_and_upload_plugins` has just confirmed, that 403 is then the error it is."""
     s3_client = owned.client
 
     def _log(msg: str) -> None:

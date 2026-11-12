@@ -28,10 +28,12 @@ TemplateURL, an MSK Connect plugin, a Lambda function's code).
 
 A 403 to an owner-checked request cannot say why: another account owns the bucket, or this
 identity may not make the request. So the refusal (:func:`not_owned_message`) names both, the
-permission the refused request needs and S3's own answer -- until an owner-checked request has
-reached the bucket (:attr:`OwnedBucket.confirmed`). From then on the bucket is known to be this
-account's, and a 403 is IAM, a KMS key policy or an SCP: :func:`refusal_text` leaves it to be
-reported as the error it is.
+permission the refused request needs and S3's own answer. Once an owner-checked request has
+reached the bucket (:attr:`OwnedBucket.confirmed`), a later 403 is checked again with an
+owner-checked HeadBucket (:func:`refusal_text`): the bucket's owner may have deleted it since,
+which frees the name for another account. A 200 shows the bucket is still this account's, so
+that 403 is IAM, a KMS key policy or an SCP, reported as the error it is; anything else
+unconfirms the bucket, and the 403 is the refusal.
 
 Verified against the Amazon S3 documentation: a request whose expected owner is not the
 bucket's owner fails with 403 Access Denied; HeadBucket answers a bucket that does not exist, or
@@ -260,8 +262,8 @@ class OwnedBucket:
     account ID is refused here, so no request goes out without a real one.
 
     :attr:`confirmed` turns true once one of those requests succeeds: S3 answered it, so this
-    account owns the bucket, and a 403 after that is not another account's bucket
-    (:func:`refusal_text`).
+    account owned the bucket then. A 403 after that is the refusal only if :meth:`still_owned`
+    no longer reaches the bucket (:func:`refusal_text`).
     """
 
     def __init__(self, client: Any, name: str, owner: str) -> None:
@@ -284,6 +286,19 @@ class OwnedBucket:
         return self._reached(
             self.client.head_bucket(Bucket=self.name, ExpectedBucketOwner=self.owner)
         )
+
+    def still_owned(self) -> bool:
+        """After a 403 on a :attr:`confirmed` bucket: whether an owner-checked HeadBucket still
+        reaches it. A bucket cannot change owner, but its owner can delete it, and another
+        account can then create one by that name. ``False``, and the bucket is no longer
+        :attr:`confirmed`, when the HeadBucket fails for any reason (an identity without
+        s3:ListBucket included: the owner cannot be confirmed then either)."""
+        try:
+            self.head()
+        except Exception:  # noqa: BLE001 - any failure leaves the owner unconfirmed
+            self.confirmed = False
+            return False
+        return True
 
     def head_key(self, key: str) -> Any:
         return self._reached(
@@ -385,15 +400,19 @@ class OwnedBucket:
 def refusal_text(exc: BaseException, bucket: OwnedBucket | None = None) -> Optional[str]:
     """The operator-facing refusal when ``exc`` is the tool not using a bucket it cannot
     confirm it owns: a :class:`BucketOwnershipError`, or a 403 to an owner-checked request on
-    ``bucket`` before one of them has reached it. ``None`` for any other error -- a 403 on a
-    bucket already :attr:`~OwnedBucket.confirmed` among them: a bucket cannot change owner
-    without being deleted, so that 403 is this identity's IAM policy, a KMS key policy or an
-    SCP, and the caller reports it as the error it is (S3 refused it all the same)."""
+    ``bucket``. ``None`` for any other error, and for a 403 on a bucket already
+    :attr:`~OwnedBucket.confirmed` that an owner-checked HeadBucket still reaches
+    (:meth:`~OwnedBucket.still_owned`): this account still owns it, so that 403 is this
+    identity's IAM policy, a KMS key policy or an SCP, and the caller reports it as the error
+    it is (S3 refused it all the same). A confirmed bucket the HeadBucket no longer reaches
+    may have been deleted and created again by another account: the 403 is the refusal."""
     if isinstance(exc, BucketOwnershipError):
         return str(exc)
-    if bucket is not None and not bucket.confirmed and is_access_denied(exc):
-        return not_owned_message(bucket.name, bucket.owner, exc)
-    return None
+    if bucket is None or not is_access_denied(exc):
+        return None
+    if bucket.confirmed and bucket.still_owned():
+        return None
+    return not_owned_message(bucket.name, bucket.owner, exc)
 
 
 __all__ = [

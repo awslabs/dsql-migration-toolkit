@@ -187,8 +187,9 @@ Parameters:
       s3://bucket/key of the app source tarball (.tar.gz of the repo root), in a bucket
       THIS account owns. Required when SourceMode=s3; the host downloads it with
       `aws s3api get-object --expected-bucket-owner` (a bucket by that name in another
-      account is refused) and extracts it with --strip-components=1, and the host role may
-      read only that object. Ignored when SourceMode=git.
+      account is refused) and extracts it with --strip-components=1, and SourceMode=s3
+      adds to the host role a grant of s3:GetObject on that one object. Ignored when
+      SourceMode=git.
 
   SourceRepoUrl:
     Type: String

@@ -32,6 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
 from dsql_migrator.core.models import (
     AiConversation,
     AssessmentReport,
@@ -549,8 +550,11 @@ class S3SessionStateStore:
     Every request asserts the caller's own account (``sts:GetCallerIdentity``, read once)
     as the bucket's owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`): a bucket
     another account owns gets no snapshot and gives none back (a reconnecting browser starts
-    fresh rather than restoring what that account wrote), and the refusal is logged at ERROR
-    and kept in :attr:`bucket_refusal` (the app's startup reports it).
+    fresh rather than restoring what that account wrote), and the refusal is logged at ERROR,
+    kept in :attr:`bucket_refusal` and recorded once in the activity log (at startup, by the
+    prune), and the next save or prune checks the bucket again first. That holds for a bucket
+    another account creates while the app runs, after this account's was deleted: the first
+    403 is checked with an owner-checked HeadBucket (``refusal_text``).
     """
 
     def __init__(
@@ -630,16 +634,32 @@ class S3SessionStateStore:
 
     def _log_refusal(self, message: str, exc: BaseException) -> bool:
         """Log ``exc`` at ERROR, with what to do about it, when it is the bucket being refused
-        (``message`` says which call failed); ``False`` for any other error."""
+        (``message`` says which call failed); ``False`` for any other error.
+
+        The first refusal since the bucket was last usable is recorded in the activity log
+        too (at startup, the prune's; while the app runs, that of a bucket another account
+        took over). The next save or prune checks the bucket again (``_ensure_bucket``)
+        instead of trusting the earlier check, so the bucket is used again once this account
+        owns it."""
         refusal = refusal_text(exc, self._owned)
         if refusal is None:
             return False
-        self.bucket_refusal = refusal
+        with self._lock:
+            self._ensured = False
+            first = self.bucket_refusal is None
+            self.bucket_refusal = refusal
         _LOGGER.error(
             "%s: session state is not saved to or restored from this bucket, so a "
             "reconnecting browser starts over after a restart. %s",
             message, refusal,
         )
+        if first:
+            log_activity(
+                ActivityCategory.SYSTEM,
+                "Session state is not saved: S3 bucket refused",
+                status=ActivityStatus.FAILURE,
+                detail=refusal,
+            )
         return True
 
     @staticmethod

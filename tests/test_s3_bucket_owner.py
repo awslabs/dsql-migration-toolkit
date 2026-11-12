@@ -31,14 +31,17 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from urllib.parse import urlsplit
 
 import pytest
 from botocore.exceptions import ClientError
@@ -600,6 +603,55 @@ def test_a_bucket_this_account_may_create_but_not_reach_is_refused() -> None:
     assert "CreateBucket" not in s3.ops()
 
 
+def _refused_after_create(already_owned: bool) -> tuple[OwnerCheckingS3, str]:
+    """A bucket whose first HeadBucket answers 404 and whose HeadBucket after CreateBucket
+    answers 403: created by this call (and this identity may not list it), or there already,
+    in this account (CreateBucket: BucketAlreadyOwnedByYou), yet refused to that check."""
+    region = "eu-west-1"
+    s3 = OwnerCheckingS3(region=region)
+    name = plugin_bucket_name(_ME, region)
+    if not already_owned:
+        s3.iam_denied = {"HeadBucket"}  # the missing bucket answers 404 before IAM is asked
+        return s3, name
+    s3.bucket(name)
+    real_head = s3.head_bucket
+
+    def head(**params):
+        if not s3.head_denied:  # the first one misses it; every one after is refused
+            s3.calls.append(("HeadBucket", dict(params)))
+            s3.head_denied = True
+            raise _error("HeadBucket", "404", 404)
+        return real_head(**params)
+
+    s3.head_bucket = head  # type: ignore[method-assign]
+    return s3, name
+
+
+@pytest.mark.parametrize("already_owned", [False, True])
+def test_a_bucket_the_check_after_create_refuses_is_refused_not_adopted(already_owned) -> None:
+    # The HeadBucket after CreateBucket is what shows the bucket is this account's: a create
+    # answered BucketAlreadyOwnedByYou, or a race with another create, proves nothing until
+    # it answers. Its 403 is a hard error -- the bucket is not adopted, and the deploy and
+    # the state store built on it write nothing there.
+    s3, name = _refused_after_create(already_owned)
+    owned = OwnedBucket(s3, name, _ME)
+    with pytest.raises(BucketOwnershipError) as exc:
+        owned.ensure("eu-west-1", sleep=lambda _s: None)
+    _assert_refusal(str(exc.value), name)
+    assert "a HeadBucket request" in str(exc.value)
+    assert s3.ops() == ["HeadBucket", "CreateBucket", "HeadBucket"]
+    assert owned.confirmed is False and s3.violations == []
+
+    s3, name = _refused_after_create(already_owned)
+    with pytest.raises(S3ProvisionError):
+        ensure_plugin_bucket(s3, _ME, "eu-west-1")
+    s3, name = _refused_after_create(already_owned)
+    store = S3JobStore(name, region="eu-west-1", s3_client=s3, sts_client=_Sts())
+    store.save(_job("j1"), None)
+    assert "PutObject" not in s3.ops() and s3.buckets[name].objects == {}
+    _assert_refusal(store.bucket_refusal or "", name)
+
+
 @pytest.mark.parametrize("region", ["us-east-1", "ap-northeast-2"])
 def test_a_missing_bucket_is_created_then_verified(region) -> None:
     s3 = OwnerCheckingS3(region=region)
@@ -1037,6 +1089,117 @@ def test_a_confirmed_buckets_403_is_reported_as_it_is_by_the_ledger_and_deployer
     assert "update_stack" not in cfn.calls
 
 
+def test_a_deployer_that_may_not_list_the_bucket_cannot_confirm_it_after_a_403() -> None:
+    # Start CDC's CdcDeployRole has no s3:ListBucket, so the HeadBucket that checks a 403 on
+    # its confirmed bucket again is refused too: the deployer cannot tell its IAM policy from
+    # a bucket another account now owns, and says both -- naming the PutObject it sent and
+    # s3:PutObject, never s3:ListBucket.
+    s3 = OwnerCheckingS3()
+    s3.bucket(_BUCKET)
+    s3.iam_denied = {"HeadBucket"}
+    deployer, cfn = _deployer(s3)
+    deployer.preflight_template(_BIG)  # the PutObject shows the bucket is this account's
+    s3.iam_denied = {"HeadBucket", "PutObject"}
+    with pytest.raises(CdcDeployError) as exc:
+        deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
+    text = str(exc.value)
+    _assert_refusal(text)
+    assert "a PutObject request" in text and "allows s3:PutObject on it" in text
+    assert "s3:ListBucket" not in text
+    assert s3.ops() == ["PutObject", "PutObject", "HeadBucket"]
+    assert "update_stack" not in cfn.calls
+
+
+def _take_over(s3: OwnerCheckingS3, name: str = _BUCKET) -> _Bucket:
+    """This account's bucket is deleted (which frees its name), and another account creates
+    one by that name with a bucket policy that lets this identity in."""
+    del s3.buckets[name]
+    return _foreign(s3, name)
+
+
+def _record_activity(monkeypatch) -> list[tuple[str, dict]]:
+    """What the state stores write to the activity log: (action, keywords)."""
+    from dsql_migrator.core import job_store, session_state_store
+
+    recorded: list[tuple[str, dict]] = []
+
+    def record(category, action, **kwargs):
+        recorded.append((action, {"category": category, **kwargs}))
+
+    monkeypatch.setattr(job_store, "log_activity", record)
+    monkeypatch.setattr(session_state_store, "log_activity", record)
+    return recorded
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_a_state_bucket_another_account_takes_over_while_the_app_runs_is_refused(
+    background, caplog, monkeypatch
+) -> None:
+    # FAILS WITHOUT THE FIX: once the startup check had confirmed the bucket, a 403 was taken
+    # for IAM -- a plain WARNING, no bucket_refusal, nothing in the activity log -- and the
+    # stores never checked the bucket again until a restart (S3 refused every request all the
+    # same, so nothing reached the other account's bucket either way).
+    recorded = _record_activity(monkeypatch)
+    s3 = OwnerCheckingS3()
+    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    sessions = S3SessionStateStore(
+        _BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts(), background=background
+    )
+    jobs.save(_job("j1"), None)  # creates the bucket and shows it is this account's
+    sessions.save(SessionSnapshot(session_id="s1"))
+    assert sessions.flush(5.0)
+    theirs = _take_over(s3)
+    with caplog.at_level(logging.WARNING):
+        jobs.save(_job("j1", "DONE"), None)
+        sessions.save(SessionSnapshot(session_id="s2"))
+        assert sessions.flush(5.0)
+        assert sessions.load("s1") is None
+    assert theirs.objects == {} and s3.reads == [] and s3.violations == []
+    _assert_refusal(jobs.bucket_refusal or "")
+    _assert_refusal(sessions.bucket_refusal or "")
+    stores = ("dsql_migrator.core.job_store", "dsql_migrator.core.session_state_store")
+    logged = [r for r in caplog.records if r.name in stores]
+    assert logged and all(r.levelno == logging.ERROR for r in logged)
+    assert [action for action, _kw in recorded] == [
+        "Job state is not saved: S3 bucket refused",
+        "Session state is not saved: S3 bucket refused",
+    ]
+    # Each store checks the bucket again before its next save, and records nothing new...
+    s3.calls.clear()
+    jobs.save(_job("j2"), None)
+    assert s3.ops() == ["HeadBucket"] and len(recorded) == 2
+    # ...so once the other account's bucket is gone, it creates this account's and saves.
+    del s3.buckets[_BUCKET]
+    jobs.save(_job("j3"), None)
+    assert s3.buckets[_BUCKET].owner == _ME and "jobs/j3.json" in s3.buckets[_BUCKET].objects
+    assert jobs.bucket_refusal is None
+    assert s3.violations == []
+
+
+def test_the_ledger_and_the_deployer_refuse_a_bucket_taken_over_after_they_reached_it() -> None:
+    # As for the state stores: the ledger read "unreadable" with a bare AccessDenied, and the
+    # deployer's update said only that the upload failed.
+    s3 = OwnerCheckingS3()
+    s3.bucket(_BUCKET)
+    ledger = S3OverlayLedger(_BUCKET, s3_client=s3, sts_client=_Sts(), sleep=lambda _s: None)
+    ledger.put_tables("k", {"shop.docs": _ledger_record()})  # the PUT shows it is ours
+    deployer, cfn = _deployer(s3)
+    deployer.preflight_template(_BIG)
+    theirs = _take_over(s3)
+    s3.reads.clear()  # the ledger's own read-back of its write
+    read = ledger.read("k")
+    assert read.status == "unreadable"
+    _assert_refusal(read.error or "")
+    with pytest.raises(OverlayLedgerError) as written:
+        ledger.put_tables("k", {"shop.docs": _ledger_record()})
+    _assert_refusal(str(written.value))
+    with pytest.raises(CdcDeployError) as staged:
+        deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
+    _assert_refusal(str(staged.value))
+    assert "update_stack" not in cfn.calls
+    assert theirs.objects == {} and s3.reads == [] and s3.violations == []
+
+
 def test_the_plugin_uploads_after_the_bucket_is_confirmed_report_a_403_as_it_is(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1081,7 +1244,10 @@ def test_the_job_store_uses_and_restores_nothing_from_another_accounts_bucket(ca
     assert s3.reads == []
     assert s3.violations == []
     _assert_refusal(store.bucket_refusal or "")
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    errors = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and r.name == "dsql_migrator.core.job_store"
+    ]
     assert errors and all("cannot resume" in r.getMessage() for r in errors)
 
 
@@ -1239,39 +1405,72 @@ def test_the_overlay_ledger_asserts_the_owner_on_every_request() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The app's startup reports a refused state bucket in the activity log
+# A refused state bucket is recorded in the activity log
 # ---------------------------------------------------------------------------
 
 
-def test_the_startup_records_a_refused_state_bucket_in_the_activity_log(monkeypatch) -> None:
-    from dsql_migrator.core import activity_log
-    from dsql_migrator.ui import app
+def test_a_refused_state_bucket_is_recorded_in_the_activity_log_once(monkeypatch) -> None:
+    # Each store records its own refusal when it first meets it -- at startup, its restore or
+    # prune -- so no caller has to remember to report it, and a refusal while the app runs is
+    # recorded too (test_a_state_bucket_another_account_takes_over_while_the_app_runs_...).
+    from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus
 
-    logged: list[tuple] = []
-    monkeypatch.setattr(
-        activity_log, "log_activity", lambda *a, **k: logged.append((a, k))
-    )
+    recorded = _record_activity(monkeypatch)
     s3 = OwnerCheckingS3()
     _foreign(s3)
     jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
     jobs.load_all()
+    jobs.save(_job("j1"), None)
+    jobs.prune_terminal(0)
     sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
     sessions.prune(200)
-    app._report_refused_state_buckets(jobs, sessions)
-    assert [a[1] for a, _k in logged] == [
+    sessions.save(SessionSnapshot(session_id="s1"))
+    assert sessions.load("s1") is None
+    assert [action for action, _kw in recorded] == [
         "Job state is not saved: S3 bucket refused",
         "Session state is not saved: S3 bucket refused",
     ]
-    for _a, kwargs in logged:
-        assert kwargs["status"] is activity_log.ActivityStatus.FAILURE
+    for _action, kwargs in recorded:
+        assert kwargs["category"] is ActivityCategory.SYSTEM
+        assert kwargs["status"] is ActivityStatus.FAILURE
         _assert_refusal(kwargs["detail"])
-    # A usable bucket, and a SQLite store, report nothing.
-    logged.clear()
+    # A usable bucket records nothing; nor does a 403 that is this identity's IAM policy.
+    recorded.clear()
     own = OwnerCheckingS3()
     usable = S3JobStore(_BUCKET, region=_REGION, s3_client=own, sts_client=_Sts())
     usable.load_all()
-    app._report_refused_state_buckets(usable, object())
-    assert logged == []
+    own.iam_denied = {"PutObject"}
+    usable.save(_job("j1"), None)
+    assert recorded == [] and usable.bucket_refusal is None
+
+
+_STARTUP_HARNESS = Path(__file__).with_name("_startup_state_buckets_harness.py")
+
+
+def test_the_apps_startup_records_each_refused_state_bucket_in_the_activity_log(
+    tmp_path: Path,
+) -> None:
+    # The guides and the configuration help promise that the activity log records the
+    # refusal at startup. The app's real main() runs (in its own interpreter, as main()
+    # changes process-wide state) with both state buckets set, as on ECS Fargate, and every
+    # AWS request refused before it is sent: neither store can read this identity's account,
+    # so each refuses its bucket at its first request -- the job restore and the session prune.
+    env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
+    out = subprocess.run(
+        [sys.executable, str(_STARTUP_HARNESS), str(tmp_path)],
+        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=240, check=False,
+    )
+    assert out.returncode == 0, out.stderr[-4000:]
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    refused = [r for r in result["records"] if str(r.get("action", "")).endswith("bucket refused")]
+    assert [(r["action"], r["status"]) for r in refused] == [
+        ("Job state is not saved: S3 bucket refused", "failure"),
+        ("Session state is not saved: S3 bucket refused", "failure"),
+    ]
+    assert all("sts:GetCallerIdentity" in r["detail"] for r in refused)
+    # Only STS was asked: no S3 request goes out without the account to assert.
+    assert result["aws_refused"]
+    assert all(urlsplit(url).hostname.startswith("sts.") for url in result["aws_refused"])
 
 
 # ---------------------------------------------------------------------------
@@ -1370,11 +1569,19 @@ def _logging_stub(name: str, output: str = "") -> str:
     )
 
 
-def _paste(tmp_path: Path, command: str, *, owner_ok: bool) -> list[list[str]]:
-    """Run ``command`` as a pasted guide block; the stub commands it called, with their
-    arguments."""
-    bash = shutil.which("bash")
-    assert bash is not None
+# How each shell runs a paste: bash without its start-up files, and zsh as an interactive
+# shell without them (macOS's default shell: interactive, `#` starts no comment there, as
+# its INTERACTIVE_COMMENTS option is off).
+_SHELLS = {"bash": ("--noprofile", "--norc"), "zsh": ("-f", "-i")}
+
+
+def _paste(
+    tmp_path: Path, command: str, *, owner_ok: bool, shell: str = "bash"
+) -> list[list[str]]:
+    """Run ``command`` as a guide block pasted into ``shell``; the stub commands it called,
+    with their arguments."""
+    executable = shutil.which(shell)
+    assert executable is not None
     bin_dir = _stub_bin(tmp_path, {
         "aws": _STUB_AWS,
         "docker": _logging_stub("docker"),
@@ -1389,8 +1596,8 @@ def _paste(tmp_path: Path, command: str, *, owner_ok: bool) -> list[list[str]]:
         "TEMPLATE_BUCKET": f"mysql-dsql-migrator-templates-{_ME}-1a2b3c4d",
     }
     subprocess.run(
-        [bash, "--noprofile", "--norc"], input=command, env=env, capture_output=True,
-        text=True, timeout=60, check=False,
+        [executable, *_SHELLS[shell]], input=command.encode("utf-8"), env=env,
+        capture_output=True, timeout=60, check=False,
     )
     return [line.split("\t") for line in log.read_text().splitlines()]
 
@@ -1435,6 +1642,32 @@ def test_every_deploy_and_teardown_runs_only_after_its_owner_check(
         assert len(ran) == 1, command
         target = _arg(ran[0], "--s3-bucket") if acts[0] == "cloudformation" else ran[0][3]
         assert target.removeprefix("s3://") == _arg(checks[-1], "--bucket"), command
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("zsh") is None, reason="needs bash and zsh"
+)
+@pytest.mark.parametrize("name", [*_GUIDES, "cdc-stack/README.md"])
+def test_the_guides_bucket_commands_run_alike_when_pasted_into_zsh(
+    name: str, tmp_path: Path
+) -> None:
+    # FAILS WITHOUT THE FIX: pasted into macOS's interactive zsh, where `#` starts no
+    # comment, the image update's comment line before its owner check opened a quote at
+    # "CloudFormation's", so neither the check nor the deploy ran (the docker build and push
+    # before it had); the EC2 setup block stopped the same way before its `aws s3 mb`, and the
+    # cdc-stack README's deploy on the comment after its last argument. Every block that
+    # creates, checks, deploys from or deletes a guide's bucket now runs the same commands in
+    # zsh as in bash, whether the owner check passes or fails.
+    blocks = [
+        b for b in _FENCED_BASH.findall(_guide(name))
+        if re.search(r"TEMPLATE_BUCKET|PLUGIN_BUCKET|mysql-dsql-migrator-plugins-", b)
+    ]
+    assert len(blocks) == (1 if name.startswith("cdc-stack") else 7), name
+    for block in blocks:
+        for owner_ok in (True, False):
+            in_bash = _paste(tmp_path, block, owner_ok=owner_ok)
+            assert in_bash, block
+            assert _paste(tmp_path, block, owner_ok=owner_ok, shell="zsh") == in_bash, block
 
 
 # ---------------------------------------------------------------------------
@@ -1502,11 +1735,11 @@ def test_the_ec2_host_downloads_its_source_only_from_a_bucket_this_account_owns(
         assert [c[0] for c in calls] == ["aws"]  # nothing extracted, nothing run
 
 
-def test_the_ec2_host_role_may_read_only_the_source_tarball() -> None:
+def test_source_mode_s3_grants_the_host_role_that_one_tarball() -> None:
     # The guide's SourceMode=s3 example (s3://$TEMPLATE_BUCKET/...) was denied: the host
-    # role's only S3 read was the plugin bucket. With SourceMode=s3 it may now read the one
-    # object SourceS3Uri names (and nothing with SourceMode=git); the download asserts that
-    # this account owns its bucket.
+    # role's only S3 read was the plugin bucket (which it keeps). With SourceMode=s3 a grant
+    # adds the one object SourceS3Uri names (no grant with SourceMode=git); the download
+    # asserts that this account owns its bucket.
     from tests.test_ec2_appstack import _load, _user_data
 
     doc = _load()
