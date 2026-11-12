@@ -80,8 +80,9 @@ _EARLIER = (
     "CDC infrastructure deployed in this account and Region may run connector plugins, an "
     "offset seeder and a template from it (delete it on the CDC step and review what its stack "
     "created), and on ECS Fargate the job and session state and the record of dropped "
-    "DEFAULTs may have come from it; then rotate the source database credentials, and check "
-    "the target's schema, DEFAULTs and data against the Schema Conversion output."
+    "DEFAULTs may have come from it; then rotate the source database credentials, check the "
+    "target's schema and DEFAULTs against the Schema Conversion output, and its data with a "
+    "CHECKSUM Validation."
 )
 
 # The IAM permission each request the tool sends to the bucket needs: what a 403 to it points
@@ -195,6 +196,20 @@ def already_exists_message(bucket: str, owner: str) -> str:
         f"S3 bucket '{bucket}' already exists in another AWS account (CreateBucket: "
         "BucketAlreadyExists), so the tool did not use it, and nothing was written to it. "
         f"{_REMEDY} This account is {owner}. {_WHY}"
+    )
+
+
+def create_denied_message(bucket: str, owner: str, exc: BaseException) -> str:
+    """The refusal for a CreateBucket that S3 denied (403): no bucket by that name was
+    found for this account, and this identity may not create one -- an SCP, a permissions
+    boundary or a missing s3:CreateBucket. Not another account's bucket: S3 answers that with
+    ``BucketAlreadyExists``."""
+    return (
+        f"S3 bucket '{bucket}' does not exist in this account ({owner}), and this identity may "
+        f"not create it (CreateBucket: {_first_line(exc).rstrip('.')}), so the tool did not use "
+        "any bucket by that name and wrote nothing. Allow s3:CreateBucket on it for this "
+        "identity (check SCPs and permissions boundaries too), or create the bucket in this "
+        "account yourself, then retry."
     )
 
 
@@ -388,6 +403,13 @@ class OwnedBucket:
                 raise BucketOwnershipError(
                     already_exists_message(self.name, self.owner)
                 ) from exc
+            elif is_access_denied(exc):
+                # A denied CreateBucket is this identity's permissions (an SCP, a boundary,
+                # no s3:CreateBucket), not another account's bucket: that answers
+                # BucketAlreadyExists. Fail closed all the same, with the cause it is.
+                raise BucketOwnershipError(
+                    create_denied_message(self.name, self.owner, exc)
+                ) from exc
             else:
                 raise
         for attempt in range(_VERIFY_ATTEMPTS):
@@ -429,6 +451,7 @@ __all__ = [
     "OwnedBucket",
     "already_exists_message",
     "caller_account_id",
+    "create_denied_message",
     "error_code",
     "is_access_denied",
     "is_missing",

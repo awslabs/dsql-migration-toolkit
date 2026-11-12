@@ -927,8 +927,9 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   상태는 두 데이터베이스 모두에 작용했음: 커넥터 플러그인은 소스 시크릿을 읽고 Aurora DSQL 클러스터에
   `admin`으로 연결할 수 있는 역할로 실행되었고, Full Load는 복원된 세션의 편집된 타깃 DDL을 적용하며,
   Cut over는 원장 기록이 지정한 DEFAULT를 복원함. CDC 인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을
-  검토하고, 소스 시크릿이 담은 소스 데이터베이스 자격 증명을 교체하고, 타깃의 스키마·DEFAULT·데이터를
-  Schema Conversion 출력과 대조한 뒤, 이 계정이 소유한 버킷에서 이 버전으로 다시 배포할 것.
+  검토하고, 소스 시크릿이 담은 소스 데이터베이스 자격 증명을 교체하고, 타깃의 스키마·DEFAULT는
+  Schema Conversion 출력과, 데이터는 CHECKSUM Validation으로 대조한 뒤, 이 계정이 소유한 버킷에서 이 버전으로
+  다시 배포할 것.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.
@@ -1181,6 +1182,9 @@ aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCO
 >
 > - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl`, `SourceRepoRef`는 첫 부팅 때만 읽습니다: 나중에
 >   바꿔도 호스트에서는 아무것도 바뀌지 않습니다.
+> - 그래서 호스트는 첫 부팅 때의 버전으로 실행됩니다. 더 새 버전(예: S3 버킷 소유자 확인이 들어간 버전)을
+>   실행하려면 그 버전으로 새 스택을 배포하세요(또는 인스턴스를 교체). 호스트가 CDC 인프라를 배포했다면
+>   먼저 ECS Fargate 보안 노트의 *이 계정에서 이전 버전을 실행했다면?*을 따르세요: 그 확인은 호스트에도 해당합니다.
 >
 > `EnableAiAssist`, `BedrockModelArns`, `SourceDbSecurityGroupId`, `SourceDbCidr`,
 > `SourceDbPort`, `HttpsEgressCidr`, `MskEgressCidr`는 업데이트 때 적용되고(IAM 정책과 보안 그룹

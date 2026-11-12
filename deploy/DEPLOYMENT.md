@@ -1018,8 +1018,9 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   connect to the Aurora DSQL cluster as `admin`, a Full Load applies a restored session's
   edited target DDL, and Cut over restores the DEFAULTs that a ledger record names. Delete
   the CDC infrastructure, review the stacks' resources and their CloudTrail history, rotate
-  the source database credentials that the source secret holds, check the target's schema,
-  DEFAULTs and data against the Schema Conversion output, and deploy again with this version
+  the source database credentials that the source secret holds, check the target's schema
+  and DEFAULTs against the Schema Conversion output and its data with a CHECKSUM Validation,
+  and deploy again with this version
   from a bucket this account owns.
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
@@ -1293,6 +1294,10 @@ the in-process seed), then starts the service. Progress is in
 >
 > - `SourceMode`, `SourceS3Uri`, `SourceRepoUrl` and `SourceRepoRef` are read at first
 >   boot only: changing them later changes nothing on the host.
+> - So a host runs the version it first booted with. To run a newer one -- for example one
+>   with the S3 bucket owner check -- deploy a new stack with it (or replace the instance),
+>   and if the host deployed CDC infrastructure, first follow *Ran an earlier version in
+>   this account?* in the ECS Fargate security notes: its checks apply to a host too.
 >
 > `EnableAiAssist`, `BedrockModelArns`, `SourceDbSecurityGroupId`, `SourceDbCidr`,
 > `SourceDbPort`, `HttpsEgressCidr` and `MskEgressCidr` take effect on the update (they

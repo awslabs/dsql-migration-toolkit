@@ -1010,7 +1010,7 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   Cut over は台帳の記録が示す DEFAULT を復元します。
   CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認し、
   ソースシークレットが保持するソースデータベースの認証情報をローテーションし、
-  ターゲットのスキーマ・DEFAULT・データを Schema Conversion の出力と照合したうえで、
+  ターゲットのスキーマと DEFAULT を Schema Conversion の出力と、データを CHECKSUM の Validation で照合したうえで、
   このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
 - **監査証跡**: 構造化されたアクティビティログ（成功 + 失敗のタイムライン、UI から
   ダウンロード可能）は、シークレットではないフィールドのみを記録します — 行の値、
@@ -1276,6 +1276,10 @@ aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCO
 >
 > - `SourceMode`、`SourceS3Uri`、`SourceRepoUrl`、`SourceRepoRef` は初回起動時にしか読まれません:
 >   後から変えても、ホスト上では何も変わりません。
+> - そのためホストは初回起動時のバージョンで動きます。新しいバージョン（たとえば S3 バケットの所有者確認を含む
+>   もの）を動かすには、そのバージョンで新しいスタックをデプロイしてください（またはインスタンスを置き換えます）。
+>   ホストが CDC インフラをデプロイした場合は、先に ECS Fargate のセキュリティの注記にある
+>   *このアカウントで以前のバージョンを実行した場合は?* に従ってください: その確認はホストにも当てはまります。
 >
 > `EnableAiAssist`、`BedrockModelArns`、`SourceDbSecurityGroupId`、`SourceDbCidr`、
 > `SourceDbPort`、`HttpsEgressCidr`、`MskEgressCidr` は更新時に反映され（IAM ポリシーとセキュリティグループのルールを設定するため）、

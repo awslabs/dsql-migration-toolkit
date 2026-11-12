@@ -1743,19 +1743,19 @@ _EARLIER_VERSION_NOTE = {
         "**Ran an earlier version in this account?**",
         "the record of dropped DEFAULTs (the overlay ledger)",
         "rotate the source database credentials that the source secret holds",
-        "check the target's schema, DEFAULTs and data against the Schema Conversion output",
+        "check the target's schema and DEFAULTs against the Schema Conversion output and its data with a CHECKSUM Validation",
     ),
     "DEPLOYMENT.ko.md": (
         "**이 계정에서 이전 버전을 실행했다면?**",
         "제거된 DEFAULT의 기록(오버레이 원장)",
         "소스 시크릿이 담은 소스 데이터베이스 자격 증명을 교체",
-        "타깃의 스키마·DEFAULT·데이터를 Schema Conversion 출력과 대조",
+        "타깃의 스키마·DEFAULT는 Schema Conversion 출력과, 데이터는 CHECKSUM Validation으로 대조",
     ),
     "DEPLOYMENT.ja.md": (
         "**このアカウントで以前のバージョンを実行した場合は?**",
         "削除された DEFAULT の記録（オーバーレイ台帳）",
         "ソースシークレットが保持するソースデータベースの認証情報をローテーション",
-        "ターゲットのスキーマ・DEFAULT・データを Schema Conversion の出力と照合",
+        "ターゲットのスキーマと DEFAULT を Schema Conversion の出力と、データを CHECKSUM の Validation で照合",
     ),
 }
 
@@ -1780,7 +1780,8 @@ def test_the_earlier_version_steps_cover_the_source_credentials_and_the_target()
     refusal = not_owned_message(_BUCKET, _ME)
     assert "the record of dropped DEFAULTs" in refusal
     assert "rotate the source database credentials" in refusal
-    assert "check the target's schema, DEFAULTs and data" in refusal
+    assert "check the target's schema and DEFAULTs against the Schema Conversion output" in refusal
+    assert "its data with a CHECKSUM Validation" in refusal
 
 
 @pytest.mark.parametrize("name", _GUIDES)
@@ -2070,3 +2071,31 @@ def test_source_mode_s3_grants_the_host_role_that_one_tarball() -> None:
         assert re.fullmatch(pattern, ok), ok
     for bad in ("s3://bucket", "s3://bucket/", "https://bucket/k", "s3://Bucket/k", "bucket/k"):
         assert not re.fullmatch(pattern, bad), bad
+
+
+
+def test_a_denied_create_bucket_is_this_identitys_permission_not_another_accounts_bucket() -> None:
+    """CreateBucket answering 403 (an SCP, a permissions boundary, no s3:CreateBucket) is not
+    another account's bucket -- S3 answers that with BucketAlreadyExists. The tool still fails
+    closed, but names the cause it is."""
+    from botocore.exceptions import ClientError
+
+    from dsql_migrator.core.s3_ownership import BucketOwnershipError, OwnedBucket
+
+    class _Client:
+        def head_bucket(self, **kwargs):
+            assert kwargs.get("ExpectedBucketOwner") == "123456789012"
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"},
+                               "ResponseMetadata": {"HTTPStatusCode": 404}}, "HeadBucket")
+
+        def create_bucket(self, **kwargs):
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "Access Denied"},
+                               "ResponseMetadata": {"HTTPStatusCode": 403}}, "CreateBucket")
+
+    bucket = OwnedBucket(_Client(), "mysql-dsql-migrator-plugins-123456789012-ap-northeast-2",
+                         "123456789012")
+    with pytest.raises(BucketOwnershipError) as caught:
+        bucket.ensure("ap-northeast-2", sleep=lambda _s: None)
+    message = str(caught.value)
+    assert "may not create it" in message and "s3:CreateBucket" in message
+    assert "owned by another AWS account" not in message
