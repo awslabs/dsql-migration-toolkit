@@ -399,13 +399,18 @@ export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
 export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
 # ServiceSubnetIds: 프라이빗 서브넷 2개
 export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
-# CertificateArn: 아래에 실제 ACM 인증서 ARN을 붙여넣거나, 도메인 없이 self-signed 테스트
-# 인증서로 자동 채우려면 스크립트 출력을 한 줄로 캡처:
-#   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
+# CertificateArn: 실제 ACM 인증서 ARN, 또는 self-signed 테스트 인증서는 블록 아래 참고
 export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
 export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
 export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
+
+ACM 인증서가 없나요? 블록 다음에 이것을 실행하면 `CERTIFICATE_ARN`이 self-signed 테스트 인증서로
+채워집니다(도메인 불필요, 브라우저가 경고함):
+
+```bash
+export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
 ```
 
 > [!WARNING]
@@ -837,8 +842,10 @@ UI에서 AI를 켜고 **Verify AI access**를 실행하세요. 모델이 지금 
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/teardown.sh mysql-dsql-migrator          # 스택만 삭제
-DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator   # ECR repo + 이미지도 제거
+# 스택만 삭제:
+deploy/teardown.sh mysql-dsql-migrator
+# ECR repo + 이미지도 제거:
+DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator
 ```
 
 직접 만든 Route 53 레코드는 수동으로 제거해야 합니다.
@@ -888,9 +895,10 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   Fargate에서는 작업·세션 상태와 컬럼 제외가 제거한 DEFAULT의 기록)은 이 계정을 버킷의 예상 소유자로
   지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 다른 계정에 있는 그 이름의 버킷은 절대 사용하지
   않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은 오류로 멈추고, 작업·세션
-  상태는 저장되지 않음(시작 시 활동 로그에 기록). 그 기록(오버레이 원장, 매뉴얼 §13.6)이 없으면, 제외된
-  컬럼이 있는 테이블을 포함한 Full Load는 시작되지 않음: Start 대화상자가 *Could not read the record of
-  excluded-column changes*를 표시하고 Start를 비활성화하며, 그런 테이블에 이른 실행은 그 테이블을
+  상태는 저장되지 않음(앱의 모든 화면 위에 버킷 이름을 담은 오류 알림이 표시되고, 활동 로그에 기록됨).
+  그 기록(오버레이 원장, 매뉴얼 §13.6)이 없으면, 제외된 컬럼이 있는 테이블을 포함한 Full Load는
+  시작되지 않음: Start 대화상자가 *Could not read the record of excluded-column changes*를 표시하고
+  Start를 비활성화하며, 그런 테이블에 이른 실행은 그 테이블을
   *cannot read the record of dropped DEFAULTs; nothing was changed on this table*로 실패시킴(활동 로그의
   *overlay ledger unreadable* 항목이 거부된 버킷을 알려 줌). 제외된 컬럼이 없는 테이블만의 Full Load는
   평소대로 실행됨. `DSQL_MIGRATOR_JOB_STATE_BUCKET` 또는 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`으로
@@ -915,8 +923,12 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   늦은 날짜로는 아무것도 증명되지 않음). 404는 그 이름을 아무것도 사용하지 않았을 때만 안전함. 둘 중
   하나라도 다른 계정이 소유하거나 안전하다고 확인할 수 없다면 거기서 온 것을 신뢰하지 말 것: CDC 인프라의
   커넥터 플러그인·오프셋 시더·템플릿(플러그인 버킷), 앱 스택의 템플릿(템플릿 버킷), 그리고 ECS Fargate에서
-  복원된 작업·세션 상태. CDC 인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을 검토한 뒤, 이 계정이
-  소유한 버킷에서 이 버전으로 다시 배포할 것.
+  플러그인 버킷에서 복원된 작업·세션 상태와 거기서 읽은 제거된 DEFAULT의 기록(오버레이 원장). 그 코드와
+  상태는 두 데이터베이스 모두에 작용했음: 커넥터 플러그인은 소스 시크릿을 읽고 Aurora DSQL 클러스터에
+  `admin`으로 연결할 수 있는 역할로 실행되었고, Full Load는 복원된 세션의 편집된 타깃 DDL을 적용하며,
+  Cut over는 원장 기록이 지정한 DEFAULT를 복원함. CDC 인프라를 삭제하고, 스택의 리소스와 CloudTrail 기록을
+  검토하고, 소스 시크릿이 담은 소스 데이터베이스 자격 증명을 교체하고, 타깃의 스키마·DEFAULT·데이터를
+  Schema Conversion 출력과 대조한 뒤, 이 계정이 소유한 버킷에서 이 버전으로 다시 배포할 것.
 - **감사 추적**: 구조화된 활동 로그(성공 + 실패 타임라인, UI에서 다운로드)는 비밀이 아닌 필드만 기록 —
   행 값, 비밀번호, IAM 토큰은 절대 없음. 태스크 임시 디스크에서 크기 제한·회전됨; 내구성 사본은
   CloudWatch 미러(**검증** 섹션)를 켜기.
@@ -1334,7 +1346,8 @@ aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" 
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/build_and_push.sh            # 태그 기본값은 프로젝트 버전
+# 태그 기본값은 프로젝트 버전:
+deploy/build_and_push.sh
 # 또는 명시적 태그 고정:
 deploy/build_and_push.sh 0.1.0
 ```
@@ -1358,7 +1371,8 @@ aws cloudformation deploy \
   --region "$AWS_REGION"
 
 # 매 빌드: 소스 zip + 업로드, CodeBuild 실행, 대기, 이미지 URI 출력.
-deploy/build_in_codebuild.sh            # 태그 기본값은 프로젝트 버전
+# 태그 기본값은 프로젝트 버전:
+deploy/build_in_codebuild.sh
 # 또는 명시적 태그 고정:
 deploy/build_in_codebuild.sh 0.1.0
 ```

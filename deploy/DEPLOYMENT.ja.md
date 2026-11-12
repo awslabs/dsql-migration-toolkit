@@ -425,13 +425,18 @@ export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
 export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
 # ServiceSubnetIds: プライベートサブネット 2 つ
 export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
-# CertificateArn: 下に実際の ACM 証明書 ARN を貼り付けるか、自己署名テスト証明書
-# (ドメイン不要) をスクリプト出力の 1 行キャプチャで自動入力する:
-#   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
+# CertificateArn: 実際の ACM 証明書 ARN、または自己署名のテスト証明書はブロックの下を参照
 export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
 export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
 export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
+
+ACM 証明書がない場合は、ブロックの後にこれを実行すると、`CERTIFICATE_ARN` が自己署名のテスト証明書で
+埋まります（ドメイン不要、ブラウザは警告を表示）:
+
+```bash
+export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
 ```
 
 > [!WARNING]
@@ -903,8 +908,10 @@ yet* で拒否された場合は、上記のとおり契約を承諾してから
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/teardown.sh mysql-dsql-migrator          # スタックのみ削除
-DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator   # ECR リポジトリ + イメージも削除
+# スタックのみ削除:
+deploy/teardown.sh mysql-dsql-migrator
+# ECR リポジトリ + イメージも削除:
+DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator
 ```
 
 手動で作成した Route 53 レコードは手動で削除する必要があります。
@@ -962,8 +969,9 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   列の除外が削除した DEFAULT の記録）は、このアカウントをバケットの想定所有者として指定し、このアカウントが
   バケットを所有していなければ S3 が拒否します。別のアカウントにあるその名前のバケットは決して使用しません:
   Deploy CDC infrastructure と Start CDC はバケット名と対処方法を示すエラーで止まり、ジョブとセッションの
-  状態は保存されません（起動時にアクティビティログに記録されます）。その記録（オーバーレイ台帳、マニュアル
-  §13.6）がないと、除外された列を持つテーブルを含む Full Load は開始されません: Start ダイアログが
+  状態は保存されません（アプリのすべての画面の上に、バケット名を示すエラー通知が表示され、
+  アクティビティログに記録されます）。その記録（オーバーレイ台帳、マニュアル §13.6）がないと、
+  除外された列を持つテーブルを含む Full Load は開始されません: Start ダイアログが
   *Could not read the record of excluded-column changes* と表示して Start を無効にし、そのような
   テーブルに達した実行はそのテーブルを *cannot read the record of dropped DEFAULTs; nothing was changed
   on this table* で失敗させます（アクティビティログの *overlay ledger unreadable* エントリが拒否された
@@ -993,9 +1001,17 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   日付では何も証明できません）。404 で安全と言えるのは、その名前を何も使っていなかった場合だけです。
   どちらかを別のアカウントが所有している場合、または安全だと確認できない場合は、そこから来たものを信頼
   しないでください: CDC インフラのコネクタープラグイン・オフセットシーダー・テンプレート（プラグイン
-  バケット）、アプリスタックのテンプレート（テンプレートバケット）、そして ECS Fargate で復元された
-  ジョブとセッションの状態です。CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認した
-  うえで、このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
+  バケット）、アプリスタックのテンプレート（テンプレートバケット）、そして ECS Fargate で
+  プラグインバケットから復元されたジョブとセッションの状態と、
+  そこから読み取った削除された DEFAULT の記録（オーバーレイ台帳）です。
+  そのコードと状態は両方のデータベースに作用しました: コネクタープラグインはソースシークレットを読み取り
+  Aurora DSQL クラスターに `admin` として接続できるロールで実行され、
+  Full Load は復元されたセッションの編集済みターゲット DDL を適用し、
+  Cut over は台帳の記録が示す DEFAULT を復元します。
+  CDC インフラを削除し、スタックのリソースと CloudTrail の履歴を確認し、
+  ソースシークレットが保持するソースデータベースの認証情報をローテーションし、
+  ターゲットのスキーマ・DEFAULT・データを Schema Conversion の出力と照合したうえで、
+  このアカウントが所有するバケットからこのバージョンで再デプロイしてください。
 - **監査証跡**: 構造化されたアクティビティログ（成功 + 失敗のタイムライン、UI から
   ダウンロード可能）は、シークレットではないフィールドのみを記録します — 行の値、
   パスワード、IAM トークンは決して記録しません。タスクの一時ディスク上でサイズ上限が
@@ -1433,7 +1449,8 @@ aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" 
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/build_and_push.sh            # タグはデフォルトでプロジェクトバージョン
+# タグはデフォルトでプロジェクトバージョン:
+deploy/build_and_push.sh
 # または明示的なタグを固定:
 deploy/build_and_push.sh 0.1.0
 ```
@@ -1458,7 +1475,8 @@ aws cloudformation deploy \
   --region "$AWS_REGION"
 
 # 各ビルド: ソースを zip + アップロードし、CodeBuild を実行し、待機し、イメージ URI を出力。
-deploy/build_in_codebuild.sh            # タグはデフォルトでプロジェクトバージョン
+# タグはデフォルトでプロジェクトバージョン:
+deploy/build_in_codebuild.sh
 # または明示的なタグを固定:
 deploy/build_in_codebuild.sh 0.1.0
 ```

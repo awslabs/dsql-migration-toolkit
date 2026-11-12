@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Runs the app's ``main()`` with S3 job and session state buckets, for
-tests/test_s3_bucket_owner.py, and prints what the activity log recorded at startup.
+tests/test_s3_bucket_owner.py, and prints what the activity log recorded at startup and the
+notice the page then shows above every view.
 
 Run as a script in its own interpreter (``main()`` changes process-wide state). The two state
 buckets are set as the ECS Fargate app template sets them, and every AWS request is refused
 before it is sent (the credentials are placeholders), so STS cannot name this identity's
 account and each store refuses its bucket. All local state goes to the directory given as
-the first argument. Prints one JSON object: the activity log's records and the URLs of the
-refused AWS requests.
+the first argument. Prints one JSON object: the activity log's records, the URLs of the
+refused AWS requests, and the page's state-bucket notice (``[header, body]``, or ``null``).
 """
 
 from __future__ import annotations
@@ -54,9 +55,12 @@ def _refuse(self, request, *_a, **_k):  # noqa: ANN001
 botocore.httpsession.URLLib3Session.send = _refuse
 
 import dsql_migrator.ui.app as app_module  # noqa: E402
+from dsql_migrator.ui.workflow import state_bucket_notice  # noqa: E402
 
 if __name__ == "__main__":
     app_module.main()  # ui.run returns at once in user simulation
     with open(f"{WORK}/activity.log", encoding="utf-8") as fh:
         records = [json.loads(line) for line in fh if line.strip()]
-    print(json.dumps({"records": records, "aws_refused": REFUSED}))
+    # What the page reads on each render (build_page hands it to build_workflow_sidebar).
+    notice = state_bucket_notice(*app_module._state_bucket_refusals())
+    print(json.dumps({"records": records, "aws_refused": REFUSED, "notice": notice}))

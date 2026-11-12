@@ -197,6 +197,19 @@ _KEEP_DONE_JOBS = 100
 _KEEP_SESSIONS = 200
 
 
+def _state_bucket_refusals() -> tuple[str | None, str | None]:
+    """The job and the session state store's S3 bucket refusals (their ``bucket_refusal``),
+    read on every render of the page's main area, which shows them above every view
+    (``state_bucket_notice``). ``None`` for a store that uses its bucket or keeps its state
+    in SQLite."""
+
+    def _refusal(store: object) -> str | None:
+        value = getattr(store, "bucket_refusal", None)
+        return value if isinstance(value, str) and value else None
+
+    return _refusal(getattr(JOB_MANAGER, "store", None)), _refusal(SESSION_STATE_STORE)
+
+
 async def build_when_connected(client: object, build: Callable[[], None]) -> bool:
     """Run ``build`` once ``client``'s websocket is connected; ``False`` if it never was.
 
@@ -947,6 +960,7 @@ def build_page(
         cdc_teardown_done_dismiss=_cdc_teardown_done_dismiss,
         cdc_op_in_flight_getter=_cdc_op_in_flight,
         cdc_probe=_cdc_probe,
+        state_bucket_refusals_getter=_state_bucket_refusals,
         on_ai_panel_ready=lambda handle: _ai_panel_holder.__setitem__("handle", handle),
         ai_context_getter=_ai_context,
         ai_general_streamer_factory=_general_ai_streamer,

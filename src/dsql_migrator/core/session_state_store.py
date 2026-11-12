@@ -50,6 +50,7 @@ from dsql_migrator.core.models import (
     WorkflowState,
 )
 from dsql_migrator.core.s3_ownership import (
+    CallerAccountError,
     OwnedBucket,
     refusal_text,
     session_caller_account,
@@ -551,10 +552,11 @@ class S3SessionStateStore:
     as the bucket's owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`): a bucket
     another account owns gets no snapshot and gives none back (a reconnecting browser starts
     fresh rather than restoring what that account wrote), and the refusal is logged at ERROR,
-    kept in :attr:`bucket_refusal` and recorded once in the activity log (at startup, by the
-    prune), and the next save or prune checks the bucket again first. That holds for a bucket
-    another account creates while the app runs, after this account's was deleted: the first
-    403 is checked with an owner-checked HeadBucket (``refusal_text``).
+    kept in :attr:`bucket_refusal` (the app shows it above every screen) and recorded in the
+    activity log (at startup, by the prune), once for each kind of refusal, and the next save
+    or prune checks the bucket again first. That holds for a bucket another account creates
+    while the app runs, after this account's was deleted: the first 403 is checked with an
+    owner-checked HeadBucket (``refusal_text``).
     """
 
     def __init__(
@@ -581,6 +583,9 @@ class S3SessionStateStore:
         #: Why the bucket was last refused (another account owns it, this identity cannot
         #: reach it, or its account could not be read); ``None`` once it is usable.
         self.bucket_refusal: Optional[str] = None
+        # The activity-log entries recorded since the bucket was last usable (one per kind of
+        # refusal, see _log_refusal).
+        self._recorded: set[str] = set()
         self._ensured = False
         self._background = background
         # session id -> its newest snapshot not yet uploaded, and the one being uploaded.
@@ -631,22 +636,31 @@ class S3SessionStateStore:
         self._ops().ensure(self._region)
         self._ensured = True
         self.bucket_refusal = None
+        self._recorded.clear()
 
     def _log_refusal(self, message: str, exc: BaseException) -> bool:
         """Log ``exc`` at ERROR, with what to do about it, when it is the bucket being refused
         (``message`` says which call failed); ``False`` for any other error.
 
-        The first refusal since the bucket was last usable is recorded in the activity log
-        too (at startup, the prune's; while the app runs, that of a bucket another account
-        took over). The next save or prune checks the bucket again (``_ensure_bucket``)
-        instead of trusting the earlier check, so the bucket is used again once this account
-        owns it."""
+        Each kind of refusal is recorded in the activity log too, the first time it is met
+        since the bucket was last usable: this identity's account could not be read (no
+        request was sent), or S3 refused the bucket (at startup, the prune's; while the app
+        runs, that of a bucket another account took over). So a bucket another account owns is
+        recorded after an STS failure at startup as well. The next save or prune checks the
+        bucket again (``_ensure_bucket``) instead of trusting the earlier check, so the bucket
+        is used again once this account owns it."""
         refusal = refusal_text(exc, self._owned)
         if refusal is None:
             return False
+        action = (
+            "Session state is not saved: AWS account ID unreadable"
+            if isinstance(exc, CallerAccountError)
+            else "Session state is not saved: S3 bucket refused"
+        )
         with self._lock:
             self._ensured = False
-            first = self.bucket_refusal is None
+            first = action not in self._recorded
+            self._recorded.add(action)
             self.bucket_refusal = refusal
         _LOGGER.error(
             "%s: session state is not saved to or restored from this bucket, so a "
@@ -656,7 +670,7 @@ class S3SessionStateStore:
         if first:
             log_activity(
                 ActivityCategory.SYSTEM,
-                "Session state is not saved: S3 bucket refused",
+                action,
                 status=ActivityStatus.FAILURE,
                 detail=refusal,
             )

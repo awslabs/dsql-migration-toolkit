@@ -267,6 +267,11 @@ class JobManager:
             self._store = store
         self.restore()
 
+    @property
+    def store(self) -> "Optional[JobStore]":
+        """The durable store attached to this manager (``None`` until one is)."""
+        return self._store
+
     def restore(self) -> None:
         """Reload persisted jobs, reconciling ones interrupted by a restart.
 

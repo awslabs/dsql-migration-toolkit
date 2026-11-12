@@ -1171,9 +1171,21 @@ def test_a_state_bucket_another_account_takes_over_while_the_app_runs_is_refused
     # ...so once the other account's bucket is gone, it creates this account's and saves.
     del s3.buckets[_BUCKET]
     jobs.save(_job("j3"), None)
-    assert s3.buckets[_BUCKET].owner == _ME and "jobs/j3.json" in s3.buckets[_BUCKET].objects
-    assert jobs.bucket_refusal is None
+    sessions.save(SessionSnapshot(session_id="s3"))
+    assert sessions.flush(5.0)
+    assert s3.buckets[_BUCKET].owner == _ME
+    assert {"jobs/j3.json", "sessions/s3.json"} <= set(s3.buckets[_BUCKET].objects)
+    assert jobs.bucket_refusal is None and sessions.bucket_refusal is None
     assert s3.violations == []
+    # A takeover after the bucket was usable again is a new refusal, recorded again.
+    _take_over(s3)
+    jobs.save(_job("j4"), None)
+    sessions.save(SessionSnapshot(session_id="s4"))
+    assert sessions.flush(5.0)
+    assert [action for action, _kw in recorded][2:] == [
+        "Job state is not saved: S3 bucket refused",
+        "Session state is not saved: S3 bucket refused",
+    ]
 
 
 def test_the_ledger_and_the_deployer_refuse_a_bucket_taken_over_after_they_reached_it() -> None:
@@ -1444,17 +1456,214 @@ def test_a_refused_state_bucket_is_recorded_in_the_activity_log_once(monkeypatch
     assert recorded == [] and usable.bucket_refusal is None
 
 
+class _StsFailsFirst(_Sts):
+    """STS that fails its first call (throttled at startup, say), then answers."""
+
+    def get_caller_identity(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise ClientError(
+                {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
+                "GetCallerIdentity",
+            )
+        return super().get_caller_identity()
+
+
+@pytest.mark.parametrize("store", ["jobs", "sessions"])
+def test_a_foreign_bucket_after_an_unreadable_account_is_recorded_too(
+    store: str, monkeypatch
+) -> None:
+    # FAILS WITHOUT THE FIX: the activity log took only the first refusal since the bucket was
+    # last usable, so after an STS failure at startup the bucket another account owns -- the
+    # refusal that matters -- reached the ERROR log only, under the STS entry titled "S3
+    # bucket refused" although no S3 request had been sent. Each kind is recorded once now.
+    recorded = _record_activity(monkeypatch)
+    s3 = OwnerCheckingS3()
+    theirs = _foreign(s3)
+    sts = _StsFailsFirst()
+    if store == "jobs":
+        jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=sts)
+        jobs.load_all()  # the account read fails: nothing is sent
+        assert s3.calls == []
+        jobs.save(_job("j1"), None)  # the account is read: the bucket is another account's
+        jobs.save(_job("j2"), None)
+        refusal, prefix = jobs.bucket_refusal, "Job"
+    else:
+        sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=sts)
+        sessions.prune(200)
+        assert s3.calls == []
+        sessions.save(SessionSnapshot(session_id="s1"))
+        assert sessions.load("s1") is None
+        sessions.save(SessionSnapshot(session_id="s2"))
+        refusal, prefix = sessions.bucket_refusal, "Session"
+    assert [action for action, _kw in recorded] == [
+        f"{prefix} state is not saved: AWS account ID unreadable",
+        f"{prefix} state is not saved: S3 bucket refused",
+    ]
+    assert "sts:GetCallerIdentity" in recorded[0][1]["detail"]
+    _assert_refusal(recorded[1][1]["detail"])
+    assert recorded[1][1]["detail"] == refusal
+    assert theirs.objects == {} and s3.reads == [] and s3.violations == []
+
+
+# ---------------------------------------------------------------------------
+# A refused state bucket is shown above every view
+# ---------------------------------------------------------------------------
+
+
+def test_the_state_bucket_notice_says_what_is_lost_and_why() -> None:
+    from dsql_migrator.core.s3_ownership import not_owned_message
+    from dsql_migrator.ui.workflow import state_bucket_notice
+
+    refusal = not_owned_message(_BUCKET, _ME)
+    other = "Could not read this identity's AWS account ID (sts:GetCallerIdentity: x)."
+    assert state_bucket_notice(None, None) is None
+    header, body = state_bucket_notice(refusal, None)
+    assert header == "Job state is not saved"
+    assert "an interrupted Full Load cannot resume" in body and "browser" not in body
+    assert body.endswith(refusal)
+    header, body = state_bucket_notice(None, refusal)
+    assert header == "Session state is not saved"
+    assert "a reconnecting browser starts over" in body and "Full Load" not in body
+    assert body.endswith(refusal)
+    # One bucket for both (the ECS Fargate default) is one refusal, said once...
+    header, body = state_bucket_notice(refusal, refusal)
+    assert header == "Job and session state are not saved"
+    assert "cannot resume" in body and "browser starts over" in body
+    assert body.count(refusal) == 1
+    # ...and two different ones say which is which.
+    _header, body = state_bucket_notice(refusal, other)
+    assert f"Job state: {refusal} Session state: {other}" in body
+
+
+class _NoPanel:
+    """The AI panel, off (the shell builds it; the notice does not need it)."""
+
+    def is_enabled(self) -> bool:
+        return False
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: None
+
+
+def _shell(monkeypatch, refusals):
+    """The real shell (build_workflow_sidebar) on its Connect view, with a NiceGUI double; the
+    elements it built."""
+    import types
+
+    from dsql_migrator.ui import workflow as wf
+    from dsql_migrator.ui.session import SessionStore
+    from tests.test_ui_connect_ai_status import _io_bound, _Ui
+
+    ui = _Ui()
+    fake = types.ModuleType("nicegui")
+    fake.ui = ui  # type: ignore[attr-defined]
+    fake.run = SimpleNamespace(  # type: ignore[attr-defined]
+        io_bound=_io_bound, cpu_bound=_io_bound
+    )
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+    monkeypatch.setattr(wf, "build_ai_panel", lambda *_a, **_k: _NoPanel())
+    wf.build_workflow_sidebar(
+        SessionStore(), "s3own", app_title="t", version="v",
+        connect_builder=lambda *_a: ui.label("CONNECT FORM"),
+        state_bucket_refusals_getter=lambda: refusals,
+    )
+    return ui.els
+
+
+def test_the_shell_shows_a_refused_state_bucket_above_every_view(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX: the refusal reached only the ERROR log and the activity log
+    # (downloadable from Settings), so the app ran Full Loads with their state unsaved and
+    # said nothing on the page.
+    import ast
+    import inspect
+    import textwrap
+
+    from dsql_migrator.core.s3_ownership import not_owned_message
+    from dsql_migrator.ui import workflow as wf
+    from dsql_migrator.ui.design import notice_box_classes
+
+    refusal = not_owned_message(_BUCKET, _ME)
+    els = _shell(monkeypatch, (refusal, refusal))
+    labels = [el.text for el in els if el.kind == "label"]
+    assert labels.index("Job and session state are not saved") < labels.index("CONNECT FORM")
+    (box,) = [
+        el for el in els if el.kind == "row" and el.classes_str == notice_box_classes("error")
+    ]
+    texts = [el.text for el in box.children[1].children]
+    assert texts[0] == "Job and session state are not saved" and texts[1].endswith(refusal)
+    # Nothing while both stores use their bucket.
+    els = _shell(monkeypatch, (None, None))
+    assert not [el for el in els if el.kind == "label" and "not saved" in el.text]
+    # Drawn before render_main branches on the view: on Connect, every step and the tools.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(wf.build_workflow_sidebar)))
+    (render_main,) = [
+        n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "render_main"
+    ]
+    body = [ast.unparse(statement) for statement in render_main.body]
+    banner = next(i for i, s in enumerate(body) if s.startswith("_render_state_bucket_banner("))
+    first_branch = next(i for i, s in enumerate(render_main.body) if isinstance(s, ast.If))
+    assert banner < first_branch
+
+
+def test_the_page_reads_each_state_stores_refusal_when_it_renders(monkeypatch) -> None:
+    # build_page hands the shell a getter of both stores' bucket_refusal, read at each render:
+    # a bucket refused at startup (the job restore, the session prune) is on the first page,
+    # and one refused while the app runs, on the next render.
+    import types
+
+    from dsql_migrator.core.job_manager import JobManager
+    from tests.test_ai_panel import _Ui as _PageUi
+
+    _record_activity(monkeypatch)
+    fake = types.ModuleType("nicegui")
+    fake.ui = _PageUi()  # type: ignore[attr-defined]
+    fake.run = SimpleNamespace(io_bound=None, cpu_bound=None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nicegui", fake)
+    from dsql_migrator.ui import app as app_module
+
+    hooks: dict = {}
+
+    def _spy_sidebar(*_a, **kwargs):  # noqa: ANN002
+        hooks.update(kwargs)
+        return (None, lambda *_a, **_k: None)
+
+    monkeypatch.setattr(app_module, "build_workflow_sidebar", _spy_sidebar)
+    s3 = OwnerCheckingS3()
+    _foreign(s3)
+    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    monkeypatch.setattr(app_module, "JOB_MANAGER", JobManager(stall_timeout_seconds=None))
+    monkeypatch.setattr(app_module, "SESSION_STATE_STORE", sessions)
+    getter = app_module._state_bucket_refusals
+    assert getter() == (None, None)  # SQLite-less, store-less: nothing to show
+    app_module.JOB_MANAGER.attach_store(jobs)  # main(): the restore is refused
+    sessions.prune(200)  # main(): so is the prune
+    session_id = "s3own-page"
+    try:
+        app_module.build_page(app_module.AppConfig(), session_id)
+    finally:
+        for store in ("SESSION_STORE", "DATA_MIGRATION_STORE"):
+            getattr(app_module, store).clear(session_id)
+    assert hooks["state_bucket_refusals_getter"] is getter
+    _assert_refusal(getter()[0] or "")
+    _assert_refusal(getter()[1] or "")
+    assert getter() == (jobs.bucket_refusal, sessions.bucket_refusal)
+    assert s3.reads == [] and s3.violations == []
+
+
 _STARTUP_HARNESS = Path(__file__).with_name("_startup_state_buckets_harness.py")
 
 
-def test_the_apps_startup_records_each_refused_state_bucket_in_the_activity_log(
+def test_the_apps_startup_records_each_refused_state_bucket_and_shows_it_on_the_page(
     tmp_path: Path,
 ) -> None:
     # The guides and the configuration help promise that the activity log records the
-    # refusal at startup. The app's real main() runs (in its own interpreter, as main()
-    # changes process-wide state) with both state buckets set, as on ECS Fargate, and every
-    # AWS request refused before it is sent: neither store can read this identity's account,
-    # so each refuses its bucket at its first request -- the job restore and the session prune.
+    # refusal at startup, and that the app shows it above every screen. The app's real main()
+    # runs (in its own interpreter, as main() changes process-wide state) with both state
+    # buckets set, as on ECS Fargate, and every AWS request refused before it is sent: neither
+    # store can read this identity's account, so each refuses its bucket at its first request
+    # -- the job restore and the session prune -- and no S3 request is sent.
     env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}
     out = subprocess.run(
         [sys.executable, str(_STARTUP_HARNESS), str(tmp_path)],
@@ -1462,15 +1671,25 @@ def test_the_apps_startup_records_each_refused_state_bucket_in_the_activity_log(
     )
     assert out.returncode == 0, out.stderr[-4000:]
     result = json.loads(out.stdout.strip().splitlines()[-1])
-    refused = [r for r in result["records"] if str(r.get("action", "")).endswith("bucket refused")]
+    refused = [
+        r for r in result["records"] if " state is not saved: " in str(r.get("action", ""))
+    ]
+    # FAILS WITHOUT THE FIX: both were titled "S3 bucket refused" although no S3 request was
+    # sent -- the account read failed.
     assert [(r["action"], r["status"]) for r in refused] == [
-        ("Job state is not saved: S3 bucket refused", "failure"),
-        ("Session state is not saved: S3 bucket refused", "failure"),
+        ("Job state is not saved: AWS account ID unreadable", "failure"),
+        ("Session state is not saved: AWS account ID unreadable", "failure"),
     ]
     assert all("sts:GetCallerIdentity" in r["detail"] for r in refused)
     # Only STS was asked: no S3 request goes out without the account to assert.
     assert result["aws_refused"]
     assert all(urlsplit(url).hostname.startswith("sts.") for url in result["aws_refused"])
+    # FAILS WITHOUT THE FIX: nothing on the page said so (the startup above is what main()
+    # leaves for the first page render: build_page hands _state_bucket_refusals to the shell).
+    header, body = result["notice"]
+    assert header == "Job and session state are not saved"
+    assert "cannot resume" in body and "sts:GetCallerIdentity" in body
+    assert body.count("sts:GetCallerIdentity") == 1  # one refusal for both: said once
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1734,53 @@ def test_the_guides_template_bucket_is_unpredictable_and_owner_checked(name: str
     assert flat.count("aws s3api head-bucket --expected-bucket-owner") == 2, name
     # ...and the operator who still has the old guide's predictable bucket is told what to do.
     assert text.count("mysql-dsql-migrator-templates-<account>-<region>") == 2, name
+
+
+# Each guide's "Ran an earlier version in this account?" note: its title, then what it must say
+# (whitespace aside: the lines wrap differently in each language).
+_EARLIER_VERSION_NOTE = {
+    "DEPLOYMENT.md": (
+        "**Ran an earlier version in this account?**",
+        "the record of dropped DEFAULTs (the overlay ledger)",
+        "rotate the source database credentials that the source secret holds",
+        "check the target's schema, DEFAULTs and data against the Schema Conversion output",
+    ),
+    "DEPLOYMENT.ko.md": (
+        "**이 계정에서 이전 버전을 실행했다면?**",
+        "제거된 DEFAULT의 기록(오버레이 원장)",
+        "소스 시크릿이 담은 소스 데이터베이스 자격 증명을 교체",
+        "타깃의 스키마·DEFAULT·데이터를 Schema Conversion 출력과 대조",
+    ),
+    "DEPLOYMENT.ja.md": (
+        "**このアカウントで以前のバージョンを実行した場合は?**",
+        "削除された DEFAULT の記録（オーバーレイ台帳）",
+        "ソースシークレットが保持するソースデータベースの認証情報をローテーション",
+        "ターゲットのスキーマ・DEFAULT・データを Schema Conversion の出力と照合",
+    ),
+}
+
+
+def test_the_earlier_version_steps_cover_the_source_credentials_and_the_target() -> None:
+    # FAILS WITHOUT THE FIX: the untrusted list left out the overlay ledger, and the steps
+    # (delete the CDC infrastructure, review, redeploy) rotated no credential and checked
+    # nothing on the target -- though the connector plugins ran with a role that can read the
+    # source secret and connect to the cluster as admin, a Full Load applies a restored
+    # session's edited target DDL, and an earlier Cut over restored a ledger record's DEFAULT.
+    from dsql_migrator.core.s3_ownership import not_owned_message
+
+    def flat(text: str) -> str:
+        return re.sub(r"\s+", "", text)
+
+    for name, (title, *says) in _EARLIER_VERSION_NOTE.items():
+        text = _guide(name)
+        note = text[text.index(title):text.index("\n- **", text.index(title))]
+        for phrase in says:
+            assert flat(phrase) in flat(note), (name, phrase)
+    # The refusal itself says the same.
+    refusal = not_owned_message(_BUCKET, _ME)
+    assert "the record of dropped DEFAULTs" in refusal
+    assert "rotate the source database credentials" in refusal
+    assert "check the target's schema, DEFAULTs and data" in refusal
 
 
 @pytest.mark.parametrize("name", _GUIDES)
@@ -1573,20 +1839,36 @@ def _logging_stub(name: str, output: str = "") -> str:
 # shell without them (macOS's default shell: interactive, `#` starts no comment there, as
 # its INTERACTIVE_COMMENTS option is off).
 _SHELLS = {"bash": ("--noprofile", "--norc"), "zsh": ("-f", "-i")}
+# The repository's scripts a guide block runs by a relative path: in the directory a paste
+# runs in, each is a logging stub, so no pasted block can run the real one.
+_GUIDE_SCRIPTS = {
+    "build_and_push.sh": "",
+    "build_in_codebuild.sh": "",
+    "create_test_cert.sh": f"CertificateArn=arn:aws:acm:{_REGION}:{_ME}:certificate/test",
+    "teardown.sh": "",
+}
 
 
 def _paste(
-    tmp_path: Path, command: str, *, owner_ok: bool, shell: str = "bash"
+    tmp_path: Path, command: str, *, owner_ok: bool, shell: str = "bash",
+    probe: tuple[str, ...] = (),
 ) -> list[list[str]]:
-    """Run ``command`` as a guide block pasted into ``shell``; the stub commands it called,
-    with their arguments."""
+    """Run ``command`` as a guide block pasted into ``shell``, in ``tmp_path``; the stub
+    commands it called, with their arguments. ``probe`` names variables whose values the
+    paste then reports, as a last call (``envprobe``)."""
     executable = shutil.which(shell)
     assert executable is not None
     bin_dir = _stub_bin(tmp_path, {
         "aws": _STUB_AWS,
         "docker": _logging_stub("docker"),
         "openssl": _logging_stub("openssl", "1a2b3c4d"),
+        "envprobe": _logging_stub("envprobe"),
     })
+    scripts = tmp_path / "deploy"
+    scripts.mkdir(exist_ok=True)
+    for script, output in _GUIDE_SCRIPTS.items():
+        (scripts / script).write_text(_logging_stub(f"deploy/{script}", output))
+        (scripts / script).chmod(0o755)
     log = tmp_path / "calls.log"
     log.write_text("")
     env = {
@@ -1595,9 +1877,11 @@ def _paste(
         "ACCOUNT": _ME, "AWS_REGION": _REGION, "ECR_REPO": "mysql-dsql-migrator",
         "TEMPLATE_BUCKET": f"mysql-dsql-migrator-templates-{_ME}-1a2b3c4d",
     }
+    if probe:
+        command += "\nenvprobe " + " ".join(f'"${name}"' for name in probe) + "\n"
     subprocess.run(
         [executable, *_SHELLS[shell]], input=command.encode("utf-8"), env=env,
-        capture_output=True, timeout=60, check=False,
+        cwd=tmp_path, capture_output=True, timeout=60, check=False,
     )
     return [line.split("\t") for line in log.read_text().splitlines()]
 
@@ -1648,26 +1932,36 @@ def test_every_deploy_and_teardown_runs_only_after_its_owner_check(
     shutil.which("bash") is None or shutil.which("zsh") is None, reason="needs bash and zsh"
 )
 @pytest.mark.parametrize("name", [*_GUIDES, "cdc-stack/README.md"])
-def test_the_guides_bucket_commands_run_alike_when_pasted_into_zsh(
+def test_the_guides_shell_blocks_run_alike_when_pasted_into_zsh(
     name: str, tmp_path: Path
 ) -> None:
     # FAILS WITHOUT THE FIX: pasted into macOS's interactive zsh, where `#` starts no
     # comment, the image update's comment line before its owner check opened a quote at
     # "CloudFormation's", so neither the check nor the deploy ran (the docker build and push
     # before it had); the EC2 setup block stopped the same way before its `aws s3 mb`, and the
-    # cdc-stack README's deploy on the comment after its last argument. Every block that
-    # creates, checks, deploys from or deletes a guide's bucket now runs the same commands in
-    # zsh as in bash, whether the owner check passes or fails.
-    blocks = [
-        b for b in _FENCED_BASH.findall(_guide(name))
+    # cdc-stack README's deploy on the comment after its last argument. The AWS CLI deploy's
+    # environment block, pasted just before the template bucket's commands, ran
+    # deploy/create_test_cert.sh (an ACM certificate import) from its commented-out
+    # CERTIFICATE_ARN line, and in English the apostrophe in "DB's" quoted away its VPC and
+    # subnet exports; each image build ran with the tag "#" from its trailing comment, and
+    # teardown.sh got its trailing comment as arguments. Every shell block of the guides and
+    # the cdc-stack README now runs the same commands in zsh as in bash and leaves the same
+    # values in the variables it exports, whether a block's owner check passes or fails.
+    blocks = _FENCED_BASH.findall(_guide(name))
+    buckets = [
+        b for b in blocks
         if re.search(r"TEMPLATE_BUCKET|PLUGIN_BUCKET|mysql-dsql-migrator-plugins-", b)
     ]
-    assert len(blocks) == (1 if name.startswith("cdc-stack") else 7), name
+    expected = (1, 1) if name.startswith("cdc-stack") else (22, 7)
+    assert (len(blocks), len(buckets)) == expected, name
     for block in blocks:
-        for owner_ok in (True, False):
-            in_bash = _paste(tmp_path, block, owner_ok=owner_ok)
-            assert in_bash, block
-            assert _paste(tmp_path, block, owner_ok=owner_ok, shell="zsh") == in_bash, block
+        exported = tuple(dict.fromkeys(re.findall(r"^export ([A-Z_][A-Z0-9_]*)=", block, re.M)))
+        for owner_ok in (True, False) if "head-bucket" in block else (True,):
+            in_bash = _paste(tmp_path, block, owner_ok=owner_ok, probe=exported)
+            # (A block with a <placeholder> to edit first runs nothing as written.)
+            assert in_bash or block not in buckets, block
+            in_zsh = _paste(tmp_path, block, owner_ok=owner_ok, shell="zsh", probe=exported)
+            assert in_zsh == in_bash, block
 
 
 # ---------------------------------------------------------------------------

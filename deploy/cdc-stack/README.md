@@ -80,11 +80,13 @@ The template exceeds CloudFormation's 51,200-byte inline limit, so the CLI stage
 bucket: the tool's plugin bucket, which `PluginBucketArn` names and the stack's connector
 plugins and offset seeder are read from. That bucket's name is derived from the account ID
 and Region, so another AWS account could own a bucket by that name: the deploy runs only if
-the `head-bucket` check confirms that this account owns it. Replace `...` with the other
-parameters (the template's `Parameters` section lists them), and add `--no-execute-changeset`
-to inspect the change set without applying it.
+the `head-bucket` check confirms that this account owns it. Set `AWS_REGION` to the app's
+Region (the plugin bucket's name ends with it), replace `...` with the other parameters (the
+template's `Parameters` section lists them), and add `--no-execute-changeset` to inspect the
+change set without applying it.
 
 ```bash
+export AWS_REGION=us-east-1
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export PLUGIN_BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
 aws s3api head-bucket --bucket "$PLUGIN_BUCKET" --expected-bucket-owner "$ACCOUNT" \

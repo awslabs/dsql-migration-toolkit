@@ -118,8 +118,8 @@ class AppConfig(BaseModel):
             "which lives on the task's EPHEMERAL /tmp and is wiped on replacement. "
             "Every request names this identity's own AWS account as the bucket's "
             "expected owner, so a bucket by this name in another account is never "
-            "used: no job state is saved to it or restored from it, and the activity "
-            "log records the refusal at startup. "
+            "used: no job state is saved to it or restored from it, the app shows the "
+            "refusal above every screen, and the activity log records it. "
             "When None, the local SQLite path is used (local dev). Config key: "
             "DSQL_MIGRATOR_JOB_STATE_BUCKET."
         ),
@@ -155,7 +155,8 @@ class AppConfig(BaseModel):
             "and is wiped on replacement. Every request names this identity's own "
             "AWS account as the bucket's expected owner, so a bucket by this name in "
             "another account is never used: no session state is saved to it or "
-            "restored from it, and the activity log records the refusal at startup. "
+            "restored from it, the app shows the refusal above every screen, and the "
+            "activity log records it. "
             "When None, the local SQLite path is used "
             "(local dev). Config key: DSQL_MIGRATOR_SESSION_STATE_BUCKET."
         ),

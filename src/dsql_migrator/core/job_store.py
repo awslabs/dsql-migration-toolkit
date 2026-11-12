@@ -37,6 +37,7 @@ from typing import Optional, Protocol
 from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
 from dsql_migrator.core.models import MigrationJob
 from dsql_migrator.core.s3_ownership import (
+    CallerAccountError,
     OwnedBucket,
     refusal_text,
     session_caller_account,
@@ -227,12 +228,12 @@ class S3JobStore:
     Every request asserts the caller's own account (``sts:GetCallerIdentity``, read once)
     as the bucket's owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`): a bucket
     another account owns gets no job state and gives none back, and the refusal is logged
-    at ERROR, kept in :attr:`bucket_refusal` and recorded once in the activity log (at
-    startup, by the restore). The store then behaves as with any unusable bucket: nothing is
-    saved, nothing is restored, and the next save, restore or prune checks the bucket again
-    first. That holds for a bucket another account creates while the app runs, after this
-    account's was deleted: the first 403 is checked with an owner-checked HeadBucket
-    (``refusal_text``).
+    at ERROR, kept in :attr:`bucket_refusal` (the app shows it above every screen) and
+    recorded in the activity log (at startup, by the restore), once for each kind of refusal.
+    The store then behaves as with any unusable bucket: nothing is saved, nothing is restored,
+    and the next save, restore or prune checks the bucket again first. That holds for a bucket
+    another account creates while the app runs, after this account's was deleted: the first
+    403 is checked with an owner-checked HeadBucket (``refusal_text``).
     """
 
     def __init__(
@@ -260,6 +261,9 @@ class S3JobStore:
         #: Why the bucket was last refused (another account owns it, this identity cannot
         #: reach it, or its account could not be read); ``None`` once it is usable.
         self.bucket_refusal: Optional[str] = None
+        # The activity-log entries recorded since the bucket was last usable (one per kind of
+        # refusal, see _log_refusal).
+        self._recorded: set[str] = set()
         self._ensured = False
         self._min_interval = float(min_write_interval_seconds)
         self._clock = clock or time.monotonic
@@ -310,22 +314,31 @@ class S3JobStore:
         self._ops().ensure(self._region)
         self._ensured = True
         self.bucket_refusal = None
+        self._recorded.clear()
 
     def _log_refusal(self, message: str, exc: BaseException) -> bool:
         """Log ``exc`` at ERROR, with what to do about it, when it is the bucket being refused
         (``message`` says which call failed); ``False`` for any other error.
 
-        The first refusal since the bucket was last usable is recorded in the activity log
-        too (at startup, the restore's; while the app runs, that of a bucket another account
-        took over). The next save, restore or prune checks the bucket again
-        (``_ensure_bucket``) instead of trusting the earlier check, so the bucket is used again
-        once this account owns it."""
+        Each kind of refusal is recorded in the activity log too, the first time it is met
+        since the bucket was last usable: this identity's account could not be read (no
+        request was sent), or S3 refused the bucket (at startup, the restore's; while the app
+        runs, that of a bucket another account took over). So a bucket another account owns is
+        recorded after an STS failure at startup as well. The next save, restore or prune
+        checks the bucket again (``_ensure_bucket``) instead of trusting the earlier check, so
+        the bucket is used again once this account owns it."""
         refusal = refusal_text(exc, self._owned)
         if refusal is None:
             return False
+        action = (
+            "Job state is not saved: AWS account ID unreadable"
+            if isinstance(exc, CallerAccountError)
+            else "Job state is not saved: S3 bucket refused"
+        )
         with self._lock:
             self._ensured = False
-            first = self.bucket_refusal is None
+            first = action not in self._recorded
+            self._recorded.add(action)
             self.bucket_refusal = refusal
         _LOGGER.error(
             "%s: job state is not saved to or restored from this bucket, so an interrupted "
@@ -335,7 +348,7 @@ class S3JobStore:
         if first:
             log_activity(
                 ActivityCategory.SYSTEM,
-                "Job state is not saved: S3 bucket refused",
+                action,
                 status=ActivityStatus.FAILURE,
                 detail=refusal,
             )

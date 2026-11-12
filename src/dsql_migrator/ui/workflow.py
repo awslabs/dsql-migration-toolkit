@@ -1331,6 +1331,62 @@ def _render_reconnect_banner(ui: object, state: "object") -> None:
     )
 
 
+def state_bucket_notice(
+    job_refusal: Optional[str], session_refusal: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """``(header, body)`` of the error notice shown above every view while the job or the
+    session state store does not use its S3 bucket (each store's ``bucket_refusal``:
+    another AWS account owns the bucket, this identity cannot reach it, or this identity's
+    account could not be read); ``None`` while both are usable or neither is in S3.
+
+    The refusal was only an ERROR log line and an activity-log entry, so an operator who ran
+    only a Full Load learned that its state was not saved when a task replacement lost the
+    resume. The body says what is lost, then the refusal itself (the bucket, why, and what
+    to do); one refusal for both stores (the same bucket, on ECS Fargate) is said once.
+    """
+    if not job_refusal and not session_refusal:
+        return None
+    resume = "an interrupted Full Load cannot resume after a restart or a task replacement"
+    browser = "a reconnecting browser starts over"
+    if job_refusal and session_refusal:
+        header = "Job and session state are not saved"
+        lost = f"The app does not use the S3 bucket that holds them, so {resume}, and {browser}."
+        why = (
+            job_refusal
+            if job_refusal == session_refusal
+            else f"Job state: {job_refusal} Session state: {session_refusal}"
+        )
+    elif job_refusal:
+        header = "Job state is not saved"
+        lost = f"The app does not use the S3 bucket that holds it, so {resume}."
+        why = job_refusal
+    else:
+        header = "Session state is not saved"
+        lost = (
+            f"The app does not use the S3 bucket that holds it, so {browser} after a restart "
+            "or a task replacement."
+        )
+        why = str(session_refusal)
+    return header, f"{lost} {why}"
+
+
+def _render_state_bucket_banner(
+    ui: object,
+    refusals_getter: Optional[Callable[[], "tuple[Optional[str], Optional[str]]"]],
+) -> None:
+    """Render :func:`state_bucket_notice` for ``refusals_getter()`` -- the job and the
+    session store's refusals -- as an error notice; nothing while there is none."""
+    if refusals_getter is None:
+        return
+    try:
+        notice = state_bucket_notice(*refusals_getter())
+    except Exception:  # noqa: BLE001 - a banner must never break the page render
+        return
+    if notice is not None:
+        header, body = notice
+        render_notice(ui, tone="error", header=header, body=body)
+
+
 # How often the persistent CDC-teardown banner re-checks the background job. A
 # teardown runs for minutes (delete ~15–45 min), so a slow poll is plenty; it only
 # needs to notice completion to remove itself.
@@ -1366,6 +1422,10 @@ def build_workflow_sidebar(
     cdc_teardown_done_dismiss: Optional[Callable[[], None]] = None,
     cdc_op_in_flight_getter: Optional[Callable[[], Optional[str]]] = None,
     cdc_probe: Optional[Callable[[], None]] = None,
+    # The job and the session state store's S3 bucket refusals (state_bucket_notice).
+    state_bucket_refusals_getter: Optional[
+        Callable[[], "tuple[Optional[str], Optional[str]]"]
+    ] = None,
     optional_tools: Optional[dict[str, "OptionalTool"]] = None,
     on_ai_panel_ready: Optional[Callable[["AiPanelHandle"], None]] = None,
     ai_context_getter: Optional[Callable[[], "MigrationContext"]] = None,
@@ -1922,6 +1982,9 @@ def build_workflow_sidebar(
         @ui.refreshable
         def render_main() -> None:
             view = selected["view"]
+            # Job / session state not saved (its S3 bucket refused), pinned above ALL views
+            # while it lasts: Connect, every step and the optional tools.
+            _render_state_bucket_banner(ui, state_bucket_refusals_getter)
             # Persistent CDC-teardown banner, pinned above ALL views (Connect, the
             # workflow steps, and the optional tools) so a background stop/delete --
             # e.g. one fired by Start over, which lands the user on Connect -- stays

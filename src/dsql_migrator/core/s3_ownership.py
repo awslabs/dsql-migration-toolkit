@@ -79,7 +79,9 @@ _EARLIER = (
     "Versions of the tool before this check used such a bucket. If another account owns it, "
     "CDC infrastructure deployed in this account and Region may run connector plugins, an "
     "offset seeder and a template from it (delete it on the CDC step and review what its stack "
-    "created), and on ECS Fargate the job and session state may have been restored from it."
+    "created), and on ECS Fargate the job and session state and the record of dropped "
+    "DEFAULTs may have come from it; then rotate the source database credentials, and check "
+    "the target's schema, DEFAULTs and data against the Schema Conversion output."
 )
 
 # The IAM permission each request the tool sends to the bucket needs: what a 403 to it points
@@ -100,6 +102,11 @@ _OPERATION_IN_TEXT = re.compile(r"when calling the (\w+) operation")
 class BucketOwnershipError(RuntimeError):
     """The tool does not use an S3 bucket whose owner it cannot confirm: another AWS account
     owns it, this identity cannot reach it, or the caller's own account could not be read."""
+
+
+class CallerAccountError(BucketOwnershipError):
+    """The caller's own AWS account ID could not be read (or was not a 12-digit ID), so no
+    request was sent to the bucket: there was no owner to assert. S3 refused nothing."""
 
 
 def _first_line(exc: BaseException) -> str:
@@ -202,13 +209,13 @@ def _sts_failure_message(exc: BaseException) -> str:
 
 def caller_account_id(sts_client: Any) -> str:
     """The caller's own AWS account ID: ``sts:GetCallerIdentity``, which needs no IAM
-    permission. :class:`BucketOwnershipError` when it cannot be read."""
+    permission. :class:`CallerAccountError` when it cannot be read."""
     try:
         account = str(sts_client.get_caller_identity()["Account"])
     except Exception as exc:  # noqa: BLE001 - surfaced as the refusal it causes
-        raise BucketOwnershipError(_sts_failure_message(exc)) from exc
+        raise CallerAccountError(_sts_failure_message(exc)) from exc
     if not _ACCOUNT_ID.fullmatch(account):
-        raise BucketOwnershipError(
+        raise CallerAccountError(
             f"sts:GetCallerIdentity returned the account ID {account!r}, not 12 digits, so the "
             "tool cannot assert who owns its S3 bucket, and does not use it."
         )
@@ -233,7 +240,7 @@ class CallerAccount:
                 try:
                     client = self._sts()
                 except Exception as exc:  # noqa: BLE001 - no client, no account
-                    raise BucketOwnershipError(_sts_failure_message(exc)) from exc
+                    raise CallerAccountError(_sts_failure_message(exc)) from exc
                 self._account = caller_account_id(client)
             return self._account
 
@@ -268,7 +275,7 @@ class OwnedBucket:
 
     def __init__(self, client: Any, name: str, owner: str) -> None:
         if not _ACCOUNT_ID.fullmatch(str(owner or "")):
-            raise BucketOwnershipError(
+            raise CallerAccountError(
                 f"No AWS account ID to assert as the owner of S3 bucket '{name}' (got "
                 f"{owner!r}), so the tool does not use it."
             )
@@ -418,6 +425,7 @@ def refusal_text(exc: BaseException, bucket: OwnedBucket | None = None) -> Optio
 __all__ = [
     "BucketOwnershipError",
     "CallerAccount",
+    "CallerAccountError",
     "OwnedBucket",
     "already_exists_message",
     "caller_account_id",

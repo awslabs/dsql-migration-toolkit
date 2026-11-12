@@ -420,19 +420,24 @@ every customer. The minimal (Dev/Test) deploy:
 ```bash
 # --- Your environment (edit these) -------------------------------------------
 export AWS_REGION=us-east-1
-# VpcId: recommended -- the source DB's VPC
+# VpcId: recommended -- the VPC of the source DB
 export VPC_ID=vpc-0a1b2c3d4e5f6a7b8
 # AlbSubnetIds: 2 subnets, distinct AZs
 export ALB_SUBNET_IDS=subnet-0f1e2d3c4b5a69788,subnet-0a9b8c7d6e5f43210
 # ServiceSubnetIds: 2 private subnets
 export SERVICE_SUBNET_IDS=subnet-0123456789abcdef0,subnet-0fedcba987654321f
-# CertificateArn: paste a real ACM cert ARN below, OR auto-fill a self-signed TEST
-# cert (no domain needed) by capturing the script's output in one line instead:
-#   export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
+# CertificateArn: a real ACM cert ARN, or a self-signed TEST cert, see below the block
 export CERTIFICATE_ARN=arn:aws:acm:us-east-1:123456789012:certificate/a1b2c3d4-e5f6-47a8-9b0c-1d2e3f4a5b6c
 export DSQL_CLUSTER_ARN=arn:aws:dsql:us-east-1:123456789012:cluster/f0a1b2c3d4e5f6a7b8c9d0e1f2
 export SOURCE_DB_SG=sg-0a1b2c3d4e5f6a7b8
 # -----------------------------------------------------------------------------
+```
+
+No ACM certificate? After the block, this fills `CERTIFICATE_ARN` with a self-signed TEST
+certificate instead (no domain needed; browsers warn):
+
+```bash
+export CERTIFICATE_ARN=$(deploy/create_test_cert.sh | sed -n 's/^CertificateArn=//p')
 ```
 
 > [!WARNING]
@@ -904,8 +909,10 @@ default):
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/teardown.sh mysql-dsql-migrator          # delete the stack only
-DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator   # also remove the ECR repo + images
+# Delete the stack only:
+deploy/teardown.sh mysql-dsql-migrator
+# Also remove the ECR repo + images:
+DELETE_ECR=true deploy/teardown.sh mysql-dsql-migrator
 ```
 
 Route 53 records you created manually must be removed manually.
@@ -969,7 +976,8 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   this account as the bucket's expected owner, which S3 refuses unless this account owns
   the bucket. A bucket by that name in another account is never used: Deploy CDC
   infrastructure and Start CDC stop with an error that names the bucket and what to do,
-  and the job and session state are not saved (the activity log records it at startup).
+  and the job and session state are not saved (an error notice above every screen of the
+  app says so and names the bucket, and the activity log records it).
   Without that record (the overlay ledger, manual §13.6), a Full Load that includes a
   table with excluded columns does not start: its Start dialog says *Could not read the
   record of excluded-column changes* and keeps Start disabled, and a run that reaches such a
@@ -1004,9 +1012,15 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   the name only if nothing used it. If another account owns either name, or you cannot clear
   it, treat what came from it as untrusted: the CDC infrastructure's connector plugins, offset
   seeder and template (the plugin bucket), the app stack's template (the template bucket),
-  and the job and session state restored on ECS Fargate. Delete the CDC infrastructure,
-  review the stacks' resources and their CloudTrail history, and deploy again with this
-  version from a bucket this account owns.
+  and, on ECS Fargate, the job and session state restored from the plugin bucket and the
+  record of dropped DEFAULTs (the overlay ledger) read from it. That code and state acted on
+  both databases: the connector plugins ran with a role that can read the source secret and
+  connect to the Aurora DSQL cluster as `admin`, a Full Load applies a restored session's
+  edited target DDL, and Cut over restores the DEFAULTs that a ledger record names. Delete
+  the CDC infrastructure, review the stacks' resources and their CloudTrail history, rotate
+  the source database credentials that the source secret holds, check the target's schema,
+  DEFAULTs and data against the Schema Conversion output, and deploy again with this version
+  from a bucket this account owns.
 - **Audit trail**: the structured activity log (success + failure timeline,
   downloadable from the UI) records non-secret fields only — never row values,
   passwords, or IAM tokens. It is size-capped and rotated on the task's
@@ -1455,7 +1469,8 @@ aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" 
 
 ```bash
 export AWS_REGION=us-east-1
-deploy/build_and_push.sh            # tag defaults to the project version
+# The tag defaults to the project version:
+deploy/build_and_push.sh
 # or pin an explicit tag:
 deploy/build_and_push.sh 0.1.0
 ```
@@ -1480,7 +1495,8 @@ aws cloudformation deploy \
   --region "$AWS_REGION"
 
 # Each build: zip + upload source, run CodeBuild, wait, print the image URI.
-deploy/build_in_codebuild.sh            # tag defaults to the project version
+# The tag defaults to the project version:
+deploy/build_in_codebuild.sh
 # or pin an explicit tag:
 deploy/build_in_codebuild.sh 0.1.0
 ```
