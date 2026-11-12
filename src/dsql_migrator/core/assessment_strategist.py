@@ -1091,7 +1091,7 @@ def build_cdc_error_chat_system(
     the live CDC status (DLQ depth + poison tables + SQLSTATEs, detected schema drift,
     stream/stall state). ``scope`` is ``"dlq"`` (poison records) or ``"drift"`` (the drift
     banner: a source schema change, or a value its column cannot hold). The model is grounded on this tool's CDC model
-    (:data:`_CDC_RECOVERY_CONTEXT`) so its advice maps to the real buttons (Fix target
+    (:func:`_cdc_recovery_context`) so its advice maps to the real buttons (Fix target
     schema / per-table Reload / Stop CDC) and the standing-gap-before-cutover rule.
     """
     subject = (
