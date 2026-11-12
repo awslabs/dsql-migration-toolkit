@@ -180,10 +180,9 @@ What makes it more than a chatbot:
   elsewhere, and recent actions ground each answer.
 - **"What's next?" briefing.** A header action gives a tool-grounded read of what to do
   next and the top risks right now.
-- **Scoped deep-links.** Each step offers a one-click "ask about this" into the panel —
-  per-failed-table / per-quarantine help on Full Load, drift + DLQ triage on CDC, "Explain
-  this mismatch" on Validation, and a **GO / HOLD "is it safe to cut over?"** read on Cut
-  over.
+- **Scoped deep-links.** Every step except Cut over offers a one-click "ask about this"
+  into the panel — per-failed-table / per-quarantine help on Full Load, drift + DLQ triage
+  on CDC, and "Explain this mismatch" on Validation.
 
 **Safety — the same model as all AI assist:** off by default; Bedrock-only (no API-key
 entry); the tools are strictly read-only and see **schema / status / DDL / plan metadata —

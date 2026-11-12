@@ -39,6 +39,7 @@ import ast
 import importlib
 import importlib.util
 import inspect
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -256,33 +257,61 @@ def test_no_src_module_defines_or_imports_a_deleted_name() -> None:
         rel = path.relative_to(_SRC).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
         for node in ast.walk(tree):
+            # An import binds its alias too: ``from m import x as <deleted>`` and
+            # ``import m as <deleted>`` bring the name back as surely as importing it.
             if isinstance(node, ast.ImportFrom):
                 if node.module == "dsql_migrator.core.ai_routing":
                     found.append(f"{rel}:{node.lineno} imports core.ai_routing")
                 found.extend(
-                    f"{rel}:{node.lineno} imports {alias.name}"
+                    f"{rel}:{node.lineno} imports {_imported(alias)}"
                     for alias in node.names
-                    if alias.name in deleted
+                    if alias.name in deleted or alias.asname in deleted
                 )
             elif isinstance(node, ast.Import):
                 found.extend(
-                    f"{rel}:{node.lineno} imports {alias.name}"
+                    f"{rel}:{node.lineno} imports {_imported(alias)}"
                     for alias in node.names
                     if alias.name == "dsql_migrator.core.ai_routing"
+                    or alias.asname in deleted
                 )
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name in deleted:
                     found.append(f"{rel}:{node.lineno} defines {node.name}")
-        # A deleted module-level constant (MAX_SUGGESTION_CHARS, ENV_BEDROCK_*, ...) brought
-        # back by assignment in any module.
-        for node in tree.body:
-            targets = (
-                node.targets if isinstance(node, ast.Assign)
-                else [node.target] if isinstance(node, ast.AnnAssign) else []
-            )
-            found.extend(
-                f"{rel}:{node.lineno} assigns {t.id}"
-                for t in targets
-                if isinstance(t, ast.Name) and t.id in deleted
-            )
+            elif isinstance(node, ast.Global):
+                # ``global <deleted>`` lets a function bind the module's name.
+                found.extend(
+                    f"{rel}:{node.lineno} declares global {name}"
+                    for name in node.names
+                    if name in deleted
+                )
+        # A deleted module-level name (MAX_SUGGESTION_CHARS, ENV_BEDROCK_*, ...) bound
+        # again in any module by any other statement: an assignment of any shape (an
+        # unpacking ``_a, <deleted> = ...`` too), a for, with or := target, also inside a
+        # module-level if or try. Function and class bodies are skipped: a local variable
+        # or a class attribute of that name is not the module's (a def of it is caught
+        # above, wherever it is).
+        found.extend(
+            f"{rel}:{node.lineno} assigns {node.id}"
+            for node in _module_scope(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id in deleted
+        )
     assert found == []
+
+
+def _imported(alias: ast.alias) -> str:
+    return f"{alias.name} as {alias.asname}" if alias.asname else alias.name
+
+
+def _module_scope(tree: ast.Module) -> Iterator[ast.AST]:
+    """Every node that runs in the module's own scope: the module's statements and what
+    they hold, but not the inside of a def, a class or a lambda (each its own scope)."""
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            pending.extend(ast.iter_child_nodes(node))

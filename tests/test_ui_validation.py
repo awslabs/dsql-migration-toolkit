@@ -2377,6 +2377,36 @@ def test_the_cutover_screen_no_longer_offers_an_ai_dba_chat() -> None:
     assert _re.search(r"\bai_post_event\b", src), src
 
 
+def test_no_copy_still_promises_the_removed_cut_over_verdict() -> None:
+    """Two texts kept offering what the chat above gave after v0.1.479 removed it: the
+    Connect screen's AI Assist line ("a cut-over repoint recipe with a GO/HOLD verdict")
+    and the manual's scoped deep-links bullet in chapter 9.5 (a GO / HOLD "is it safe to
+    cut over?" read on Cut over), in English, Korean and Japanese. Neither does now, and
+    no manual page or README promises a GO/HOLD verdict."""
+    import re
+    from pathlib import Path
+
+    from tests.test_ui_connect_ai_status import _render
+
+    # What the operator reads on the REAL Connect page (the suite's NiceGUI double).
+    ui, _state = _render(lambda _state: None)
+    line = next(
+        el.text
+        for el in ui.els
+        if el.kind == "label" and el.text.startswith("Augment the deterministic workflow")
+    )
+    for stale in ("go/hold", "go / hold", "verdict", "repoint", "safe to cut over"):
+        assert stale not in line.lower(), line
+    assert line.endswith("plus an always-available AI chat on every step."), line
+
+    repo = Path(__file__).resolve().parent.parent
+    pages = sorted((repo / "docs" / "manual").glob("*/*.md")) + sorted(repo.glob("README*.md"))
+    assert len(pages) > 40, pages
+    for page in pages:
+        flat = " ".join(page.read_text(encoding="utf-8").split())  # KO wrapped "GO / HOLD"
+        assert not re.search(r"GO ?/ ?HOLD", flat), page
+
+
 def test_cutover_runner_marks_step_done() -> None:
     # The Cut over step has no job: its runner records the user's acknowledgement
     # by marking WorkflowStep.CUT_OVER DONE on the session's workflow state.

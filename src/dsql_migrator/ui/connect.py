@@ -1377,13 +1377,15 @@ def build_connect_page(
             # the value proposition is read before the decision. AI Assist spans
             # the whole journey (per-object guidance in Evaluation, conversion
             # suggestions, and the AI chat), so the copy is no longer scoped to
-            # "conversion" only.
+            # "conversion" only. It offers nothing on Cut over beyond that chat: the
+            # Cut over chat and its GO/HOLD verdict went in v0.1.479 (see
+            # build_cutover_screen).
             ui.label(
                 "Augment the deterministic workflow with an Amazon Bedrock–backed "
                 "AI DBA across the whole migration — per-object guidance and "
                 "conversion suggestions for objects marked MANUAL or UNSUPPORTED, "
-                "query-lint and validation help, and a cut-over repoint recipe with "
-                "a GO/HOLD verdict — plus an always-available AI chat on every step."
+                "and query-lint and validation help — plus an always-available AI "
+                "chat on every step."
             ).classes("text-sm text-gray-700")
 
             # The decision itself, front and centre: a single switch, not buried
