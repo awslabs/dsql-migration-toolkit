@@ -3570,7 +3570,7 @@ def test_reset_in_place_preserves_cdc_deploy_role_arn() -> None:
     # cloudformation:DescribeStacks) -> AccessDenied on the deployed stack.
     store = DataMigrationStore()
     state = store.get_or_create("s1")
-    state.cdc_deploy_role_arn = "arn:aws:iam::076914959415:role/mysql-dsql-migrator-cdc-deploy"
+    state.cdc_deploy_role_arn = "arn:aws:iam::123456789012:role/mysql-dsql-migrator-cdc-deploy"
     state.job_id = "job-xyz"
 
     store.reset_in_place("s1")
@@ -3579,7 +3579,7 @@ def test_reset_in_place_preserves_cdc_deploy_role_arn() -> None:
     assert state.job_id is None  # user state wiped
     # ...but the deploy-role ARN survives so CDC keeps working after Start over.
     assert state.cdc_deploy_role_arn == (
-        "arn:aws:iam::076914959415:role/mysql-dsql-migrator-cdc-deploy"
+        "arn:aws:iam::123456789012:role/mysql-dsql-migrator-cdc-deploy"
     )
 
 

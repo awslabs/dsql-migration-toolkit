@@ -588,9 +588,9 @@ def test_g22_target_error_hint_explains_server_unavailable() -> None:
 _DENIED = (
     'connection to server at "18.97.33.134", port 5432 failed: FATAL: unable to '
     "accept connection, access denied DETAIL: Session Id: abc HINT: User: "
-    "arn:aws:sts::076914959415:assumed-role/mysql-dsql-migrator-TaskRole-X/sess is "
+    "arn:aws:sts::123456789012:assumed-role/mysql-dsql-migrator-TaskRole-X/sess is "
     "not authorized to perform: dsql:DbConnectAdmin on resource: "
-    "arn:aws:dsql:us-east-1:076914959415:cluster/ejudkwl6is27j3gmifw75amwme because "
+    "arn:aws:dsql:us-east-1:123456789012:cluster/exampleclusteraaaaaaaaaaaa because "
     "no identity-based policy allows the dsql:DbConnectAdmin action"
 )
 
@@ -606,12 +606,12 @@ def test_granted_cluster_endpoint_is_derived_from_the_arn(monkeypatch) -> None:
     monkeypatch.setenv(GRANTED_CLUSTER_ENV, "")
     assert granted_dsql_cluster_endpoint() is None, "blank = nothing granted"
     monkeypatch.setenv(
-        GRANTED_CLUSTER_ENV, " arn:aws:dsql:us-east-1:076914959415:cluster/abc123 "
+        GRANTED_CLUSTER_ENV, " arn:aws:dsql:us-east-1:123456789012:cluster/abc123 "
     )
     assert granted_dsql_cluster_endpoint() == "abc123.dsql.us-east-1.on.aws"
     # A wildcard grant has no single endpoint to name.
     monkeypatch.setenv(
-        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:076914959415:cluster/*"
+        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:123456789012:cluster/*"
     )
     assert granted_dsql_cluster_endpoint() is None
     # Junk must not produce a junk endpoint.
@@ -645,10 +645,10 @@ def test_a_different_cluster_is_named_instead_of_sending_them_to_iam(monkeypatch
 
     monkeypatch.setenv(
         GRANTED_CLUSTER_ENV,
-        "arn:aws:dsql:us-east-1:076914959415:cluster/grto2rur2hklwxhnkctspgxwdm",
+        "arn:aws:dsql:us-east-1:123456789012:cluster/exampleclusterbbbbbbbbbbbb",
     )
     hint = _failure_hint(_DENIED)
-    assert "grto2rur2hklwxhnkctspgxwdm.dsql.us-east-1.on.aws" in hint, hint
+    assert "exampleclusterbbbbbbbbbbbb.dsql.us-east-1.on.aws" in hint, hint
     assert "DsqlClusterArn" in hint, hint
     assert "cannot be widened by hand" in hint, hint
     assert "confirm your AWS identity" not in hint, hint
@@ -674,7 +674,7 @@ def test_a_wildcard_grant_falls_back_to_the_iam_wording(monkeypatch) -> None:
     )
 
     monkeypatch.setenv(
-        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:076914959415:cluster/*"
+        GRANTED_CLUSTER_ENV, "arn:aws:dsql:us-east-1:123456789012:cluster/*"
     )
     hint = _failure_hint(_DENIED)
     assert "dsql:DbConnectAdmin on this cluster" in hint
