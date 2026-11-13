@@ -3603,6 +3603,56 @@ DEPLOY_EMPTY_CAPTURE = (
 )
 
 
+class _StartPointChain(NamedTuple):
+    """What :func:`_cdc_start_point_chain` resolves: the start point Start CDC would seed
+    (``seed``, ``origin``), whether that start resumes a committed offset instead of seeding
+    (``resumes``), and the two refusals that point can draw -- ``newer`` (G25, A2:
+    ``(notice, line)``) and ``split`` (G137: the reason text)."""
+
+    seed: object
+    origin: str
+    resumes: bool
+    newer: "Optional[tuple[tuple[str, str, str, str], str]]"
+    split: Optional[str]
+
+
+def _cdc_start_point_chain(migration_state, job_manager, job, watermark, source_type):
+    """The start-point refusal chain of Start CDC, resolved once for the start this session
+    would make from ``watermark`` (the Full Load record ``job``'s).
+
+    Shared by the two places that must agree on it and no others: the Start button
+    (:func:`_render_cdc_start_button`, which disables Start and shows the refusal) and the
+    worker backstop (:func:`_start_cdc_deploy`, which a Retry CDC reaches without the
+    button). The start-point card and the Start dialog judge a point they resolve
+    themselves, with their own arguments.
+
+    * ``seed``/``origin`` (:func:`_cdc_start_seed`): a MySQL Manual binlog point beats the
+      Full Load watermark; PostgreSQL always takes the watermark.
+    * ``resumes`` (:func:`cdc_start_resumes`): a stack that has streamed resumes from its
+      committed offset, so nothing is seeded and a later point does not tear a split read.
+    * ``newer`` (G25, A2, :func:`newer_start_point_refusal`): a Start that would move a stack
+      that has streamed FORWARD, past where it last started.
+    * ``split`` (G137, :func:`split_start_point_refusal`): a Manual point later than the Full
+      Load's while CDC captures a table that load read in parts.
+
+    Pure apart from the CDC-state job reads of the two refusals.
+    """
+    seed, origin = _cdc_start_seed(migration_state, watermark, source_type)
+    resumes = cdc_start_resumes(migration_state, seed, source_type)
+    return _StartPointChain(
+        seed=seed,
+        origin=origin,
+        resumes=resumes,
+        newer=newer_start_point_refusal(
+            migration_state, seed, source_type, origin=origin, job_watermark=watermark,
+        ),
+        split=split_start_point_refusal(
+            migration_state, job, seed, source_type, origin=origin, resumes=resumes,
+            job_manager=job_manager,
+        ),
+    )
+
+
 def _render_cdc_start_button(
     ui, migration_state, job_manager, refresh, *, inventory=None, session=None
 ) -> None:
@@ -3628,24 +3678,17 @@ def _render_cdc_start_button(
     # could resume perfectly. The operator was pushed toward re-entering coordinates by
     # hand, or worse, re-running the Full Load, to recover something the connector had
     # not lost.
-    _seed, _seed_origin = _cdc_start_seed(
-        migration_state, watermark, _cdc_source_type(session)
+    #
+    # The start point this Start would take and the refusals it draws -- the chain the Start
+    # CDC worker applies again as its backstop (:func:`_cdc_start_point_chain`): G25 (A2), a
+    # Start that would move a stack that has streamed forward past where it last started,
+    # and G137, a Manual point later than the Full Load's while CDC captures a table it read
+    # in parts.
+    _chain = _cdc_start_point_chain(
+        migration_state, job_manager, job, watermark, _cdc_source_type(session)
     )
-    resumes_from_offset = cdc_start_resumes(
-        migration_state, _seed, _cdc_source_type(session)
-    )
-    # G25 (A2): a MySQL Start that would move a stack that has streamed forward, past where it
-    # last started (a detour through Full load only, a later Manual point) -- refused.
-    _newer = newer_start_point_refusal(
-        migration_state, _seed, _cdc_source_type(session), origin=_seed_origin,
-        job_watermark=watermark,
-    )
-    # G137: a Manual point later than the Full Load's, while CDC captures a table it read in
-    # parts -- refused.
-    _split_refusal = split_start_point_refusal(
-        migration_state, job, _seed, _cdc_source_type(session), origin=_seed_origin,
-        resumes=resumes_from_offset, job_manager=job_manager,
-    )
+    resumes_from_offset = _chain.resumes
+    _newer, _split_refusal = _chain.newer, _chain.split
     # Why the last run's connector stopped, kept across Stop CDC (the runbook's first step)
     # until the next Start: "Ready to resume" alone would invite the Start that stops the
     # same way. A past event the operator can act on, not a block -> warning.
@@ -9028,7 +9071,12 @@ def _start_cdc_deploy(
     # the ops window. What the seeder is OFFERED is the seed below (MySQL: a Manual binlog
     # point beats it -- the card and the preview already show that point as the start).
     watermark = _cdc_watermark(job, migration_state)
-    seed, seed_origin = _cdc_start_seed(migration_state, watermark, _cdc_source_type(session))
+    # The same chain the Start button resolved (:func:`_cdc_start_point_chain`), re-applied
+    # here as the backstop of a Retry CDC, which comes here without the button.
+    _chain = _cdc_start_point_chain(
+        migration_state, job_manager, job, watermark, _cdc_source_type(session)
+    )
+    seed, seed_origin = _chain.seed, _chain.origin
     _seed_refusal = seed_refused_by_an_earlier_offer(
         migration_state, seed, _cdc_source_type(session)
     )
@@ -9039,10 +9087,7 @@ def _start_cdc_deploy(
         return
     # G25 (A2): a stack that has streamed never moves forward to a newer start point (Retry
     # CDC comes here directly; the worker judges it again against a fresh describe).
-    _newer = newer_start_point_refusal(
-        migration_state, seed, _cdc_source_type(session), origin=seed_origin,
-        job_watermark=watermark,
-    )
+    _newer = _chain.newer
     if _newer is not None:
         render_notice(
             ui, tone="error", icon=_newer[0][1], header=_newer[0][2], body=_newer[0][3]
@@ -9051,11 +9096,7 @@ def _start_cdc_deploy(
     # G137 backstop (the card and the Start button say it first; Retry CDC comes here
     # directly): a Manual point later than the Full Load's while a table read in parts is
     # captured.
-    _split_refusal = split_start_point_refusal(
-        migration_state, job, seed, _cdc_source_type(session), origin=seed_origin,
-        resumes=cdc_start_resumes(migration_state, seed, _cdc_source_type(session)),
-        job_manager=job_manager,
-    )
+    _split_refusal = _chain.split
     if _split_refusal:
         render_notice(ui, tone="error", header=SPLIT_READ_HEADER, body=_split_refusal)
         return
