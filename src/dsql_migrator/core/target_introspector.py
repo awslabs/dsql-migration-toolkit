@@ -156,6 +156,8 @@ def _table_identifier(name: str):
     return sql.Identifier(schema_name, bare) if bare else sql.Identifier(name)
 
 
+# target_connection's _safe_close, kept here: importing this module does not load the target
+# connection layer (_default_connector_factory imports it lazily).
 def _safe_close(closeable: Any) -> None:
     """Close a cursor/connection, swallowing any error during cleanup."""
     try:

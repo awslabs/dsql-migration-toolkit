@@ -141,6 +141,7 @@ from dsql_migrator.core.occ import (
 )
 from dsql_migrator.core.target_connection import (
     DsqlConnector,
+    _safe_close,
     is_dropped_connection,
     is_server_unavailable,
     is_transient_connection_error,
@@ -2829,14 +2830,6 @@ def _aggregate_result(
         cancelled=cancelled,
         indexes_created=indexes_created,
     )
-
-
-def _safe_close(closeable: Any) -> None:
-    """Close a cursor/connection, swallowing any error during cleanup."""
-    try:
-        closeable.close()
-    except Exception:  # noqa: BLE001 - cleanup must not raise
-        pass
 
 
 __all__ = [

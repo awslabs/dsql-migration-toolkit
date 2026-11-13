@@ -79,6 +79,7 @@ from dsql_migrator.core.occ import (
 )
 from dsql_migrator.core.pg_names import pg_fold_unquoted, pg_stored_name
 from dsql_migrator.core.target_connection import (
+    _safe_close,
     is_server_unavailable,
     is_transient_connection_error,
 )
@@ -1731,14 +1732,6 @@ def _default_connection_factory(target: TargetConnectionConfig) -> ConnectionFac
 
     connector = DsqlConnector(target)
     return connector.connect
-
-
-def _safe_close(closeable: Any) -> None:
-    """Close a cursor/connection, swallowing any error during cleanup."""
-    try:
-        closeable.close()
-    except Exception:  # noqa: BLE001 - cleanup must not raise
-        pass
 
 
 # ---------------------------------------------------------------------------

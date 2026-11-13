@@ -117,6 +117,7 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.target_connection import (
     TRANSACTION_AGE_LIMIT_SQLSTATE,
     DsqlConnector,
+    _safe_close,
     is_dropped_connection,
     is_dsql_statement_limit,
     is_server_unavailable,
@@ -3400,14 +3401,6 @@ def _build_drift(
         watermark_binlog=watermark_binlog,
         current_binlog=current_binlog,
     )
-
-
-def _safe_close(closeable: Any) -> None:
-    """Close a cursor/connection, swallowing any error during cleanup."""
-    try:
-        closeable.close()
-    except Exception:  # noqa: BLE001 - cleanup must not raise
-        pass
 
 
 def _safe_error_message(exc: Exception) -> str:

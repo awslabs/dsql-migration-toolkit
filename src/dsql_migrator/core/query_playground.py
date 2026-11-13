@@ -38,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from dsql_migrator.core.models import TargetConnectionConfig
 from dsql_migrator.core.query_converter import StatementKind
-from dsql_migrator.core.target_connection import DsqlConnector
+from dsql_migrator.core.target_connection import DsqlConnector, _safe_close
 
 # A target connection factory opens one psycopg-style DSQL connection. Injectable
 # so tests never reach a real cluster (mirrors the validator's seam).
@@ -130,14 +130,6 @@ def _default_target_connection_factory(
 def _strip_terminator(sql: str) -> str:
     """Return ``sql`` without a trailing semicolon/whitespace (for EXPLAIN prefixing)."""
     return sql.rstrip().rstrip(";").rstrip()
-
-
-def _safe_close(closeable: Any) -> None:
-    """Close a cursor/connection, swallowing any error during cleanup."""
-    try:
-        closeable.close()
-    except Exception:  # noqa: BLE001 - cleanup must not raise
-        pass
 
 
 def _set_search_path(connection: Any, schema: str) -> None:

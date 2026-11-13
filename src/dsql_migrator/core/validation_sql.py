@@ -33,7 +33,9 @@ from typing import Mapping, Optional, Sequence
 
 from psycopg import sql
 
-from dsql_migrator.core.batched_import import _ParamSafeIdentifier
+# _pg_table_identifier is the Full Load's (one split rule for a target table name); its name
+# here stays importable (the validator, the schema applier, scripts and the harness use it).
+from dsql_migrator.core.batched_import import _ParamSafeIdentifier, _pg_table_identifier
 from dsql_migrator.core.converter import (
     is_spatial_mysql_type,
     map_mysql_type,
@@ -106,18 +108,6 @@ def _text_mysql_table(name: str) -> str:
     """:func:`_quote_mysql_table` for a statement run through ``text()``
     (:func:`_text_mysql_identifier`)."""
     return text_safe(_quote_mysql_table(name))
-
-
-def _pg_table_identifier(name: str) -> "sql.Identifier":
-    """Return a psycopg identifier for a possibly schema-qualified table name.
-
-    Splits ``schema.table`` so it composes to ``"schema"."table"`` rather than a
-    single quoted ``"schema.table"`` identifier (which would not exist).
-    """
-    schema, separator, obj = name.partition(".")
-    if separator and schema and obj:
-        return sql.Identifier(schema, obj)
-    return sql.Identifier(name)
 
 
 def _param_safe(statement: "sql.Composable") -> "sql.Composable":
