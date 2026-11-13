@@ -122,10 +122,10 @@ from dsql_migrator.ui.data_migration._full_load_ui import _quarantine_detail_row
 from dsql_migrator.ui.design import (
     EXPANSION_PANEL_CLASSES,
     FIT_TABLE_CLASS,
-    NOTICE_STYLE,
     definition_row,
     fit_table_css,
     inline_hint,
+    notice_panel,
     render_notice,
     section_header,
 )
@@ -1074,15 +1074,9 @@ def _render_cdc_catalog_drift_notice(
             baseline_known=baseline is not None,
             fix_tables=fix_tables,
         )
-        bg, border, icon_color, _icon = NOTICE_STYLE["error"]
-        with ui.column().classes(  # type: ignore[attr-defined]
-            f"w-full gap-1 rounded-md border {border} {bg} p-2"
+        with notice_panel(
+            ui, tone="error", header=notice.header, icon="schema"  # type: ignore[union-attr]
         ):
-            with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-                ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
-                ui.label(notice.header).classes(  # type: ignore[attr-defined,union-attr]
-                    "text-sm font-semibold text-gray-900"
-                )
             ui.label(notice.intro).classes("text-xs text-gray-800")  # type: ignore[attr-defined,union-attr]
             for table, text in notice.rows:  # type: ignore[union-attr]
                 with ui.row().classes("w-full items-center gap-2"):  # type: ignore[attr-defined]
@@ -3749,14 +3743,9 @@ def _render_cdc_schema_drift_banner(
         )
     else:
         _header = "Source schema change detected"
-    bg, border, icon_color, _icon = NOTICE_STYLE.get(_tone, NOTICE_STYLE["info"])
-    with ui.column().classes(  # type: ignore[attr-defined]
-        f"w-full gap-1 rounded-md border {border} {bg} p-2"
-    ):
-        with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-            ui.icon("schema").classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
-            ui.label(_header).classes("text-sm font-semibold text-gray-900")  # type: ignore[attr-defined]
-            if cdc_ai_opener is not None:
+    with notice_panel(ui, tone=_tone, header=_header, icon="schema") as (header_row, _panel):
+        if cdc_ai_opener is not None:
+            with header_row:
                 ui.space()  # type: ignore[attr-defined]
                 # A banner that claims no schema change gets a chat that does not either (the
                 # seed becomes the operator's first message): the seed, the tooltip and the
@@ -4143,16 +4132,11 @@ def _render_cdc_dlq_panel(
     _activity = getattr(migration_state, "cdc_activity", None)
     _stalled = bool(getattr(_activity, "sink_stall_confirmed", False))
     tone = _dlq_panel_tone(health, sink_stalled=_stalled)
-    bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
-    with ui.column().classes(  # type: ignore[attr-defined]
-        f"w-full gap-2 rounded-md border {border} {bg} p-3"
-    ):
+    with notice_panel(
+        ui, tone=tone, header="Dead-letter queue (poison records)"
+    ) as (header_row, _panel):
         # Header band: icon + title + depth badge (left), refresh (right).
-        with ui.row().classes("w-full items-center gap-2 no-wrap"):  # type: ignore[attr-defined]
-            ui.icon(default_icon).classes(f"{icon_color} text-lg")  # type: ignore[attr-defined]
-            ui.label("Dead-letter queue (poison records)").classes(  # type: ignore[attr-defined]
-                "text-sm font-semibold text-gray-900"
-            )
+        with header_row:
             _badge_color = (
                 "negative"
                 if tone == "error"

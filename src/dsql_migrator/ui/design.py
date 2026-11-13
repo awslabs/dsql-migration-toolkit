@@ -113,6 +113,31 @@ def notice_container(ui, *, tone: str, header: str, body: str = "", icon: str = 
             yield body_column
 
 
+@contextmanager
+def notice_panel(ui, *, tone: str, header: str, icon: str = ""):
+    """A notice whose header is a ROW that can carry controls, over full-width content.
+
+    The Cloudscape "Alert" treatment (tinted box, tone border, status glyph, bold header)
+    for a monitoring panel: the glyph and the header open a header row the caller can add
+    to (a count badge, or ``ui.space()`` then a refresh or AI button), and the content
+    stacks full-width below it. :func:`notice_container` cannot carry those controls: its
+    header is a single label beside the glyph, with the content indented under it.
+
+    Yields ``(header_row, body)``. Re-enter ``header_row`` (``with header_row:``) to append
+    to the header; anything created directly in the ``with`` block lands in ``body``,
+    below it. The box has the notice box's tint, border and padding
+    (:func:`notice_box_classes`).
+    """
+    bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
+    body = ui.column().classes(f"w-full gap-2 rounded-md border {border} {bg} p-3")
+    with body:
+        header_row = ui.row().classes("w-full items-center gap-2 no-wrap")
+        with header_row:
+            ui.icon(icon or default_icon).classes(f"{icon_color} text-lg")
+            ui.label(header).classes("text-sm font-semibold text-gray-900")
+        yield header_row, body
+
+
 def render_notice(
     ui,
     *,

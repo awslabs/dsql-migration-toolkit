@@ -362,6 +362,127 @@ def test_notice_container_icon_override_and_unknown_tone_fallback() -> None:
     assert notice_box_classes("bogus") == notice_box_classes("info")
 
 
+class _Node:
+    """An element of :class:`_TreeUi`: its kind, text, classes and children."""
+
+    def __init__(self, ui, kind, text=""):
+        self._ui = ui
+        self.kind = kind
+        self.text = text
+        self.class_list: list[str] = []
+        self.children: list["_Node"] = []
+
+    def classes(self, value="", *_a, **_k):
+        if value:
+            self.class_list.append(value)
+        return self
+
+    def props(self, *_a, **_k):
+        return self
+
+    def __enter__(self):
+        self._ui.stack.append(self)
+        return self
+
+    def __exit__(self, *exc):
+        self._ui.stack.pop()
+        return False
+
+
+class _TreeUi:
+    """A NiceGUI stand-in that records which element each one was created in."""
+
+    def __init__(self):
+        self.root = _Node(self, "root")
+        self.stack = [self.root]
+
+    def _make(self, kind, text=""):
+        node = _Node(self, kind, str(text))
+        self.stack[-1].children.append(node)
+        return node
+
+    def column(self, *_a, **_k):
+        return self._make("column")
+
+    def row(self, *_a, **_k):
+        return self._make("row")
+
+    def icon(self, name="", *_a, **_k):
+        return self._make("icon", name)
+
+    def label(self, text="", *_a, **_k):
+        return self._make("label", text)
+
+    def badge(self, text="", *_a, **_k):
+        return self._make("badge", text)
+
+    def space(self, *_a, **_k):
+        return self._make("space")
+
+
+def test_notice_panel_puts_header_controls_in_the_header_row_and_content_below() -> None:
+    """cdcui-7: a monitoring panel's header carries controls (a count badge, a refresh)
+    and its content runs full-width below -- what notice_container cannot lay out."""
+    from dsql_migrator.ui.design import notice_box_classes, notice_panel
+
+    ui = _TreeUi()
+    with notice_panel(ui, tone="warning", header="Dead letters") as (header_row, body):
+        with header_row:
+            ui.badge("3 quarantined")
+            ui.space()
+        ui.label("Health message")
+    (panel,) = ui.root.children
+    assert panel is body and panel.kind == "column"
+    bg, border, icon_color, icon = NOTICE_STYLE["warning"]
+    assert panel.class_list == [f"w-full gap-2 rounded-md border {border} {bg} p-3"]
+    header, message = panel.children
+    assert header is header_row and header.kind == "row"
+    assert [(c.kind, c.text) for c in header.children] == [
+        ("icon", icon), ("label", "Dead letters"), ("badge", "3 quarantined"), ("space", ""),
+    ]
+    assert f"{icon_color} text-lg" in header.children[0].class_list
+    assert "text-sm font-semibold text-gray-900" in header.children[1].class_list
+    assert (message.kind, message.text) == ("label", "Health message")
+    # The panel has the notice box's tint, border and padding.
+    assert bg in notice_box_classes("warning") and "p-3" in notice_box_classes("warning")
+
+
+def test_notice_panel_icon_override_and_unknown_tone_fallback() -> None:
+    from dsql_migrator.ui.design import notice_panel
+
+    ui = _TreeUi()
+    with notice_panel(ui, tone="error", header="h", icon="schema"):
+        pass
+    (panel,) = ui.root.children
+    assert panel.children[0].children[0].text == "schema"
+    assert NOTICE_STYLE["error"][2] + " text-lg" in panel.children[0].children[0].class_list
+
+    other = _TreeUi()
+    with notice_panel(other, tone="bogus", header="h"):
+        pass
+    (panel,) = other.root.children
+    bg, border, _icon_color, icon = NOTICE_STYLE["info"]
+    assert panel.class_list == [f"w-full gap-2 rounded-md border {border} {bg} p-3"]
+    assert panel.children[0].children[0].text == icon
+
+
+def test_the_cdc_monitoring_panels_are_notice_panels() -> None:
+    """The catalog-drift notice, the schema-drift banner and the dead-letter panel no
+    longer assemble their box from NOTICE_STYLE by hand."""
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _cdc_monitoring as cm
+
+    for render in (
+        cm._render_cdc_catalog_drift_notice,
+        cm._render_cdc_schema_drift_banner,
+        cm._render_cdc_dlq_panel,
+    ):
+        source = inspect.getsource(render)
+        assert "with notice_panel(" in source, render.__name__
+        assert "NOTICE_STYLE" not in source and "rounded-md border" not in source
+
+
 def test_render_notice_icon_override() -> None:
     ui = _RecordingUi()
     render_notice(ui, tone="info", header="Cost", body="x", icon="payments")
