@@ -536,11 +536,7 @@ def build_connect_page(
         # on a FAILURE with AI set up, offer a ONE-CLICK "Ask AI to help fix this"
         # affordance that actually invokes the model (paid reasoning stays explicit).
         if side == "source":
-            _word = (
-                "PostgreSQL"
-                if _engine["type"] is SourceType.POSTGRES
-                else "MySQL"
-            )
+            _word = dialect_for(_engine["type"]).engine_display_name
             label = f"Source ({_word})"
         else:
             label = "Target (Aurora DSQL)"
@@ -1162,7 +1158,7 @@ def build_connect_page(
                     side="source",
                     success=result.success,
                     coordinates=(
-                        f"{'PostgreSQL' if config.source_type is SourceType.POSTGRES else 'MySQL'} "
+                        f"{dialect_for(config.source_type).engine_display_name} "
                         f"host={config.host} port={config.port} "
                         f"database={config.database or '(not set)'}"
                     ),

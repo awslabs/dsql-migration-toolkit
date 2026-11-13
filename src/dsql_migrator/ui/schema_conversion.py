@@ -707,16 +707,16 @@ def _render_source_default(column: ColumnDef) -> str:
 
 
 def _quote_pg_ident(name: str) -> str:
-    """Double-quote a PostgreSQL identifier for the display-only source renderer."""
-    return '"' + name.replace('"', '""') + '"'
+    """Double-quote a PostgreSQL identifier for the display-only source renderer (doubling
+    any double quote): the PostgreSQL source dialect's ``quote_identifier``."""
+    return dialect_for(SourceType.POSTGRES).quote_identifier(name)
 
 
 def _quote_pg_table(name: str) -> str:
-    """Quote a (possibly ``schema.table``) PostgreSQL name for display."""
-    schema, sep, obj = name.partition(".")
-    if sep and schema and obj:
-        return f"{_quote_pg_ident(schema)}.{_quote_pg_ident(obj)}"
-    return _quote_pg_ident(name)
+    """Quote a (possibly ``schema.table``) PostgreSQL name per part for display -- split at
+    the first '.' when both parts are non-empty: the PostgreSQL source dialect's
+    ``quote_table``."""
+    return dialect_for(SourceType.POSTGRES).quote_table(name)
 
 
 def _pg_source_foreign_key_options(foreign_key: ForeignKeyDef) -> str:
