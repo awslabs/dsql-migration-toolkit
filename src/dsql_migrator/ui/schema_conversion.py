@@ -2123,7 +2123,9 @@ def build_schema_conversion_screen(
                 "min-width: 360px"
             ):
                 ui.label("Confirm REPLACE").classes("text-lg font-semibold")
-                ui.label(detail).classes("text-sm text-red-700")
+                # The irreversible impact, as a notice rather than loose red text; the
+                # confirm button below stays color=negative.
+                render_notice(ui, tone="warning", header="This cannot be undone", body=detail)
                 with ui.row().classes("justify-end gap-2 w-full"):
                     ui.button("Cancel", on_click=dialog.close).props("flat")
 

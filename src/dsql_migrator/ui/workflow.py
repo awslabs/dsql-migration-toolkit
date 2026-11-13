@@ -1720,7 +1720,7 @@ def build_workflow_sidebar(
                 with ui.item(on_click=lambda: select(_CONNECT_VIEW)).props(
                     "clickable"
                 ).classes(
-                    "rounded-borders " + ("bg-blue-1" if connect_active else "")
+                    "rounded-borders " + ("bg-blue-50" if connect_active else "")
                 ):
                     # The icon carries the CONNECTION state, not just whether Connect
                     # is the selected view: green = both verified, amber broken-link =
@@ -1773,7 +1773,7 @@ def build_workflow_sidebar(
                     status = get_status(workflow, step)
                     active = selected["view"] == step
                     item_classes = "rounded-borders " + (
-                        "bg-blue-1" if active else ""
+                        "bg-blue-50" if active else ""
                     )
                     if indent:
                         item_classes += " pl-6"
@@ -1859,7 +1859,7 @@ def build_workflow_sidebar(
                     for tool in tools.values():
                         tool_active = selected["view"] == tool.view_key
                         item_classes = "rounded-borders " + (
-                            "bg-blue-1" if tool_active else ""
+                            "bg-blue-50" if tool_active else ""
                         )
                         if locked:
                             item_classes += " opacity-50"

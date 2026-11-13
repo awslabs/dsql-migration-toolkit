@@ -1521,3 +1521,36 @@ def test_the_per_table_migration_status_table_opts_into_fitting_its_card() -> No
     ui = _render_cdc_per_table_for_design()
     assert FIT_TABLE_CSS in ui.css  # the stylesheet reached the page
     assert any(FIT_TABLE_CLASS in c for c in ui.classes_applied)  # ...and the table opted in
+
+
+def test_the_sidebar_highlights_the_active_view_with_the_tailwind_shade() -> None:
+    """AS-12: the Quasar numeric shade bg-blue-1 is out of the sidebar's three active-item
+    highlights (Connect, the steps, the tools); bg-blue-50 is what every other active
+    surface uses."""
+    import inspect
+
+    from dsql_migrator.ui import workflow
+
+    source = inspect.getsource(workflow)
+    assert "bg-blue-1" not in source
+    assert source.count('"bg-blue-50" if connect_active else ""') == 1
+    assert source.count('"bg-blue-50" if active else ""') == 1
+    assert source.count('"bg-blue-50" if tool_active else ""') == 1
+
+
+def test_the_replace_confirmation_states_its_impact_in_a_notice() -> None:
+    """AS-12: the irreversible-impact text of the REPLACE dialog is a warning notice's
+    body, not loose red text; the confirm button stays color=negative."""
+    import inspect
+
+    from dsql_migrator.ui import schema_conversion as sc
+
+    source = inspect.getsource(sc.build_schema_conversion_screen)
+    dialog = source[source.index("def _open_replace_dialog("):source.index("def _open_conflict_dialog(")]
+    assert (
+        'render_notice(ui, tone="warning", header="This cannot be undone", body=detail)'
+        in dialog
+    )
+    assert "text-red-700" not in dialog
+    assert 'ui.button("Confirm REPLACE", on_click=_confirm).props(\n' in dialog
+    assert '"color=negative"' in dialog
