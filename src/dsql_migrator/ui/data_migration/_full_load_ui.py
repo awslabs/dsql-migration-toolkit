@@ -648,6 +648,522 @@ def _render_overlay_blocks(
     on_refreshable(lambda mode: refreshable.refresh(mode))
 
 
+# ---------------------------------------------------------------------------
+# The Full-Load confirm dialog (FL-8)
+# ---------------------------------------------------------------------------
+#
+# Module level, not a closure of _render_full_load_step: it reads nothing of the render
+# pass but what it is given -- the eight values that used to be closed over are its last
+# five keyword arguments plus ui / migration_state / job_manager -- and it is built in the
+# TOP-LEVEL client, so nothing of the per-render content slot may leak into it anyway.
+
+
+def _open_confirm_dialog_now(
+    ui,
+    migration_state,
+    job_manager,
+    *, action_tables, on_confirm, title, keeps_watermark, table_reasons=None,
+    preselect=True, checklist_hint=None, overlay=None, on_retry=None,
+    addition_forced=None, cdc_additions=frozenset(), index_only=frozenset(),
+    engine, pg_publication, schema_recreate_candidates,
+    refuse_new_start_point, refuse_cdc_live,
+) -> None:
+    """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
+
+    Shared by Start, Re-run-all, Retry-failed and per-table Reload:
+    ``action_tables`` is the set being (re)loaded (drives the summary/badges),
+    ``on_confirm`` is the action to run when confirmed, and ``title`` is the
+    dialog heading. Built in the client context (not the per-render content
+    slot) and opened on demand, so the periodic progress-poll re-render does
+    NOT tear it down a couple of seconds after it appears. The Drop-vs-Append
+    choice (when the target already holds data) applies to whichever action
+    this dialog wraps, so a retry/Reload honors the SAME choice as Start.
+
+    When ``table_reasons`` (a ``{table: failure_reason}`` map) is given -- the
+    Retry-failed case -- the dialog renders ``action_tables`` as a **checklist**
+    (all pre-checked) with each table's failure reason, so the user can uncheck
+    tables they aren't ready to retry (e.g. a not-yet-fixed source value) and
+    retry only the rest. ``on_confirm`` is then called with the checked subset;
+    otherwise it is called with no arguments.
+
+    ``preselect=False`` starts the checklist EMPTY (confirm disabled until
+    something is ticked) -- the "reload just these tables" case, where the action
+    set is every loaded table and pre-checking all of them would offer a
+    full re-load behind a button that says the opposite. ``checklist_hint``
+    replaces the retry-specific instruction line for that case.
+
+    ``addition_forced`` (G17: ``{table: reason}``) names the Full load + CDC tables
+    selected after the Full Load that the probe found holding rows: they are dropped and
+    reloaded whatever the Append / Drop choice says (the rows may predate the changes
+    CDC captures for the table, and an append keeps them), exactly like the overlay's
+    forced tables -- and (G137) the tables the Full Load read in parts, with rows or
+    empty, while their copy waits for CDC's replay, that a re-run of every table reloads
+    (``keeps_watermark`` False) or a Retry or Reload with one reader.
+
+    ``keeps_watermark`` (G25) is the action kind the summary's source-write sentence
+    follows: False for Start / Re-run all tables (a new snapshot, which on PostgreSQL
+    Full load + CDC provisions the publication and replaces the slot), True for a Retry
+    or Reload (the original watermark: the source is only read, except that each ticked
+    ``cdc_additions`` table joins CDC's publication when the watermark has the load's
+    slot, its guard setting the publication's publish_via_partition_root to true first
+    if it is false). In a CDC migration type it also words the Append / Drop & reload
+    choice (G27): a new start point does not call Append recommended and names Drop &
+    reload (:data:`_APPEND_NEW_CDC_START_POINT`); Append stays the default either way.
+
+    ``index_only`` (P4a, Retry unfinished tables) names checklist tables whose data is
+    loaded and that only get their secondary indexes: listed and tickable, but never
+    offered a reload choice, a recreate or an overlay, and the summary says no row is
+    read or written for them.
+
+    The last five arguments come from the render pass this dialog was lifted out of
+    (FL-8), which resolves them before the click: ``engine`` is the source engine the
+    summary is worded for, ``pg_publication`` whether the watermark holds the load's
+    PostgreSQL slot (so a ticked ``cdc_additions`` table joins CDC's publication),
+    ``schema_recreate_candidates`` the callable above, and ``refuse_new_start_point`` /
+    ``refuse_cdc_live`` the two click-time refusals the confirm asks again (the CDC state
+    can change while the dialog is open).
+    """
+    from nicegui import context as _ctx
+
+    client = _ctx.client
+    tables_with_data_now = sorted(migration_state.tables_with_data)
+    # Why CDC holds this run (G129; G132: a CDC operation in progress is a wait), or None.
+    cdc_hold_now = cdc_load_hold(
+        migration_state, job_manager, keeps_watermark=keeps_watermark
+    )
+    cdc_live_now = cdc_hold_now is not None
+    # Empty targets whose primary key the load will RECREATE from the applied DDL.
+    # A changed key is a schema change, so appending cannot deliver it; recreating an
+    # empty table destroys nothing, which is why the load does it without asking --
+    # but it must still be disclosed here, because a target DDL the user edited by
+    # hand after Schema Conversion is replaced. Never includes a populated table:
+    # those go through the explicit Drop & reload choice below. Resolved by the
+    # caller (which owns the inventory + applied conversions) and narrowed to the
+    # tables THIS dialog is about; a live sink forbids recreating anything.
+    #
+    # ``schema_recreate_candidates`` MUST be a callable, resolved here -- after the
+    # pre-dialog probe has read the targets' real primary keys -- because a target
+    # that already carries the applied key needs no recreate, and announcing one
+    # contradicts what the user just did in Schema Conversion. Evaluating it at
+    # render time (as a plain list) can only compare the applied DDL against the
+    # SOURCE key, which is exactly what produced the false disclosure.
+    #
+    # Rejected rather than tolerated: accepting a list too would let a caller
+    # silently regress to render-time evaluation, and the dialog would still look
+    # correct while disclosing a recreate that does not happen.
+    if not callable(schema_recreate_candidates):
+        raise TypeError(
+            "schema_recreate_candidates must be a callable resolved after the "
+            "target probe, not a pre-computed list -- a list can only have been "
+            "built before any target primary key was read."
+        )
+    _candidates = schema_recreate_candidates() or ()
+    # The tables this action reads and writes rows of: an index-only one (P4a) neither.
+    _index_only = frozenset(index_only or ())
+    load_tables = [n for n in action_tables if n not in _index_only]
+    recreate_now = (
+        [] if cdc_live_now else [n for n in _candidates if n in set(load_tables)]
+    )
+    # The column-exclusion overlay (None -> the previous dialog, unchanged).
+    _ov = overlay or {}
+    _outcome = _ov.get("outcome")
+    forced = dict(getattr(_outcome, "forced", {}) or {}) if not cdc_live_now else {}
+    _addition_forced = dict(addition_forced or {}) if not cdc_live_now else {}
+    forced.update(_addition_forced)
+    ledger_error = bool(_ov.get("ledger_error"))
+    # The populated tables the operator still CHOOSES for (the forced ones are not a
+    # choice: the NULL contract needs them dropped and reloaded).
+    radio_tables = [n for n in tables_with_data_now if n not in forced]
+    # Selected tables that are genuinely MISSING on the target AND that this run
+    # will NOT create -> an append would fail each (relation does not exist), and if
+    # the user then starts CDC that table is a standing gap CDC never backfills. A
+    # missing table IS created when: 'drop' mode (the pre-pass DROP IF EXISTS +
+    # CREATE recreates every replace table) or it is a recreate candidate (empty /
+    # key-diff, recreated from the applied DDL even in append). Neither runs while
+    # CDC is live. ``target_tables_present`` is None when the probe could not read
+    # the target -> stay conservative and do NOT warn (avoid a false "all missing").
+    _present = migration_state.target_tables_present
+    if _present is None:
+        missing_uncreated: list[str] = []
+    else:
+        _will_create = (
+            set(load_tables)
+            if (migration_state.reload_mode == "drop" and not cdc_live_now)
+            else set(recreate_now)
+        ) | set(forced)
+        missing_uncreated = [
+            n for n in load_tables
+            if n not in _present and n not in _will_create
+        ]
+    selectable = table_reasons is not None
+    # Live set of checked tables (mutated by the per-row checkboxes). Retry starts
+    # with the full action set (all pre-checked) -- the common "retry everything".
+    # A scoped reload starts EMPTY: its action set is every loaded table, so
+    # pre-checking would arm a full re-load from a button that says "specific".
+    checked: set = set(action_tables) if preselect else set()
+    # The overlay's changes section re-renders when the reload choice flips.
+    _changes: dict = {}
+
+    # Set BEFORE close() on confirm, so the close handler below can tell a confirm
+    # (the run consumes the forced set) from Cancel / Esc / a backdrop click / Retry
+    # (the forced set is dropped: it is re-derived at every probe).
+    confirmed = {"v": False}
+
+    def _build() -> None:
+        # Wider than Quasar's 560px default: the overlay statements and the per-table
+        # choices read on one line each.
+        with ui.dialog() as confirm_dialog, ui.card().style(
+            "width: min(820px, 94vw); max-width: 94vw"
+        ):
+            def _on_close(e: object) -> None:
+                if not bool(getattr(e, "value", True)) and not confirmed["v"]:
+                    migration_state.clear_exclusion_forced_replace()
+
+            confirm_dialog.on_value_change(_on_close)
+            ui.label(title).classes("text-lg font-semibold")
+            _migration_type = getattr(migration_state, "migration_type", None)
+
+            def _ticked(names) -> list:
+                return [n for n in names if n in checked] if selectable else list(names)
+
+            def _summary() -> str:
+                # A G17 addition joins the publication only when the watermark has the
+                # load's slot (pg_publication); without one Start CDC re-snapshots it.
+                ticked = _ticked(action_tables)
+                loads = [n for n in ticked if n not in _index_only]
+                only = len(ticked) - len(loads)
+                text = (
+                    full_load_confirm_summary(
+                        loads, engine, _migration_type,
+                        keeps_watermark=keeps_watermark, cdc_live=cdc_live_now,
+                        publication_additions=cdc_additions if pg_publication else (),
+                    )
+                    if loads or not only
+                    else ""
+                )
+                if only:
+                    # P4a: their data is loaded; only their secondary indexes are owed.
+                    text = (
+                        f"{text} {only} loaded "
+                        f"{'table only gets its' if only == 1 else 'tables only get their'}"
+                        " secondary indexes: no row is read or written for "
+                        f"{'it' if only == 1 else 'them'}."
+                    ).strip()
+                return text
+
+            summary_label = ui.label(_summary()).classes("text-sm")
+            # Missing target tables an append can't create -> warn BEFORE the load
+            # (rather than letting it fail per table, then risk a standing CDC gap).
+            if missing_uncreated:
+                _m_noun = "table" if len(missing_uncreated) == 1 else "tables"
+                render_notice(
+                    ui,
+                    tone="warning",
+                    header=(
+                        f"{len(missing_uncreated)} selected {_m_noun} do not exist "
+                        "on the target"
+                    ),
+                    body=(
+                        f"{format_selected_workloads(missing_uncreated)} — not "
+                        "found on Aurora DSQL (deleted, or Schema Conversion not "
+                        "applied). Appending cannot create a table, so the load "
+                        "would fail for "
+                        + ("it" if len(missing_uncreated) == 1 else "each")
+                        + " — and if you then start CDC, "
+                        + ("that table" if len(missing_uncreated) == 1
+                           else "those tables")
+                        + " would be a standing gap CDC will not backfill. Apply "
+                        "Schema Conversion for "
+                        + ("it" if len(missing_uncreated) == 1 else "them")
+                        + " first"
+                        + (", or choose 'Drop & reload' below to (re)create "
+                           + ("it" if len(missing_uncreated) == 1 else "them")
+                           + " from your applied conversion."
+                           if radio_tables and not cdc_live_now
+                           else " (on the Schema Conversion step), then retry.")
+                    ),
+                )
+            if cdc_hold_now is not None and cdc_hold_now[1] is not None:
+                # G132: a Start CDC, Stop CDC or Delete CDC infrastructure in progress is
+                # an expected wait (it ends by itself), not "CDC is streaming".
+                render_notice(
+                    ui, tone="info", header=_CDC_OP_WAIT_HEADER, body=cdc_hold_now[0]
+                )
+            elif cdc_live_now:
+                render_notice(
+                    ui,
+                    tone="error",
+                    header="CDC is currently streaming",
+                    body=f"{_CDC_LIVE_COLLISION} " + (
+                        _CDC_LIVE_KEEPS_START_POINT if keeps_watermark
+                        else _CDC_LIVE_NEW_START_POINT
+                    ),
+                )
+            from dsql_migrator.ui.data_migration._models import (
+                start_dialog_exclusion_notes,
+            )
+
+            for _tone, _note in start_dialog_exclusion_notes(migration_state):
+                inline_hint(ui, _note, tone=_tone)
+            # Without an overlay too when a G17 addition (or a G137 table read in parts) is
+            # forced: the overlay blocks then draw only the forced-table notice -- the same
+            # one, re-rendered with the checklist ticks, so an unticked table is never
+            # announced as dropped.
+            if overlay is not None or _addition_forced:
+                _render_overlay_blocks(
+                    ui, _ov, action_tables=load_tables, forced=forced,
+                    recreate_now=recreate_now, radio_tables=radio_tables,
+                    cdc_live_now=cdc_live_now, dialog=confirm_dialog,
+                    on_retry=on_retry, reload_mode=migration_state.reload_mode,
+                    on_refreshable=lambda fn: _changes.update({"refresh": fn}),
+                    scope=(lambda: checked) if selectable else None,
+                )
+            # Retry-failed: a checklist (all pre-checked) with each table's
+            # failure reason, so the user can uncheck tables not ready to retry
+            # and retry only the rest. Other actions just show badges.
+            if selectable and action_tables:
+                ui.label(
+                    checklist_hint
+                    or "Uncheck any table you're not ready to retry yet (e.g. a "
+                    "source value you haven't fixed):"
+                ).classes("text-xs text-gray-500")
+                with ui.column().classes(
+                    "w-full gap-1 max-h-60 overflow-auto"
+                ):
+                    for name in action_tables:
+                        reason = (table_reasons or {}).get(name, "")
+
+                        def _toggle(e: object, n=name) -> None:
+                            if bool(getattr(e, "value", False)):
+                                checked.add(n)
+                            else:
+                                checked.discard(n)
+                            _sync_label()
+
+                        with ui.row().classes("items-start gap-2 no-wrap w-full"):
+                            ui.checkbox(
+                                value=bool(preselect), on_change=_toggle
+                            ).props("dense")
+                            with ui.column().classes("gap-0 min-w-0"):
+                                ui.label(name).classes(
+                                    "text-sm font-medium text-gray-900"
+                                )
+                                if reason:
+                                    ui.label(reason).classes(
+                                        "text-xs text-red-700 break-all"
+                                    )
+            elif action_tables:
+                with ui.row().classes("items-center gap-1 flex-wrap"):
+                    for name in action_tables:
+                        ui.badge(name).props("color=blue-grey-6 outline")
+            # Disclose the empty targets whose schema will be recreated to deliver
+            # the primary key chosen in Schema Conversion. No choice is offered --
+            # the table is empty, so there is nothing to lose and nothing to decide,
+            # and appending simply cannot apply a new key -- but doing it silently
+            # would hide that a hand-edited target DDL is about to be replaced.
+            if recreate_now:
+                listed = ", ".join(recreate_now[:6]) + (
+                    f" +{len(recreate_now) - 6} more"
+                    if len(recreate_now) > 6
+                    else ""
+                )
+                _noun = "table" if len(recreate_now) == 1 else "tables"
+                _verb = "uses" if len(recreate_now) == 1 else "use"
+                render_notice(
+                    ui,
+                    tone="info",
+                    header=(
+                        f"{len(recreate_now)} empty {_noun} will be recreated to "
+                        "apply the chosen primary key"
+                    ),
+                    body=(
+                        f"{listed} {_verb} a primary key that differs from the "
+                        "source (for example the composite key chosen to avoid hot "
+                        "partitions). A primary key cannot be applied by appending, "
+                        "so each of these tables is dropped and recreated from your "
+                        "applied Schema Conversion before loading. They hold no rows "
+                        "on the target, so no data is lost — but any manual change "
+                        "made to the target table outside Schema Conversion is "
+                        "replaced."
+                    ),
+                )
+            # When selected targets already hold data (and CDC is not live),
+            # let the user choose the run-wide behavior: append (keep existing
+            # rows, load only the missing ones -- the non-destructive default)
+            # or drop & reload (DROP+recreate each first, for a clean load).
+            if radio_tables and not cdc_live_now:
+                # G27 (rule E): a new start point in a CDC migration type is CDC's new
+                # watermark, so Append is not "recommended" there and a line names Drop &
+                # reload (_APPEND_NEW_CDC_START_POINT). The default stays Append.
+                _new_cdc_start_point = (
+                    _migration_type in _CDC_MIGRATION_TYPES and not keeps_watermark
+                )
+                with ui.card().classes(
+                    "w-full bg-amber-50 border border-amber-200 gap-2"
+                ):
+                    with_data_label = ui.label(
+                        with_data_choice_text(
+                            len(_ticked(radio_tables)), ticked_scope=selectable
+                        )
+                    ).classes("text-sm text-gray-800")
+                    # A tick-to-choose dialog names its tables in the checklist above;
+                    # badges of every loaded table here would contradict the ticks.
+                    if not selectable:
+                        with ui.row().classes("items-center gap-1 flex-wrap"):
+                            for name in radio_tables:
+                                ui.badge(name).props("color=amber-8 outline")
+                    reload_choice = ui.radio(
+                        {
+                            "append": "Append — keep existing rows, load only "
+                            "the missing ones (idempotent"
+                            + (")" if _new_cdc_start_point else "; recommended)"),
+                            "drop": "Drop & reload — DROP and recreate these "
+                            "tables first for a clean load (existing rows are "
+                            "permanently lost; DSQL has no TRUNCATE)",
+                        },
+                        value=migration_state.reload_mode,
+                        on_change=lambda e: migration_state.set_reload_mode(
+                            str(getattr(e, "value", "append"))
+                        ),
+                    ).props("dense").classes("text-sm")
+                    reload_choice.classes("w-full")
+                    if _new_cdc_start_point:
+                        inline_hint(ui, _APPEND_NEW_CDC_START_POINT, tone="warning")
+                    # Reassure the user that a Drop & reload recreates the target
+                    # from the APPLIED schema conversion -- including any edits
+                    # they made in Schema Conversion -- not a stale/original DDL, and
+                    # (P4d) with its secondary indexes before its rows.
+                    ui.label(
+                        "Drop & reload recreates each table from your applied "
+                        "Schema Conversion (including any edits you made there), "
+                        "with its secondary indexes, before any of its rows load."
+                    ).classes("text-xs text-gray-500")
+
+            def _confirm() -> None:
+                if selectable and not checked:
+                    return  # guard: nothing selected (button is also disabled)
+                if ledger_error:
+                    return  # guard: the record could not be read (button disabled)
+                if cdc_live_now:
+                    return  # guard: CDC is streaming (button disabled; G129)
+                if refuse_new_start_point(keeps_watermark) or refuse_cdc_live(
+                    keeps_watermark
+                ):
+                    # G25: the CDC state changed while the dialog was open (a probe read
+                    # a stack that has streamed; G129: or CDC started): closed as a
+                    # Cancel, nothing runs.
+                    confirm_dialog.close()
+                    return
+                confirmed["v"] = True
+                # Hand the forced set and the disclosed overlay to the run being built.
+                migration_state.confirm_exclusion_forced_replace()
+                confirm_dialog.close()
+                # Retry-failed passes the checked subset (in the original order);
+                # every other action calls on_confirm with no arguments.
+                if selectable:
+                    chosen = [n for n in action_tables if n in checked]
+                    on_confirm(chosen)
+                else:
+                    on_confirm()
+
+            with ui.row().classes("justify-end w-full gap-2"):
+                ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
+                def _label_and_color(mode: str) -> "tuple[str, str]":
+                    drop_chosen = mode == "drop"
+                    if cdc_live_now:
+                        # G129: nothing runs while CDC is live (disabled; the notice
+                        # above says why), so no label offers a way past it.
+                        return "Confirm and start", "primary"
+                    forced_now = set(forced) & checked if selectable else set(forced)
+                    if forced_now:
+                        # The NULL contract drops these whatever the radio says, so
+                        # the button counts every table this run will DROP.
+                        drop_set = forced_now | (set(radio_tables) if drop_chosen else set())
+                        if selectable:
+                            drop_set &= checked
+                        count = len(drop_set)
+                        return (
+                            f"Drop {count} table{'s' if count != 1 else ''}, "
+                            "recreate and load",
+                            "negative",
+                        )
+                    if radio_tables:
+                        # The button label + color follow the current choice so a
+                        # destructive drop reads as destructive.
+                        return (
+                            ("Drop, recreate and load", "negative") if drop_chosen
+                            else ("Append and load", "primary")
+                        )
+                    if recreate_now:
+                        # Name the DDL step in the button too, so the action is
+                        # visible without relying on the notice above being read.
+                        # Stays primary-coloured: these targets are empty.
+                        return "Recreate and load", "primary"
+                    return "Confirm and start", "primary"
+
+                confirm_label, confirm_color = _label_and_color(
+                    migration_state.reload_mode
+                )
+                start_btn = ui.button(confirm_label, on_click=_confirm).props(
+                    f"color={confirm_color}"
+                )
+
+                def _sync_label(e: object = None) -> None:
+                    # One place for the label, colour and enabled state: the radio
+                    # change and every checklist toggle call it.
+                    mode = (
+                        str(getattr(e, "value", "append"))
+                        if e is not None and hasattr(e, "value")
+                        else migration_state.reload_mode
+                    )
+                    text, color = _label_and_color(mode)
+                    start_btn.set_text(text)
+                    start_btn.props(f"color={color}")
+                    if selectable:
+                        # The summary and the with-data count follow the ticks.
+                        summary_label.set_text(_summary())
+                        if radio_tables and not cdc_live_now:
+                            with_data_label.set_text(
+                                with_data_choice_text(
+                                    len(_ticked(radio_tables)), ticked_scope=True
+                                )
+                            )
+                    # Disabled when the retry checklist has nothing ticked, the
+                    # record of excluded-column changes could not be read, or CDC is
+                    # streaming (G129).
+                    if (selectable and not checked) or ledger_error or cdc_live_now:
+                        start_btn.disable()
+                    else:
+                        start_btn.enable()
+                    # The overlay blocks follow the reload choice AND the ticks.
+                    if _changes.get("refresh") is not None:
+                        _changes["refresh"](mode)
+
+                _sync_label()
+                # Guard must MATCH the radio's creation condition above
+                # (`tables_with_data_now and not cdc_live_now`). With CDC live the
+                # radio is never created -- nothing runs while a sink streams (G129) --
+                # so the looser `if tables_with_data_now` raised UnboundLocalError and
+                # the whole confirm dialog failed to open. Still reachable from a stale
+                # per-table Reload or "Retry unfinished tables" (rendered before CDC
+                # started; both are disabled while it is live) when the probed table
+                # already holds target rows.
+                if radio_tables and not cdc_live_now:
+                    reload_choice.on_value_change(_sync_label)
+        # Open on the NEXT tick, not this one. The dialog element was just
+        # created; opening it in the same update batches "create element" and
+        # "value=True" into one client message, and Quasar's QDialog needs the
+        # element registered first and then a SEPARATE false->true transition to
+        # animate open -- so the first open is silently dropped and only a second
+        # click (element already registered) shows it. A one-shot timer defers
+        # the open to a fresh tick so the transition fires on the first click.
+        # (Same ui.timer(once=True) deferral pattern already used in this file.)
+        ui.timer(0.05, confirm_dialog.open, once=True)
+
+    with client:  # type: ignore[attr-defined]
+        _build()
+
+
 def _render_full_load_step(
     ui,
     migration_state,
@@ -825,498 +1341,6 @@ def _render_full_load_step(
             return False
         ui.notify(hold[0], type="warning", position="top", multi_line=True)
         return True
-
-    def _open_confirm_dialog_now(
-        *, action_tables, on_confirm, title, keeps_watermark, table_reasons=None,
-        preselect=True, checklist_hint=None, overlay=None, on_retry=None,
-        addition_forced=None, cdc_additions=frozenset(), index_only=frozenset(),
-    ) -> None:
-        """Build + open the Full-Load confirm dialog in the TOP-LEVEL client.
-
-        Shared by Start, Re-run-all, Retry-failed and per-table Reload:
-        ``action_tables`` is the set being (re)loaded (drives the summary/badges),
-        ``on_confirm`` is the action to run when confirmed, and ``title`` is the
-        dialog heading. Built in the client context (not the per-render content
-        slot) and opened on demand, so the periodic progress-poll re-render does
-        NOT tear it down a couple of seconds after it appears. The Drop-vs-Append
-        choice (when the target already holds data) applies to whichever action
-        this dialog wraps, so a retry/Reload honors the SAME choice as Start.
-
-        When ``table_reasons`` (a ``{table: failure_reason}`` map) is given -- the
-        Retry-failed case -- the dialog renders ``action_tables`` as a **checklist**
-        (all pre-checked) with each table's failure reason, so the user can uncheck
-        tables they aren't ready to retry (e.g. a not-yet-fixed source value) and
-        retry only the rest. ``on_confirm`` is then called with the checked subset;
-        otherwise it is called with no arguments.
-
-        ``preselect=False`` starts the checklist EMPTY (confirm disabled until
-        something is ticked) -- the "reload just these tables" case, where the action
-        set is every loaded table and pre-checking all of them would offer a
-        full re-load behind a button that says the opposite. ``checklist_hint``
-        replaces the retry-specific instruction line for that case.
-
-        ``addition_forced`` (G17: ``{table: reason}``) names the Full load + CDC tables
-        selected after the Full Load that the probe found holding rows: they are dropped and
-        reloaded whatever the Append / Drop choice says (the rows may predate the changes
-        CDC captures for the table, and an append keeps them), exactly like the overlay's
-        forced tables -- and (G137) the tables the Full Load read in parts, with rows or
-        empty, while their copy waits for CDC's replay, that a re-run of every table reloads
-        (``keeps_watermark`` False) or a Retry or Reload with one reader.
-
-        ``keeps_watermark`` (G25) is the action kind the summary's source-write sentence
-        follows: False for Start / Re-run all tables (a new snapshot, which on PostgreSQL
-        Full load + CDC provisions the publication and replaces the slot), True for a Retry
-        or Reload (the original watermark: the source is only read, except that each ticked
-        ``cdc_additions`` table joins CDC's publication when the watermark has the load's
-        slot, its guard setting the publication's publish_via_partition_root to true first
-        if it is false). In a CDC migration type it also words the Append / Drop & reload
-        choice (G27): a new start point does not call Append recommended and names Drop &
-        reload (:data:`_APPEND_NEW_CDC_START_POINT`); Append stays the default either way.
-
-        ``index_only`` (P4a, Retry unfinished tables) names checklist tables whose data is
-        loaded and that only get their secondary indexes: listed and tickable, but never
-        offered a reload choice, a recreate or an overlay, and the summary says no row is
-        read or written for them.
-        """
-        from nicegui import context as _ctx
-
-        client = _ctx.client
-        tables_with_data_now = sorted(migration_state.tables_with_data)
-        # Why CDC holds this run (G129; G132: a CDC operation in progress is a wait), or None.
-        cdc_hold_now = cdc_load_hold(
-            migration_state, job_manager, keeps_watermark=keeps_watermark
-        )
-        cdc_live_now = cdc_hold_now is not None
-        # Empty targets whose primary key the load will RECREATE from the applied DDL.
-        # A changed key is a schema change, so appending cannot deliver it; recreating an
-        # empty table destroys nothing, which is why the load does it without asking --
-        # but it must still be disclosed here, because a target DDL the user edited by
-        # hand after Schema Conversion is replaced. Never includes a populated table:
-        # those go through the explicit Drop & reload choice below. Resolved by the
-        # caller (which owns the inventory + applied conversions) and narrowed to the
-        # tables THIS dialog is about; a live sink forbids recreating anything.
-        #
-        # ``schema_recreate_candidates`` MUST be a callable, resolved here -- after the
-        # pre-dialog probe has read the targets' real primary keys -- because a target
-        # that already carries the applied key needs no recreate, and announcing one
-        # contradicts what the user just did in Schema Conversion. Evaluating it at
-        # render time (as a plain list) can only compare the applied DDL against the
-        # SOURCE key, which is exactly what produced the false disclosure.
-        #
-        # Rejected rather than tolerated: accepting a list too would let a caller
-        # silently regress to render-time evaluation, and the dialog would still look
-        # correct while disclosing a recreate that does not happen.
-        if not callable(schema_recreate_candidates):
-            raise TypeError(
-                "schema_recreate_candidates must be a callable resolved after the "
-                "target probe, not a pre-computed list -- a list can only have been "
-                "built before any target primary key was read."
-            )
-        _candidates = schema_recreate_candidates() or ()
-        # The tables this action reads and writes rows of: an index-only one (P4a) neither.
-        _index_only = frozenset(index_only or ())
-        load_tables = [n for n in action_tables if n not in _index_only]
-        recreate_now = (
-            [] if cdc_live_now else [n for n in _candidates if n in set(load_tables)]
-        )
-        # The column-exclusion overlay (None -> the previous dialog, unchanged).
-        _ov = overlay or {}
-        _outcome = _ov.get("outcome")
-        forced = dict(getattr(_outcome, "forced", {}) or {}) if not cdc_live_now else {}
-        _addition_forced = dict(addition_forced or {}) if not cdc_live_now else {}
-        forced.update(_addition_forced)
-        ledger_error = bool(_ov.get("ledger_error"))
-        # The populated tables the operator still CHOOSES for (the forced ones are not a
-        # choice: the NULL contract needs them dropped and reloaded).
-        radio_tables = [n for n in tables_with_data_now if n not in forced]
-        # Selected tables that are genuinely MISSING on the target AND that this run
-        # will NOT create -> an append would fail each (relation does not exist), and if
-        # the user then starts CDC that table is a standing gap CDC never backfills. A
-        # missing table IS created when: 'drop' mode (the pre-pass DROP IF EXISTS +
-        # CREATE recreates every replace table) or it is a recreate candidate (empty /
-        # key-diff, recreated from the applied DDL even in append). Neither runs while
-        # CDC is live. ``target_tables_present`` is None when the probe could not read
-        # the target -> stay conservative and do NOT warn (avoid a false "all missing").
-        _present = migration_state.target_tables_present
-        if _present is None:
-            missing_uncreated: list[str] = []
-        else:
-            _will_create = (
-                set(load_tables)
-                if (migration_state.reload_mode == "drop" and not cdc_live_now)
-                else set(recreate_now)
-            ) | set(forced)
-            missing_uncreated = [
-                n for n in load_tables
-                if n not in _present and n not in _will_create
-            ]
-        selectable = table_reasons is not None
-        # Live set of checked tables (mutated by the per-row checkboxes). Retry starts
-        # with the full action set (all pre-checked) -- the common "retry everything".
-        # A scoped reload starts EMPTY: its action set is every loaded table, so
-        # pre-checking would arm a full re-load from a button that says "specific".
-        checked: set = set(action_tables) if preselect else set()
-        # The overlay's changes section re-renders when the reload choice flips.
-        _changes: dict = {}
-
-        # Set BEFORE close() on confirm, so the close handler below can tell a confirm
-        # (the run consumes the forced set) from Cancel / Esc / a backdrop click / Retry
-        # (the forced set is dropped: it is re-derived at every probe).
-        confirmed = {"v": False}
-
-        def _build() -> None:
-            # Wider than Quasar's 560px default: the overlay statements and the per-table
-            # choices read on one line each.
-            with ui.dialog() as confirm_dialog, ui.card().style(
-                "width: min(820px, 94vw); max-width: 94vw"
-            ):
-                def _on_close(e: object) -> None:
-                    if not bool(getattr(e, "value", True)) and not confirmed["v"]:
-                        migration_state.clear_exclusion_forced_replace()
-
-                confirm_dialog.on_value_change(_on_close)
-                ui.label(title).classes("text-lg font-semibold")
-                _migration_type = getattr(migration_state, "migration_type", None)
-
-                def _ticked(names) -> list:
-                    return [n for n in names if n in checked] if selectable else list(names)
-
-                def _summary() -> str:
-                    # A G17 addition joins the publication only when the watermark has the
-                    # load's slot (_pg_publication); without one Start CDC re-snapshots it.
-                    ticked = _ticked(action_tables)
-                    loads = [n for n in ticked if n not in _index_only]
-                    only = len(ticked) - len(loads)
-                    text = (
-                        full_load_confirm_summary(
-                            loads, _engine, _migration_type,
-                            keeps_watermark=keeps_watermark, cdc_live=cdc_live_now,
-                            publication_additions=cdc_additions if _pg_publication else (),
-                        )
-                        if loads or not only
-                        else ""
-                    )
-                    if only:
-                        # P4a: their data is loaded; only their secondary indexes are owed.
-                        text = (
-                            f"{text} {only} loaded "
-                            f"{'table only gets its' if only == 1 else 'tables only get their'}"
-                            " secondary indexes: no row is read or written for "
-                            f"{'it' if only == 1 else 'them'}."
-                        ).strip()
-                    return text
-
-                summary_label = ui.label(_summary()).classes("text-sm")
-                # Missing target tables an append can't create -> warn BEFORE the load
-                # (rather than letting it fail per table, then risk a standing CDC gap).
-                if missing_uncreated:
-                    _m_noun = "table" if len(missing_uncreated) == 1 else "tables"
-                    render_notice(
-                        ui,
-                        tone="warning",
-                        header=(
-                            f"{len(missing_uncreated)} selected {_m_noun} do not exist "
-                            "on the target"
-                        ),
-                        body=(
-                            f"{format_selected_workloads(missing_uncreated)} — not "
-                            "found on Aurora DSQL (deleted, or Schema Conversion not "
-                            "applied). Appending cannot create a table, so the load "
-                            "would fail for "
-                            + ("it" if len(missing_uncreated) == 1 else "each")
-                            + " — and if you then start CDC, "
-                            + ("that table" if len(missing_uncreated) == 1
-                               else "those tables")
-                            + " would be a standing gap CDC will not backfill. Apply "
-                            "Schema Conversion for "
-                            + ("it" if len(missing_uncreated) == 1 else "them")
-                            + " first"
-                            + (", or choose 'Drop & reload' below to (re)create "
-                               + ("it" if len(missing_uncreated) == 1 else "them")
-                               + " from your applied conversion."
-                               if radio_tables and not cdc_live_now
-                               else " (on the Schema Conversion step), then retry.")
-                        ),
-                    )
-                if cdc_hold_now is not None and cdc_hold_now[1] is not None:
-                    # G132: a Start CDC, Stop CDC or Delete CDC infrastructure in progress is
-                    # an expected wait (it ends by itself), not "CDC is streaming".
-                    render_notice(
-                        ui, tone="info", header=_CDC_OP_WAIT_HEADER, body=cdc_hold_now[0]
-                    )
-                elif cdc_live_now:
-                    render_notice(
-                        ui,
-                        tone="error",
-                        header="CDC is currently streaming",
-                        body=f"{_CDC_LIVE_COLLISION} " + (
-                            _CDC_LIVE_KEEPS_START_POINT if keeps_watermark
-                            else _CDC_LIVE_NEW_START_POINT
-                        ),
-                    )
-                from dsql_migrator.ui.data_migration._models import (
-                    start_dialog_exclusion_notes,
-                )
-
-                for _tone, _note in start_dialog_exclusion_notes(migration_state):
-                    inline_hint(ui, _note, tone=_tone)
-                # Without an overlay too when a G17 addition (or a G137 table read in parts) is
-                # forced: the overlay blocks then draw only the forced-table notice -- the same
-                # one, re-rendered with the checklist ticks, so an unticked table is never
-                # announced as dropped.
-                if overlay is not None or _addition_forced:
-                    _render_overlay_blocks(
-                        ui, _ov, action_tables=load_tables, forced=forced,
-                        recreate_now=recreate_now, radio_tables=radio_tables,
-                        cdc_live_now=cdc_live_now, dialog=confirm_dialog,
-                        on_retry=on_retry, reload_mode=migration_state.reload_mode,
-                        on_refreshable=lambda fn: _changes.update({"refresh": fn}),
-                        scope=(lambda: checked) if selectable else None,
-                    )
-                # Retry-failed: a checklist (all pre-checked) with each table's
-                # failure reason, so the user can uncheck tables not ready to retry
-                # and retry only the rest. Other actions just show badges.
-                if selectable and action_tables:
-                    ui.label(
-                        checklist_hint
-                        or "Uncheck any table you're not ready to retry yet (e.g. a "
-                        "source value you haven't fixed):"
-                    ).classes("text-xs text-gray-500")
-                    with ui.column().classes(
-                        "w-full gap-1 max-h-60 overflow-auto"
-                    ):
-                        for name in action_tables:
-                            reason = (table_reasons or {}).get(name, "")
-
-                            def _toggle(e: object, n=name) -> None:
-                                if bool(getattr(e, "value", False)):
-                                    checked.add(n)
-                                else:
-                                    checked.discard(n)
-                                _sync_label()
-
-                            with ui.row().classes("items-start gap-2 no-wrap w-full"):
-                                ui.checkbox(
-                                    value=bool(preselect), on_change=_toggle
-                                ).props("dense")
-                                with ui.column().classes("gap-0 min-w-0"):
-                                    ui.label(name).classes(
-                                        "text-sm font-medium text-gray-900"
-                                    )
-                                    if reason:
-                                        ui.label(reason).classes(
-                                            "text-xs text-red-700 break-all"
-                                        )
-                elif action_tables:
-                    with ui.row().classes("items-center gap-1 flex-wrap"):
-                        for name in action_tables:
-                            ui.badge(name).props("color=blue-grey-6 outline")
-                # Disclose the empty targets whose schema will be recreated to deliver
-                # the primary key chosen in Schema Conversion. No choice is offered --
-                # the table is empty, so there is nothing to lose and nothing to decide,
-                # and appending simply cannot apply a new key -- but doing it silently
-                # would hide that a hand-edited target DDL is about to be replaced.
-                if recreate_now:
-                    listed = ", ".join(recreate_now[:6]) + (
-                        f" +{len(recreate_now) - 6} more"
-                        if len(recreate_now) > 6
-                        else ""
-                    )
-                    _noun = "table" if len(recreate_now) == 1 else "tables"
-                    _verb = "uses" if len(recreate_now) == 1 else "use"
-                    render_notice(
-                        ui,
-                        tone="info",
-                        header=(
-                            f"{len(recreate_now)} empty {_noun} will be recreated to "
-                            "apply the chosen primary key"
-                        ),
-                        body=(
-                            f"{listed} {_verb} a primary key that differs from the "
-                            "source (for example the composite key chosen to avoid hot "
-                            "partitions). A primary key cannot be applied by appending, "
-                            "so each of these tables is dropped and recreated from your "
-                            "applied Schema Conversion before loading. They hold no rows "
-                            "on the target, so no data is lost — but any manual change "
-                            "made to the target table outside Schema Conversion is "
-                            "replaced."
-                        ),
-                    )
-                # When selected targets already hold data (and CDC is not live),
-                # let the user choose the run-wide behavior: append (keep existing
-                # rows, load only the missing ones -- the non-destructive default)
-                # or drop & reload (DROP+recreate each first, for a clean load).
-                if radio_tables and not cdc_live_now:
-                    # G27 (rule E): a new start point in a CDC migration type is CDC's new
-                    # watermark, so Append is not "recommended" there and a line names Drop &
-                    # reload (_APPEND_NEW_CDC_START_POINT). The default stays Append.
-                    _new_cdc_start_point = (
-                        _migration_type in _CDC_MIGRATION_TYPES and not keeps_watermark
-                    )
-                    with ui.card().classes(
-                        "w-full bg-amber-50 border border-amber-200 gap-2"
-                    ):
-                        with_data_label = ui.label(
-                            with_data_choice_text(
-                                len(_ticked(radio_tables)), ticked_scope=selectable
-                            )
-                        ).classes("text-sm text-gray-800")
-                        # A tick-to-choose dialog names its tables in the checklist above;
-                        # badges of every loaded table here would contradict the ticks.
-                        if not selectable:
-                            with ui.row().classes("items-center gap-1 flex-wrap"):
-                                for name in radio_tables:
-                                    ui.badge(name).props("color=amber-8 outline")
-                        reload_choice = ui.radio(
-                            {
-                                "append": "Append — keep existing rows, load only "
-                                "the missing ones (idempotent"
-                                + (")" if _new_cdc_start_point else "; recommended)"),
-                                "drop": "Drop & reload — DROP and recreate these "
-                                "tables first for a clean load (existing rows are "
-                                "permanently lost; DSQL has no TRUNCATE)",
-                            },
-                            value=migration_state.reload_mode,
-                            on_change=lambda e: migration_state.set_reload_mode(
-                                str(getattr(e, "value", "append"))
-                            ),
-                        ).props("dense").classes("text-sm")
-                        reload_choice.classes("w-full")
-                        if _new_cdc_start_point:
-                            inline_hint(ui, _APPEND_NEW_CDC_START_POINT, tone="warning")
-                        # Reassure the user that a Drop & reload recreates the target
-                        # from the APPLIED schema conversion -- including any edits
-                        # they made in Schema Conversion -- not a stale/original DDL, and
-                        # (P4d) with its secondary indexes before its rows.
-                        ui.label(
-                            "Drop & reload recreates each table from your applied "
-                            "Schema Conversion (including any edits you made there), "
-                            "with its secondary indexes, before any of its rows load."
-                        ).classes("text-xs text-gray-500")
-
-                def _confirm() -> None:
-                    if selectable and not checked:
-                        return  # guard: nothing selected (button is also disabled)
-                    if ledger_error:
-                        return  # guard: the record could not be read (button disabled)
-                    if cdc_live_now:
-                        return  # guard: CDC is streaming (button disabled; G129)
-                    if _refuse_new_start_point(keeps_watermark) or _refuse_cdc_live(
-                        keeps_watermark
-                    ):
-                        # G25: the CDC state changed while the dialog was open (a probe read
-                        # a stack that has streamed; G129: or CDC started): closed as a
-                        # Cancel, nothing runs.
-                        confirm_dialog.close()
-                        return
-                    confirmed["v"] = True
-                    # Hand the forced set and the disclosed overlay to the run being built.
-                    migration_state.confirm_exclusion_forced_replace()
-                    confirm_dialog.close()
-                    # Retry-failed passes the checked subset (in the original order);
-                    # every other action calls on_confirm with no arguments.
-                    if selectable:
-                        chosen = [n for n in action_tables if n in checked]
-                        on_confirm(chosen)
-                    else:
-                        on_confirm()
-
-                with ui.row().classes("justify-end w-full gap-2"):
-                    ui.button("Cancel", on_click=confirm_dialog.close).props("flat")
-                    def _label_and_color(mode: str) -> "tuple[str, str]":
-                        drop_chosen = mode == "drop"
-                        if cdc_live_now:
-                            # G129: nothing runs while CDC is live (disabled; the notice
-                            # above says why), so no label offers a way past it.
-                            return "Confirm and start", "primary"
-                        forced_now = set(forced) & checked if selectable else set(forced)
-                        if forced_now:
-                            # The NULL contract drops these whatever the radio says, so
-                            # the button counts every table this run will DROP.
-                            drop_set = forced_now | (set(radio_tables) if drop_chosen else set())
-                            if selectable:
-                                drop_set &= checked
-                            count = len(drop_set)
-                            return (
-                                f"Drop {count} table{'s' if count != 1 else ''}, "
-                                "recreate and load",
-                                "negative",
-                            )
-                        if radio_tables:
-                            # The button label + color follow the current choice so a
-                            # destructive drop reads as destructive.
-                            return (
-                                ("Drop, recreate and load", "negative") if drop_chosen
-                                else ("Append and load", "primary")
-                            )
-                        if recreate_now:
-                            # Name the DDL step in the button too, so the action is
-                            # visible without relying on the notice above being read.
-                            # Stays primary-coloured: these targets are empty.
-                            return "Recreate and load", "primary"
-                        return "Confirm and start", "primary"
-
-                    confirm_label, confirm_color = _label_and_color(
-                        migration_state.reload_mode
-                    )
-                    start_btn = ui.button(confirm_label, on_click=_confirm).props(
-                        f"color={confirm_color}"
-                    )
-
-                    def _sync_label(e: object = None) -> None:
-                        # One place for the label, colour and enabled state: the radio
-                        # change and every checklist toggle call it.
-                        mode = (
-                            str(getattr(e, "value", "append"))
-                            if e is not None and hasattr(e, "value")
-                            else migration_state.reload_mode
-                        )
-                        text, color = _label_and_color(mode)
-                        start_btn.set_text(text)
-                        start_btn.props(f"color={color}")
-                        if selectable:
-                            # The summary and the with-data count follow the ticks.
-                            summary_label.set_text(_summary())
-                            if radio_tables and not cdc_live_now:
-                                with_data_label.set_text(
-                                    with_data_choice_text(
-                                        len(_ticked(radio_tables)), ticked_scope=True
-                                    )
-                                )
-                        # Disabled when the retry checklist has nothing ticked, the
-                        # record of excluded-column changes could not be read, or CDC is
-                        # streaming (G129).
-                        if (selectable and not checked) or ledger_error or cdc_live_now:
-                            start_btn.disable()
-                        else:
-                            start_btn.enable()
-                        # The overlay blocks follow the reload choice AND the ticks.
-                        if _changes.get("refresh") is not None:
-                            _changes["refresh"](mode)
-
-                    _sync_label()
-                    # Guard must MATCH the radio's creation condition above
-                    # (`tables_with_data_now and not cdc_live_now`). With CDC live the
-                    # radio is never created -- nothing runs while a sink streams (G129) --
-                    # so the looser `if tables_with_data_now` raised UnboundLocalError and
-                    # the whole confirm dialog failed to open. Still reachable from a stale
-                    # per-table Reload or "Retry unfinished tables" (rendered before CDC
-                    # started; both are disabled while it is live) when the probed table
-                    # already holds target rows.
-                    if radio_tables and not cdc_live_now:
-                        reload_choice.on_value_change(_sync_label)
-            # Open on the NEXT tick, not this one. The dialog element was just
-            # created; opening it in the same update batches "create element" and
-            # "value=True" into one client message, and Quasar's QDialog needs the
-            # element registered first and then a SEPARATE false->true transition to
-            # animate open -- so the first open is silently dropped and only a second
-            # click (element already registered) shows it. A one-shot timer defers
-            # the open to a fresh tick so the transition fires on the first click.
-            # (Same ui.timer(once=True) deferral pattern already used in this file.)
-            ui.timer(0.05, confirm_dialog.open, once=True)
-
-        with client:  # type: ignore[attr-defined]
-            _build()
 
     # Re-entrancy guard: the confirm handler runs a ~1-2s off-loop probe before
     # opening the dialog, so a double-click would open TWO dialogs. This flag drops
@@ -1574,6 +1598,9 @@ def _render_full_load_step(
                 )
 
             _open_confirm_dialog_now(
+                ui,
+                migration_state,
+                job_manager,
                 action_tables=action_tables,
                 on_confirm=confirm_action,
                 title=title,
@@ -1586,6 +1613,11 @@ def _render_full_load_step(
                 addition_forced=addition_forced,
                 cdc_additions=cdc_additions,
                 index_only=frozenset(index_only or ()),
+                engine=_engine,
+                pg_publication=_pg_publication,
+                schema_recreate_candidates=schema_recreate_candidates,
+                refuse_new_start_point=_refuse_new_start_point,
+                refuse_cdc_live=_refuse_cdc_live,
             )
         finally:
             _confirm_busy["value"] = False

@@ -1595,19 +1595,34 @@ def test_full_load_step_passes_recreate_candidates_into_the_confirm_dialog() -> 
     closure -- names that are not in that scope -- so every Start click would have raised
     NameError. Nothing caught it because no test opens the dialog, hence this structural
     check that the value is threaded in and closed over.
-    """
-    from dsql_migrator.ui import data_migration as dm
 
-    code = dm._render_full_load_step.__code__
-    dialog = next(
-        c for c in code.co_consts
-        if getattr(c, "co_name", None) == "_open_confirm_dialog_now"
-    )
+    Since FL-8 the dialog is a MODULE-LEVEL function, so the thunk arrives as a keyword
+    argument rather than a closed-over name of the render pass; the step must pass it.
+    """
+    import ast
+    import inspect
+
+    from dsql_migrator.ui.data_migration import _full_load_ui as flu
+
+    dialog = flu._open_confirm_dialog_now.__code__
     build = next(
         c for c in dialog.co_consts if getattr(c, "co_name", None) == "_build"
     )
-    # The dialog closes over the caller-supplied list...
-    assert "schema_recreate_candidates" in dialog.co_freevars
+    # The dialog takes the caller-supplied thunk as a parameter...
+    assert "schema_recreate_candidates" in inspect.signature(
+        flu._open_confirm_dialog_now
+    ).parameters
+    # ...the step passes its own into it...
+    step = ast.parse(inspect.getsource(flu._render_full_load_step))
+    passed = {
+        keyword.arg: ast.unparse(keyword.value)
+        for node in ast.walk(step)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_open_confirm_dialog_now"
+        for keyword in node.keywords
+    }
+    assert passed.get("schema_recreate_candidates") == "schema_recreate_candidates"
     # ...and the rendering body closes over the narrowed result.
     assert "recreate_now" in build.co_freevars
     # The stale, unresolvable names must NOT come back.
