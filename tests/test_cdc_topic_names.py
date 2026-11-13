@@ -47,6 +47,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dsql_migrator.core import s3_provision
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_TOPIC_PREFIX,
@@ -1296,22 +1297,46 @@ def test_the_table_cap_speaks_first_when_both_apply(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. The core backstops refuse before anything is changed
+# 5. The core backstops refuse before anything is changed, judged for the sink plugin of the
+#    stack the capture is for: Deploy CDC infrastructure for the bundled one, the one it
+#    uploads and records as the new stack's PluginVersion; Start CDC and Retry CDC for the
+#    deployed one, read from the same describe.
 # ---------------------------------------------------------------------------
 
 
 def _refused_of_kind(kind, db, illegal):
     """Names of one kind CDC cannot stream (``illegal`` for that kind)."""
     return {"illegal": [illegal], "dotted": [f"{db}.a.b"],
-            "collision": [f"{db}.v2_users", f"{db}_v2.users"]}[kind]
+            "collision": [f"{db}.v2_users", f"{db}_v2.users"],
+            # Refused on every sink plugin, v57 included.
+            "empty": [f".{db}.t"],
+            "dotted_collision": [f"{db}.orders.v2", f"{db}.orders_v2"]}[kind]
 
 
-@pytest.mark.parametrize("kind", ["illegal", "dotted", "collision"])
+# (sink plugin, kind of name it refuses): a '.' inside a table name is refused on a plugin
+# older than v57 or one this version cannot identify (None), and only there.
+_PLUGIN_KINDS = [
+    *((plugin, kind) for plugin in (None, "v56") for kind in ("illegal", "dotted", "collision")),
+    *(("v57", kind) for kind in ("illegal", "empty", "collision", "dotted_collision")),
+]
+
+
+def _dotted_name(engine):
+    """A table whose name holds a '.', one of each engine's shapes: MySQL `shop`.`orders.v2`,
+    PostgreSQL public."public.orders" (an older sink read its tombstone as public.orders)."""
+    return "shop.orders.v2" if engine == "mysql" else "public.public.orders"
+
+
+@pytest.mark.parametrize(("bundled", "kind"), [pk for pk in _PLUGIN_KINDS if pk[0]])
 @pytest.mark.parametrize("engine", ["mysql", "postgres"])
-def test_deploy_refuses_before_the_bucket_or_any_upload(engine, kind) -> None:
+def test_deploy_refuses_before_the_bucket_or_any_upload(monkeypatch, engine, bundled, kind) -> None:
+    # FAILS WITHOUT THE FIX for a '.' inside a table name: the deploy judged every name for a
+    # plugin it could not identify, not for the one it bundles (here pinned, v56 or v57).
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", bundled)
     db = "shop" if engine == "mysql" else "public"
     refused = _refused_of_kind(kind, db, f"{db}.order$items")
     names = [f"{db}.orders", *refused]
+    params = _infra(engine, names, _counts(names))
     handle = _FakeHandle()
     logs, on_log = _logs()
     s3 = _FakeS3(absent=True)
@@ -1319,21 +1344,59 @@ def test_deploy_refuses_before_the_bucket_or_any_upload(engine, kind) -> None:
     with pytest.raises(CdcDeployError) as exc:
         _run_infra(
             handle, deployer, on_log, s3_client=s3, stack_name="dsql-cdc-shop",
-            template_body="T", params=_infra(engine, names, _counts(names)),
+            template_body="T", params=params,
             create_timeout_seconds=5.0, poll_interval_seconds=0.0,
         )
-    assert str(exc.value) == cdc_topic_name_refusal(names)
+    assert str(exc.value) == topic_name_refusal(params.filled, sink_plugin=bundled)
+    if kind == "dotted":
+        # The fact names the plugin the new stack would get, and Delete + Deploy.
+        assert f"CDC cannot stream {db}.a.b{_old_plugin_fact(bundled)}" in str(exc.value)
+    if kind in ("illegal", "collision"):
+        # Judged alike on every plugin, and as the Data Migration step judges them.
+        assert str(exc.value) == cdc_topic_name_refusal(names)
     assert s3.calls == [] and deployer.calls == [] and deployer.created == []
     assert set(_statuses(handle).values()) == {"PENDING"}
     assert handle.job.error_count == 1
     assert any(m.startswith(f"ERROR: CDC cannot stream {refused[0]}") for m in logs)
 
 
-@pytest.mark.parametrize("kind", ["illegal", "dotted", "collision"])
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_deploy_takes_a_dot_inside_a_table_name_with_a_bundled_plugin_that_reads_it(
+    monkeypatch, engine
+) -> None:
+    # FAILS WITHOUT THE FIX: the deploy refused it, judged for a plugin it could not identify,
+    # although the stack it creates gets the bundled plugin (here pinned to v57).
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v57")
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    names = [f"{db}.orders", dotted]
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    deployer = _FakeDeployer(stack_statuses=("CREATE_IN_PROGRESS", "CREATE_COMPLETE"))
+    _run_infra(
+        handle, deployer, on_log, stack_name="dsql-cdc-shop", template_body="T",
+        params=_infra(engine, names, _counts(names)),
+        create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert handle.job.error_count == 0
+    (_stack, created), = deployer.created
+    sent = dict(created)
+    # The new stack records the plugin the names were judged for, so Start judges the same.
+    assert sent["PluginVersion"] == "v57"
+    assert sent["SinkTopics"] == f"dsqlcdc.{db}.orders,dsqlcdc.{dotted}"
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+
+
+@pytest.mark.parametrize(("plugin", "kind"), _PLUGIN_KINDS)
 @pytest.mark.parametrize("engine", ["mysql", "postgres"])
 @pytest.mark.parametrize("seed_mode", ["lambda", "external"])
 @pytest.mark.parametrize("running", [False, True], ids=["create", "both_running"])
-def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, running, kind) -> None:
+def test_start_refuses_before_bootstrap_seed_or_update(
+    engine, seed_mode, running, plugin, kind
+) -> None:
+    # FAILS WITHOUT THE FIX for a deployed v56 (its plugin named) and for a pair a '.' inside
+    # a table name collides in on v57: Start judged every name for an unknown plugin.
     db = "shop" if engine == "mysql" else "public"
     names = [f"{db}.orders", *_refused_of_kind(kind, db, f"{db}.a,b")]
     params = _start(engine, names)
@@ -1341,7 +1404,10 @@ def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, runnin
     deployer = _FakeDeployer(
         connector_states={SRC: list(states), SINK: list(states)},
         # Both RUNNING on this very config: the fast path that sends nothing.
-        discovery_params=dict(params.filled) if running else None,
+        discovery_params={
+            **(dict(params.filled) if running else {}),
+            **({"PluginVersion": plugin} if plugin else {}),
+        },
     )
     seeds: list = []
     handle = _FakeHandle()
@@ -1352,7 +1418,18 @@ def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, runnin
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
             seed_mode=seed_mode, seed_fn=lambda **kw: seeds.append(kw) or "true",
         )
-    assert str(exc.value) == cdc_topic_name_refusal(names)
+    assert str(exc.value) == topic_name_refusal(params.filled, sink_plugin=plugin)
+    if kind == "dotted":
+        # The fact names the deployed plugin (or says it cannot tell), and Delete + Deploy.
+        assert f"CDC cannot stream {db}.a.b{_old_plugin_fact(plugin)}" in str(exc.value)
+    if kind == "dotted_collision":
+        # On v57 a '.' inside a table name streams, so it collides like any other name.
+        assert str(exc.value).startswith(
+            f"CDC cannot stream {db}.orders.v2 together with {db}.orders_v2{_COLLISION_FACT}")
+    if plugin is None:
+        # A stack with no PluginVersion is judged as the Data Migration step judges a stack
+        # whose plugin it does not know.
+        assert str(exc.value) == cdc_topic_name_refusal(names)
     assert deployer.updates == []
     assert "submit_update" not in deployer.calls
     assert "get_bootstrap_brokers" not in deployer.calls
@@ -1375,6 +1452,43 @@ def test_names_cdc_can_stream_reach_the_stack_update() -> None:
     _start_with(_start("mysql", legal), deployer)
     assert "submit_update" in deployer.calls
     assert dict(deployer.updates[0])["SinkTopics"] == "dsqlcdc.shop.orders,dsqlcdc.shop.items"
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+@pytest.mark.parametrize("seed_mode", ["lambda", "external"])
+def test_a_dot_inside_a_table_name_reaches_the_stack_update_on_a_v57_stack(
+    engine, seed_mode
+) -> None:
+    # FAILS WITHOUT THE FIX: Start refused it, judged for a plugin it could not identify,
+    # although the describe it had just read says v57.
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    params = _start(engine, [f"{db}.orders", dotted])
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"PluginVersion": "v57"},
+    )
+    seeds: list = []
+    handle = _FakeHandle()
+    run_cdc_start(
+        handle, stack_name=STACK, params=params, deployer=deployer,
+        on_log=lambda ts, msg: None, sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        seed_mode=seed_mode, seed_fn=lambda **kw: seeds.append(kw) or "true",
+    )
+    assert handle.job.error_count == 0
+    assert deployer.calls.count("submit_update") == 1
+    sent = dict(deployer.updates[0])
+    topics = [f"dsqlcdc.{db}.orders", f"dsqlcdc.{dotted}"]
+    assert sent["SinkTopics"] == ",".join(topics)
+    # The exact escaped entry, so the source connector captures only that table.
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+    if seed_mode == "external":
+        # The in-process seed pre-creates the dotted table's topic by its literal name.
+        (seed,) = seeds
+        assert seed["sink_topics"] == topics
+    else:
+        assert seeds == []
 
 
 # ---------------------------------------------------------------------------
