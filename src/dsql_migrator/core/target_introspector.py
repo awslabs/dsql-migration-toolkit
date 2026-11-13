@@ -1167,7 +1167,7 @@ def read_overlay_column_facts(
     a name over 63 bytes is stored cut, and the loader's INSERT and the ALTER reach it
     that way); two asked names that the catalog would store as one raise. It raises on
     any error on purpose: the overlay unit needs the exception to retry a 40001 and to
-    replay a lost connection (``core.schema_applier.apply_exclusion_overlay``).
+    replay a lost connection (``core.exclusion_overlay.apply_exclusion_overlay``).
     """
     by_stored: dict[str, str] = {}
     for column in columns:

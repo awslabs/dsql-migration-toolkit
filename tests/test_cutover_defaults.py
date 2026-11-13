@@ -21,7 +21,7 @@ from dsql_migrator.core.overlay_ledger import (
     overlay_ledger_key,
     recorded_ddl_fields,
 )
-from dsql_migrator.core.schema_applier import RestoreOutcome
+from dsql_migrator.core.exclusion_overlay import RestoreOutcome
 from dsql_migrator.core.target_introspector import ColumnNullFacts, TableOverlayFacts
 from dsql_migrator.ui import cutover_defaults as cd
 from dsql_migrator.ui.cutover_defaults import (

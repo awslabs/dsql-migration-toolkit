@@ -30,7 +30,7 @@ from dsql_migrator.core.overlay_ledger import (
     apply_restore_results,
     ddl_digest,
 )
-from dsql_migrator.core.schema_applier import (
+from dsql_migrator.core.exclusion_overlay import (
     is_single_sql_expression,
     restore_default_statement,
 )

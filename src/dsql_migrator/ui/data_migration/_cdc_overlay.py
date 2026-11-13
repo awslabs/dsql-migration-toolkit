@@ -26,7 +26,7 @@ from dsql_migrator.core.overlay_ledger import (
     append_verdict,
     plan_ledger_record,
 )
-from dsql_migrator.core.schema_applier import (
+from dsql_migrator.core.exclusion_overlay import (
     apply_exclusion_overlay,
     build_overlay_statements,
 )

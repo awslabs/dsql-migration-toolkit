@@ -20,7 +20,7 @@ from dsql_migrator.core.overlay_ledger import (
     OverlayLedgerTable,
     ddl_digest,
 )
-from dsql_migrator.core.schema_applier import apply_exclusion_overlay
+from dsql_migrator.core.exclusion_overlay import apply_exclusion_overlay
 from dsql_migrator.core.target_introspector import target_overlay_facts
 from dsql_migrator.ui.data_migration._cdc_overlay import (
     OverlayFactsUnknown,

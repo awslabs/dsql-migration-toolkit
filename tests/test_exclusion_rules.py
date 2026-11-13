@@ -877,7 +877,7 @@ def test_42703_blocks_only_a_certain_failure_and_offers_a_rule():
 
 
 def test_target_changes_match_the_start_dialog_builder():
-    from dsql_migrator.core.schema_applier import build_overlay_statements, ddl_column_facts
+    from dsql_migrator.core.exclusion_overlay import build_overlay_statements, ddl_column_facts
 
     res = _full("exclude shop.orders.price\nexclude shop.orders.note\nexclude shop.customers.name")
     by_table = {c.table: c for c in res.target_changes}

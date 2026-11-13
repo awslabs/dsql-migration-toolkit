@@ -3,7 +3,7 @@
 
 """The record of what the column-exclusion overlay changed on the TARGET.
 
-The overlay (``core.schema_applier.apply_exclusion_overlay``) makes an excluded column
+The overlay (``core.exclusion_overlay.apply_exclusion_overlay``) makes an excluded column
 nullable with no DEFAULT, so every row the migration writes stores NULL in it. The
 original DEFAULT must come back at cut over (D3), and a later run must know which tables
 already hold NULL under which column set -- neither can be re-derived from the target once

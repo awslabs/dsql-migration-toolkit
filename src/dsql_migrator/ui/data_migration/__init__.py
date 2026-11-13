@@ -3939,7 +3939,7 @@ def make_overlay_dialog_providers(migration_state, job_manager, session, invento
     conversion the render recorded) and the tables the tool recreated and did not finish.
     """
     from dsql_migrator.core.overlay_ledger import overlay_ledger_key
-    from dsql_migrator.core.schema_applier import ddl_column_facts
+    from dsql_migrator.core.exclusion_overlay import ddl_column_facts
 
     def ledger_read():
         ledger = getattr(migration_state, "overlay_ledger", None)

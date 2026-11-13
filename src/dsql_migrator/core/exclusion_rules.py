@@ -1600,7 +1600,7 @@ def _target_changes(tables_in_order, columns, retained, applied) -> "tuple[Targe
     entries, through THE builder the Start dialogs use, fed the applied DDL's facts."""
     if applied is None:
         return ()
-    from dsql_migrator.core.schema_applier import (
+    from dsql_migrator.core.exclusion_overlay import (
         OverlayRefusedError,
         build_overlay_statements,
         ddl_column_facts,

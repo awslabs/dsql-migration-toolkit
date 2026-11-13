@@ -31,7 +31,7 @@ from dsql_migrator.core.models import (
     StepStatus,
 )
 from dsql_migrator.core.target_connection import DsqlConnector
-from dsql_migrator.core.schema_applier import OverlayRefusedError, build_overlay_statements
+from dsql_migrator.core.exclusion_overlay import OverlayRefusedError, build_overlay_statements
 from dsql_migrator.core.target_introspector import (
     target_overlay_facts,
     target_primary_keys,

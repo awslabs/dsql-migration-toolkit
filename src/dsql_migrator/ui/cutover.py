@@ -508,7 +508,7 @@ def _run_cutover_default_restore(
     :func:`~dsql_migrator.ui.cutover_defaults.run_cutover_default_restore`).
     """
     from dsql_migrator.core.overlay_ledger import overlay_ledger_key
-    from dsql_migrator.core.schema_applier import restore_column_default
+    from dsql_migrator.core.exclusion_overlay import restore_column_default
     from dsql_migrator.ui.cutover_defaults import (
         CutoverRestoreOutcome,
         cutover_settle_probe,

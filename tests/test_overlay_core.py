@@ -14,16 +14,15 @@ import re
 
 import pytest
 
-from dsql_migrator.core.schema_applier import (
+from dsql_migrator.core.exclusion_overlay import (
     OverlayRefusedError,
     OverlayVerifyError,
-    SchemaApplyError,
-    _run_unit_reconnecting,
     apply_exclusion_overlay,
     build_overlay_statements,
     ddl_column_facts,
     restore_column_default,
 )
+from dsql_migrator.core.schema_applier import SchemaApplyError, _run_unit_reconnecting
 from dsql_migrator.core.target_introspector import ColumnNullFacts as F
 from dsql_migrator.core.target_introspector import target_overlay_facts
 
@@ -519,7 +518,7 @@ def test_a_backslash_in_a_plain_literal_is_restored_under_standard_strings(expr)
 
 
 def test_a_plain_literal_continued_across_a_newline_stays_plain():
-    from dsql_migrator.core.schema_applier import is_single_sql_expression
+    from dsql_migrator.core.exclusion_overlay import is_single_sql_expression
 
     for expr in ("'\\x00'\n'00'::bytea", "'a'\n'\\b'::text", "'a' '\\b'::text"):
         assert is_single_sql_expression(expr), expr

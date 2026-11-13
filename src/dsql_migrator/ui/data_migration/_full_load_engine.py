@@ -92,9 +92,10 @@ from dsql_migrator.core.source_time_zone import resolve_source_zone
 from dsql_migrator.core.mysql_start_point_fence import start_point_unfenced
 from dsql_migrator.core.mysql_zero_dates import INVALID as INVALID_DATE, ZERO as ZERO_DATE
 from dsql_migrator.core.column_exclusion import views_referencing as _views_referencing
-from dsql_migrator.core.schema_applier import (
-    OverlayRefusedError, build_overlay_statements, recreate_table,
+from dsql_migrator.core.exclusion_overlay import (
+    OverlayRefusedError, build_overlay_statements,
 )
+from dsql_migrator.core.schema_applier import recreate_table
 from dsql_migrator.core.overlay_ledger import (
     LedgerDecision,
     LedgerRead,
@@ -7972,7 +7973,7 @@ def _default_overlay_applier(
     expected_defaults: Optional[Mapping[str, Optional[str]]] = None,
 ):
     """Run one table's overlay unit on this run's target."""
-    from dsql_migrator.core.schema_applier import apply_exclusion_overlay
+    from dsql_migrator.core.exclusion_overlay import apply_exclusion_overlay
 
     connector = DsqlConnector(inputs.target_config, aws_profile=inputs.aws_profile)
     return apply_exclusion_overlay(

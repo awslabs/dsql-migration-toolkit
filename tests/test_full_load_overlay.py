@@ -295,7 +295,7 @@ from dsql_migrator.core.models import (  # noqa: E402
 )
 from dsql_migrator.core.batched_import import BatchedImportResult, OnConflictMode  # noqa: E402
 from dsql_migrator.core.overlay_ledger import LedgerRead, OverlayLedgerError, overlay_ledger_key  # noqa: E402
-from dsql_migrator.core.schema_applier import apply_exclusion_overlay  # noqa: E402
+from dsql_migrator.core.exclusion_overlay import apply_exclusion_overlay  # noqa: E402
 from dsql_migrator.core.target_introspector import ColumnNullFacts as F  # noqa: E402
 from dsql_migrator.core.target_introspector import target_overlay_facts  # noqa: E402
 from dsql_migrator.ui.data_migration._full_load_engine import (  # noqa: E402
