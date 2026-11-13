@@ -632,6 +632,32 @@ def test_match_metric_tables_prefers_exact_then_unambiguous_bare() -> None:
     assert _match_metric_tables(["nope"], discovered) == {}
 
 
+def test_match_metric_tables_never_lends_a_qualified_name_another_tables_value() -> None:
+    from dsql_migrator.core.msk_connect_controller import _match_metric_tables
+
+    # FAILS WITHOUT THE FIX: matching on the last segment gave MySQL `shop`.`orders.v2`
+    # (not published yet) the metrics of x.v2 -- another table's lag and applied ops.
+    assert _match_metric_tables(["shop.orders.v2"], ["x.v2"]) == {}
+    # FAILS WITHOUT THE FIX: the same for any qualified name -- a.orders read b.orders.
+    assert _match_metric_tables(["a.orders"], ["b.orders"]) == {}
+    # A qualified name that is published maps to itself, a '.' in its table included.
+    assert _match_metric_tables(
+        ["shop.orders.v2", "shop.orders"], ["shop.orders", "shop.orders.v2", "x.v2"]
+    ) == {"shop.orders.v2": "shop.orders.v2", "shop.orders": "shop.orders"}
+
+
+def test_match_metric_tables_reads_a_published_table_part_after_its_first_dot() -> None:
+    from dsql_migrator.core.msk_connect_controller import _match_metric_tables
+
+    # The sink publishes "<db or schema>.<table>" split at the FIRST '.', so the table part
+    # of shop.orders.v2 is orders.v2. FAILS WITHOUT THE FIX: a legacy bare v2 matched it.
+    assert _match_metric_tables(["v2"], ["shop.orders.v2"]) == {}
+    # A legacy bare name still finds its one published table.
+    assert _match_metric_tables(["items"], ["shop.orders.v2", "shop.items"]) == {
+        "items": "shop.items"
+    }
+
+
 # ---------------------------------------------------------------------------
 # delete_connector (guarded mutation)
 # ---------------------------------------------------------------------------
@@ -803,6 +829,34 @@ def test_value_conversion_failures_returns_the_distinct_named_columns() -> None:
     controller.value_conversion_failures("/msk-connect/x-cdc")
     second = [c for c in client.calls if c[0] == "filter_log_events"][1]
     assert second[1]["startTime"] == 1301
+
+
+def test_value_conversion_failures_name_a_dotted_table_from_the_given_tables() -> None:
+    # FAILS WITHOUT THE FIX: the read had no tables to judge by, so MySQL `shop`.`orders.v2`
+    # was reported as table orders.v2 (a database orders), column qty.
+    client = _FakeClient(
+        {
+            "filter_log_events": {
+                "events": [
+                    {
+                        "timestamp": 1000,
+                        "message": _CONV_LINE.format(col="shop.orders.v2.qty", type="numeric"),
+                    },
+                    {
+                        "timestamp": 1100,
+                        "message": _CONV_LINE.format(col="shop.items.price", type="numeric"),
+                    },
+                ]
+            }
+        }
+    )
+    found = _controller(client).value_conversion_failures(
+        "/msk-connect/x-cdc", tables=["shop.orders.v2", "shop.items", ""]
+    )
+    assert [(f.table, f.column) for f in found] == [
+        ("shop.orders.v2", "qty"),
+        ("shop.items", "price"),
+    ]
 
 
 def test_value_conversion_failures_fail_closed_on_access_error() -> None:

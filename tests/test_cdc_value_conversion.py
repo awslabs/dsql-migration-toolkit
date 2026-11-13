@@ -128,3 +128,71 @@ def test_the_filter_pattern_matches_the_shipped_wording() -> None:
     # here is what stops one drifting from the other.
     assert VALUE_CONVERSION_FILTER_PATTERN == '"Failed to properly convert data value"'
     assert VALUE_CONVERSION_FILTER_PATTERN.strip('"') in _PG_NAN
+
+
+# ---------------------------------------------------------------------------
+# A '.' inside a table name: the streamed names say where the table ends
+# ---------------------------------------------------------------------------
+
+
+def _line(ident: str, type_name: str = "numeric") -> str:
+    return (
+        f"ERROR Failed to properly convert data value for '{ident}' of type {type_name} "
+        "(io.debezium.relational.TableSchemaBuilder:279)"
+    )
+
+
+def _split(ident: str, tables) -> tuple[str, str]:
+    failure = parse_value_conversion_failure(_line(ident), tables=tables)
+    assert failure is not None
+    return failure.table, failure.column
+
+
+def test_a_mysql_table_name_holding_a_dot_is_named_from_the_streamed_tables() -> None:
+    # FAILS WITHOUT THE FIX: MySQL `shop`.`orders.v2` logs shop.orders.v2.qty, which the
+    # last-segments rule read as table orders.v2 (a database orders) -- the notice and the
+    # activity log then named a table this migration does not have.
+    assert _split("shop.orders.v2.qty", {"shop.orders.v2", "shop.items"}) == (
+        "shop.orders.v2",
+        "qty",
+    )
+
+
+def test_a_postgresql_table_name_holding_a_dot_is_named_with_or_without_a_catalog() -> None:
+    # FAILS WITHOUT THE FIX (both). The schema.table id is the shape captured live on
+    # PostgreSQL 17.7 (_PG_NAN); an id that also carries the database as its catalog is
+    # read after its first '.'.
+    assert _split("app.orders.v2.total", ["app.orders.v2"]) == ("app.orders.v2", "total")
+    assert _split("testdb.app.orders.v2.col", ["app.orders.v2"]) == ("app.orders.v2", "col")
+
+
+def test_the_longest_streamed_name_wins_and_the_column_is_the_rest() -> None:
+    # FAILS WITHOUT THE FIX: both shop.orders and shop.orders.v2 are streamed, and the line
+    # is the dotted table's -- the shorter name would report column "v2.qty" of shop.orders.
+    tables = frozenset({"shop.orders", "shop.orders.v2"})
+    assert _split("shop.orders.v2.qty", tables) == ("shop.orders.v2", "qty")
+    assert _split("shop.orders.qty", tables) == ("shop.orders", "qty")
+    # FAILS WITHOUT THE FIX: a '.' inside the COLUMN name stays in the column once the
+    # table is known (the last-segments rule read table orders.unit, column price).
+    assert _split("shop.orders.unit.price", tables) == ("shop.orders", "unit.price")
+
+
+def test_a_tie_between_the_two_forms_takes_the_plain_one() -> None:
+    # Pins the documented, deterministic choice for an identifier two streamed names of
+    # the same length both read: a.b (column c.d) over b.c read after a catalog (column d).
+    assert _split("a.b.c.d", {"a.b", "b.c"}) == ("a.b", "c.d")
+
+
+def test_an_unknown_table_keeps_the_legacy_split() -> None:
+    # With no streamed name that reads the line -- none given, or the table is not one of
+    # them -- the result is the last-segments rule's, exactly as before ``tables`` existed.
+    legacy = parse_value_conversion_failure(_PG_NAN)
+    assert legacy == CdcValueConversionFailure(
+        table="v45arr.arr_ok", column="vt_nan", type_name="numeric"
+    )
+    assert parse_value_conversion_failure(_PG_NAN, tables=()) == legacy
+    # A name is read only up to a '.': v45arr.arr is a prefix of the text, not of the table.
+    assert parse_value_conversion_failure(_PG_NAN, tables=["other.t", "v45arr.arr"]) == legacy
+    # A name the identifier only equals (no column after it) does not read it either.
+    assert parse_value_conversion_failure(_PG_NAN, tables={"v45arr.arr_ok.vt_nan"}) == legacy
+    assert _split("app.public.orders.total", ["public.orders.x"]) == ("public.orders", "total")

@@ -1902,6 +1902,60 @@ def test_fetch_merges_value_conversion_failures_into_a_sticky_set() -> None:
     assert len(state.cdc_value_conversion_failures) == 1
 
 
+class _ConvLineController(_ConvController):
+    """Parses one real connector line with whatever ``tables`` the poll passes it."""
+
+    def __init__(self, ident):
+        super().__init__([])
+        self._ident = ident
+        self.tables_seen: list = []
+
+    def value_conversion_failures(self, log_group, **kw):
+        from dsql_migrator.core.cdc_value_conversion import parse_value_conversion_failure
+
+        assert log_group.startswith("/msk-connect/")
+        self.tables_seen.append(kw.get("tables"))
+        line = (
+            f"ERROR Failed to properly convert data value for '{self._ident}' of type "
+            "numeric (io.debezium.relational.TableSchemaBuilder:279)"
+        )
+        return [parse_value_conversion_failure(line, tables=kw.get("tables", ()))]
+
+
+def test_fetch_names_a_dotted_table_from_the_migrated_tables() -> None:
+    # FAILS WITHOUT THE FIX: the poll passed no tables, so MySQL `shop`.`orders.v2`'s NULL
+    # column was named orders.v2.qty -- a table this migration does not have.
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    controller = _ConvLineController("shop.orders.v2.qty")
+    state = DataMigrationState()
+    state.set_cdc_controller(controller)
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_reconciled_table_names(["other.t"])  # the caller's set wins
+
+    _fetch_cdc_status(state, ["shop.orders.v2", "shop.items"])
+    assert controller.tables_seen == [["shop.orders.v2", "shop.items"]]
+    assert [f.qualified_column for f in state.cdc_value_conversion_failures] == [
+        "shop.orders.v2.qty"
+    ]
+
+
+def test_fetch_without_a_table_scope_names_it_from_the_reconciled_tables() -> None:
+    # FAILS WITHOUT THE FIX: a session reconnected to a running pipeline (no Full Load
+    # job, no table scope) still streams the tables reconciled from the live stack.
+    from dsql_migrator.ui.data_migration import _fetch_cdc_status
+
+    controller = _ConvLineController("shop.orders.v2.qty")
+    state = DataMigrationState()
+    state.set_cdc_controller(controller)
+    state.set_cdc_connector_names(["sink"])
+    state.set_cdc_reconciled_table_names(["shop.orders.v2"])
+
+    _fetch_cdc_status(state)
+    assert controller.tables_seen == [["shop.orders.v2"]]
+    assert [f.table for f in state.cdc_value_conversion_failures] == ["shop.orders.v2"]
+
+
 def test_a_value_conversion_failure_is_never_counted_as_quarantined() -> None:
     """THE regression this must not introduce: the row LANDED, so the DLQ depth must not move.
 

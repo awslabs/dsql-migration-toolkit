@@ -30,7 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.cdc import CdcConnectorError, ConnectorState, ConnectorStatus
@@ -189,24 +189,31 @@ def _match_metric_tables(
 ) -> dict[str, str]:
     """Map each requested table name to a published metric ``Table`` dimension value.
 
-    The sink emits ``Table`` schema-qualified (``db.table``); the tool's names may be
-    bare or qualified. An exact match wins; otherwise the bare table name (the last
-    dotted segment) must match **exactly one** published value. Ambiguous bare matches
-    (the same table name under two schemas) are skipped rather than risk attributing
-    another schema's rows to the wrong table — that table just falls back to the
-    COUNT-based figure. Pure, so it is unit-tested without AWS.
+    The sink emits ``Table`` schema-qualified (``db.table``, split at the FIRST '.', so a
+    table name may hold more: ``shop.orders.v2``). A qualified name (one with a '.') maps
+    only to itself: it is the same key the sink publishes, and a table that has not
+    published yet must not borrow another table's value -- matching on the last segment
+    read ``shop.orders.v2`` as ``x.v2``. A legacy BARE name (no '.') falls back to the
+    table part of a published value (after its first '.'), when **exactly one** value
+    has it. Ambiguous bare matches (the same table name under two schemas) are skipped
+    rather than risk attributing another schema's rows to the wrong table -- that table
+    just falls back to the COUNT-based figure. Pure, so it is unit-tested without AWS.
     """
     discovered_set = set(discovered)
     by_bare: dict[str, list[str]] = {}
     for value in discovered:
-        by_bare.setdefault(value.rsplit(".", 1)[-1], []).append(value)
+        bare = value.partition(".")[2]
+        if bare:
+            by_bare.setdefault(bare, []).append(value)
     matched: dict[str, str] = {}
     for name in requested:
-        if name in discovered_set:  # exact (cluster mode / already qualified)
+        if name in discovered_set:  # exact (the tool's names are qualified)
             matched[name] = name
             continue
-        candidates = by_bare.get(name.rsplit(".", 1)[-1], [])
-        if len(candidates) == 1:  # unambiguous bare match (single-db mode)
+        if "." in name:  # qualified and not published (yet) -> COUNT fallback
+            continue
+        candidates = by_bare.get(name, [])
+        if len(candidates) == 1:  # unambiguous bare match (a legacy bare name)
             matched[name] = candidates[0]
         # 0 candidates (not published yet) or >1 (ambiguous) -> skip -> COUNT fallback
     return matched
@@ -609,6 +616,7 @@ class MskConnectController:
         now: Optional[datetime] = None,
         limit: int = 200,
         window_seconds: int = _DLQ_INITIAL_LOOKBACK_SECONDS,
+        tables: Iterable[str] = (),
     ) -> "list[CdcValueConversionFailure]":
         """Read SOURCE-connector value-conversion failures from the connector log group.
 
@@ -639,6 +647,11 @@ class MskConnectController:
         walking one page forward per poll converges without an unbounded scan -- and a
         value that fails once fails on every row that carries it. ``limit`` is generous
         so a same-millisecond burst cannot be stepped over by the forward cursor.
+
+        ``tables`` (the qualified names the pipeline streams) tells each logged
+        ``<table>.<column>`` apart where a table name holds a '.'
+        (:func:`~dsql_migrator.core.cdc_value_conversion.parse_value_conversion_failure`);
+        without it a line is split by the legacy last-segments rule.
         """
         now_dt = now or datetime.now(timezone.utc)
         now_ms = int(now_dt.timestamp() * 1000)
@@ -656,8 +669,11 @@ class MskConnectController:
             return []
         found: "list[CdcValueConversionFailure]" = []
         max_ts = cursor or 0
+        known_tables = frozenset(t for t in tables if t)  # one set for every line read
         for event in list(response.get("events", []) or []):
-            record = parse_value_conversion_failure(str(event.get("message", "")))
+            record = parse_value_conversion_failure(
+                str(event.get("message", "")), tables=known_tables
+            )
             # No eventId de-dup (unlike the DLQ read): a repeated triple is harmless
             # because the caller merges into a set, so the read is idempotent by
             # construction and needs no cross-session seeding.

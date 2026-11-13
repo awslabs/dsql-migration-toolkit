@@ -2223,7 +2223,8 @@ def _fetch_cdc_status(migration_state, tables=None):
     promotes only after folding the records -- and the stop cause of a connector whose
     task stopped (``cdc_connector_diagnoses``, see :func:`_read_connector_diagnoses`).
     ``tables`` (the migrated table set) scopes the scan-free per-table applied-ops
-    metrics read; omitted (non-UI callers) -> skipped.
+    metrics read; omitted (non-UI callers) -> skipped. The value-conversion read uses
+    it to tell a table name holding a '.' from its column, else the reconciled tables.
     """
     controller = getattr(migration_state, "cdc_controller", None)
     names = list(getattr(migration_state, "cdc_connector_names", []) or [])
@@ -2352,8 +2353,17 @@ def _fetch_cdc_status(migration_state, tables=None):
     if callable(conv_reader) and stack_name:
         from dsql_migrator.core.cdc_value_conversion import VALUE_CONVERSION_MAX_TRACKED
 
+        # The streamed names tell a logged "<table>.<column>" apart where a table name
+        # holds a '.' (shop.orders.v2.qty is table shop.orders.v2, not orders.v2). The
+        # caller's migrated set, else the tables reconciled from the live stack -- the set
+        # a session with no table scope still streams.
+        _conv_tables = list(
+            tables or getattr(migration_state, "cdc_reconciled_table_names", None) or []
+        )
         try:
-            fresh = list(conv_reader(f"/msk-connect/{stack_name}-cdc") or [])
+            fresh = list(
+                conv_reader(f"/msk-connect/{stack_name}-cdc", tables=_conv_tables) or []
+            )
         except Exception:  # noqa: BLE001 - advisory, never break the poll
             fresh = []
         if fresh:

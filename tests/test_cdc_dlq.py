@@ -24,6 +24,49 @@ def test_table_from_topic_returns_db_qualified_name() -> None:
     assert _table_from_topic("") == ""
 
 
+def test_table_from_topic_keeps_a_dot_inside_the_table_name() -> None:
+    # FAILS WITHOUT THE FIX: the last two segments named the dead letter of MySQL
+    # `shop`.`orders.v2` "orders.v2" (a database orders, a table v2), so it was filed
+    # under a table this migration does not have, and its ADD COLUMN repair read nothing.
+    assert _table_from_topic("dsqlcdc.shop.orders.v2") == "shop.orders.v2"
+    # FAILS WITHOUT THE FIX, and the worse case: PostgreSQL app."app.orders" was filed
+    # under app.orders -- ANOTHER table of the same migration, which then showed
+    # quarantines for rows that were never its own.
+    assert _table_from_topic("dsqlcdc.app.app.orders") == "app.app.orders"
+    # The strip is of the given prefix only.
+    assert _table_from_topic("other.shop.orders.v2", prefix="other") == "shop.orders.v2"
+    assert _table_from_topic("other.shop.orders.v2") == "orders.v2"  # not under dsqlcdc.
+    # The bare prefix alone is no table name: the legacy fallback still names it.
+    assert _table_from_topic("dsqlcdc.") == "dsqlcdc"
+
+
+@pytest.mark.parametrize(
+    "topic",
+    [
+        "dsqlcdc.shop.orders",
+        "dsqlcdc.public.orders",
+        "dsqlcdc.cdc_demo.order_items",
+        "dsqlcdc.Shop-1.Orders_2",
+    ],
+)
+def test_table_from_topic_is_unchanged_for_every_three_segment_tool_topic(topic) -> None:
+    # Guard (passes before and after): every table name with no '.' -- each one CDC
+    # streamed before -- is filed under the same key as by the last-two-segments rule.
+    parts = topic.split(".")
+    assert _table_from_topic(topic) == f"{parts[-2]}.{parts[-1]}"
+
+
+def test_parse_files_a_dotted_table_name_dead_letter_under_that_table() -> None:
+    # FAILS WITHOUT THE FIX: rec.table was "orders.v2".
+    rec = parse_dlq_log_message(
+        "Quarantined record to DLQ (topic=dsqlcdc.shop.orders.v2, partition=0, "
+        "offset=7): DSQL apply failed (sqlstate=42703)"
+    )
+    assert rec is not None
+    assert rec.table == "shop.orders.v2"
+    assert rec.topic == "dsqlcdc.shop.orders.v2"  # the topic itself is kept as sent
+
+
 def test_parse_quarantined_line_extracts_table_offset_and_sqlstate() -> None:
     msg = (
         "Quarantined record to DLQ (topic=dsqlcdc.shop.orders, partition=0, "

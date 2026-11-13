@@ -35,7 +35,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
-from dsql_migrator.core.cdc import CdcConnectorError, SchemaDriftKind, classify_schema_drift
+from dsql_migrator.core.cdc import (
+    CDC_DEFAULT_TOPIC_PREFIX,
+    CdcConnectorError,
+    SchemaDriftKind,
+    classify_schema_drift,
+)
 from dsql_migrator.core.models import CdcDlqLedgerEntry
 
 # One regex handles both the "Quarantined record to DLQ (...)" and the
@@ -184,7 +189,7 @@ def check_constraint_from_reason(message: Optional[str]) -> Optional[str]:
     return match.group("name").strip() if match else None
 
 
-def _table_from_topic(topic: str) -> str:
+def _table_from_topic(topic: str, prefix: str = CDC_DEFAULT_TOPIC_PREFIX) -> str:
     """Return the ``db.table`` identity from a ``<prefix>.<db>.<table>`` Kafka topic.
 
     The db-QUALIFIED name (not the bare table) is what the rest of the tool keys a
@@ -195,11 +200,18 @@ def _table_from_topic(topic: str) -> str:
     ADD COLUMN drift recovery, whose ``information_schema`` reads need ``db.table``
     (a bare name splits to ``schema=<table>, name=""`` and matches zero rows).
 
-    The db + table are always the LAST two dot-segments regardless of how many
-    segments the prefix itself has, so take those. Falls back to the whole topic
-    when it is not dotted (so the record still surfaces under a stable, non-empty
-    key rather than being dropped).
+    A topic under ``<prefix>.`` (the tool's own, ``dsqlcdc.``) is that prefix plus the
+    table's qualified name, so the name is everything after it. That keeps a '.' inside a
+    table name: ``dsqlcdc.shop.orders.v2`` is ``shop.orders.v2``, the table it was
+    captured as, where the last two segments would name ``orders.v2`` (another table, or
+    none). For a 3-segment ``<prefix>.`` topic the two rules give the same name. Any other
+    topic keeps the last-two-segments rule, whatever its prefix, and falls back to the
+    whole topic when it is not dotted (so the record still surfaces under a stable,
+    non-empty key rather than being dropped).
     """
+    lead = f"{prefix}." if prefix else ""
+    if lead and topic.startswith(lead) and len(topic) > len(lead):
+        return topic[len(lead):]
     parts = [segment for segment in topic.split(".") if segment]
     if len(parts) >= 2:
         return f"{parts[-2]}.{parts[-1]}"
