@@ -2138,11 +2138,8 @@ def _render_cdc_manual_inputs(
             else:
                 binlog_unparsed = True
         _coord = (binlog_file, binlog_pos) if binlog_file is not None else None
-        _stored_coord = (
-            getattr(migration_state, "_cdc_start_binlog_file", None),
-            getattr(migration_state, "_cdc_start_binlog_pos", None),
-        )
-        _stored_gtid = getattr(migration_state, "_cdc_start_gtid", None)
+        _stored_gtid, _stored_file, _stored_pos = migration_state.cdc_start_entered()
+        _stored_coord = (_stored_file, _stored_pos)
         # A GTID set read at one position is not the set at another: a fetched (or stored)
         # set left unchanged beside an EDITED position is dropped, not stored -- on a
         # gtid_mode=ON source Debezium would start after it, so a set read later than the
@@ -2359,17 +2356,15 @@ def _render_cdc_manual_inputs(
         "so enter that too — Fetch current position fills both. A GTID set alone cannot "
         "set the start point."
     ).classes("text-xs text-gray-500 mt-1")
+    entered_gtid, entered_file, entered_pos = migration_state.cdc_start_entered()
     gtid_input = ui.input(  # type: ignore[attr-defined]
         "GTID set",
-        value=migration_state._cdc_start_gtid or "",
+        value=entered_gtid or "",
         placeholder="3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100",
     ).classes("w-full text-xs")
     binlog_default = ""
-    if migration_state._cdc_start_binlog_file and migration_state._cdc_start_binlog_pos is not None:
-        binlog_default = (
-            f"{migration_state._cdc_start_binlog_file}:"
-            f"{migration_state._cdc_start_binlog_pos}"
-        )
+    if entered_file and entered_pos is not None:
+        binlog_default = f"{entered_file}:{entered_pos}"
     binlog_input = ui.input(  # type: ignore[attr-defined]
         "Binlog file:position",
         value=binlog_default,

@@ -1244,6 +1244,21 @@ class DataMigrationState:
                 else {}
             )
 
+    def cdc_start_entered(self) -> "tuple[Optional[str], Optional[str], Optional[int]]":
+        """The Manual start point as stored -- ``(gtid, binlog_file, binlog_pos)`` -- read
+        under the lock :meth:`set_cdc_start_position` writes it under.
+
+        The raw values, whatever the start mode (:meth:`cdc_start_override` is the usable
+        point, ``None`` in ``"auto"``): what the manual inputs show and compare an edit
+        with, and what a session snapshot saves.
+        """
+        with self._lock:
+            return (
+                self._cdc_start_gtid,
+                self._cdc_start_binlog_file,
+                self._cdc_start_binlog_pos,
+            )
+
     def cdc_start_fingerprints(self) -> "dict[str, str]":
         """A copy of the Manual start point's recorded fingerprints (``{}``: none)."""
         with self._lock:

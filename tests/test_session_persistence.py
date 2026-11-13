@@ -2536,6 +2536,41 @@ def test_the_gtid_bound_stamp_is_written_only_with_a_set() -> None:
 
 
 
+def test_the_manual_start_point_is_read_through_cdc_start_entered_under_the_lock() -> None:
+    """dmshared-11: the snapshot, its dirty-check signature and the manual inputs read the
+    stored point through one accessor that takes the lock its writer holds."""
+    import inspect
+    import threading
+
+    from dsql_migrator.ui import session_persistence
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    state = DataMigrationState()
+    state.set_cdc_start_mode("manual")
+    state.set_cdc_start_position(
+        gtid=_G19_SET, binlog_file="mysql-bin-changelog.000012", binlog_pos=777
+    )
+    entered = (_G19_SET, "mysql-bin-changelog.000012", 777)
+    assert state.cdc_start_entered() == entered
+    # The raw values, whatever the mode (cdc_start_override is None in Automatic).
+    state.set_cdc_start_mode("auto")
+    assert state.cdc_start_override() is None and state.cdc_start_entered() == entered
+    # Under the lock: a read waits for a writer that holds it.
+    read: list = []
+    with state._lock:
+        reader = threading.Thread(target=lambda: read.append(state.cdc_start_entered()))
+        reader.start()
+        reader.join(0.2)
+        assert reader.is_alive() and not read
+    reader.join(5)
+    assert read == [entered]
+    for module in (session_persistence, _cdc_ui):
+        source = inspect.getsource(module)
+        for private in ("_cdc_start_gtid", "_cdc_start_binlog_file", "_cdc_start_binlog_pos"):
+            assert private not in source, (module.__name__, private)
+
+
+
 def test_a_restart_during_an_evaluation_rerun_restores_done_with_a_notice() -> None:
     """The re-run kept the previous report; the restore made it a silent DONE that read as
     the re-run's own result."""

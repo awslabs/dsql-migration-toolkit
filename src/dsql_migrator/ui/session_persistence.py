@@ -227,6 +227,7 @@ def capture_session_snapshot(
     validation_state: object = None,
 ) -> SessionSnapshot:
     """Build a non-secret :class:`SessionSnapshot` from the live session state."""
+    entered_gtid, entered_file, entered_pos = migration_state.cdc_start_entered()  # type: ignore[attr-defined]
     snapshot = SessionSnapshot(
         session_id=session_id,
         workflow=session.workflow.model_copy(deep=True),  # type: ignore[attr-defined]
@@ -256,14 +257,14 @@ def capture_session_snapshot(
             getattr(session, "migration_type_chosen", lambda: False)()
         ),
         cdc_start_mode=migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
-        cdc_start_gtid=migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
-        cdc_start_binlog_file=migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
-        cdc_start_binlog_pos=migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
+        cdc_start_gtid=entered_gtid,
+        cdc_start_binlog_file=entered_file,
+        cdc_start_binlog_pos=entered_pos,
         cdc_start_fingerprints=dict(
             getattr(migration_state, "cdc_start_fingerprints", dict)()
         ),
         # This build's card keeps a GTID set only with the position it belongs to.
-        cdc_start_gtid_bound=bool(migration_state._cdc_start_gtid),  # type: ignore[attr-defined]
+        cdc_start_gtid_bound=bool(entered_gtid),
         cdc_history_missing=bool(getattr(migration_state, "cdc_history_missing", False)),
         cdc_lob_exclusions=_flatten_lob_exclusions(
             migration_state.lob_exclusions()  # type: ignore[attr-defined]
@@ -1159,9 +1160,7 @@ def session_signature(
         migration_state.migration_type.value,  # type: ignore[attr-defined]
         bool(getattr(session, "migration_type_chosen", lambda: False)()),
         migration_state.cdc_start_mode(),  # type: ignore[attr-defined]
-        migration_state._cdc_start_gtid,  # type: ignore[attr-defined]
-        migration_state._cdc_start_binlog_file,  # type: ignore[attr-defined]
-        migration_state._cdc_start_binlog_pos,  # type: ignore[attr-defined]
+        *migration_state.cdc_start_entered(),  # type: ignore[attr-defined]
         tuple(sorted(getattr(migration_state, "cdc_start_fingerprints", dict)().items())),
         bool(getattr(migration_state, "cdc_history_missing", False)),
         lob_sig,
