@@ -172,6 +172,18 @@ from dsql_migrator.ui.data_migration._foreign_keys import (  # noqa: F401
     pending_foreign_key_count,
     preserved_foreign_key_names,
 )
+# P4b: how the record of the index builds CHANGES -- a recreated table's builds voided, a
+# table's new builds merged in, the data-loaded stamp, and the fold of a read taken before
+# the load -- is _index_builds, beside the fold the step's watch uses (FL-11). Re-exported
+# under their own names, so this module's own calls and every `from
+# dsql_migrator.ui.data_migration._full_load_engine import ...` of one (the tests') resolve
+# unchanged. A re-export does not carry a monkeypatch: patch them in _index_builds.
+from dsql_migrator.ui.data_migration._index_builds import (  # noqa: F401
+    _fold_builds_before_load,
+    _merge_index_builds,
+    _stamp_data_loaded,
+    _void_index_builds,
+)
 from dsql_migrator.ui.data_migration._models import is_quarantine_message, quarantine_message
 
 _LOGGER = logging.getLogger(__name__)
@@ -684,44 +696,6 @@ def _index_build_of(table: str, ddl: object, job_id: Optional[str]) -> IndexBuil
     )
 
 
-def _void_index_builds(job: MigrationJob, tables: "Collection[str]") -> None:
-    """P4b: this run DROP+recreated ``tables``, so every build an earlier run of the lineage
-    recorded for them -- building, failed or completed, on relations that are gone -- leaves
-    the record (``submitted == completed + failed + len(building)`` kept), whether or not
-    the run gets as far as submitting their indexes again: a stale failure would name a
-    missing constraint of a relation that no longer exists, a stale build would be read on
-    the new one, a stale completed build would be counted twice. One pass over the record;
-    nothing recorded for them: unchanged."""
-    record = job.index_builds
-    names = set(tables or ())
-    if record is None or not names:
-        return
-    building = [old for old in record.building if old.table not in names]
-    failures = [old for old in record.failures if old.table not in names]
-    voided_completed = sum(
-        count for name, count in record.completed_by_table.items() if name in names
-    )
-    voided_failures = len(record.failures) - len(failures)
-    voided = len(record.building) - len(building) + voided_failures + voided_completed
-    if not voided:
-        return
-    update: dict = {
-        "submitted": max(0, record.submitted - voided),
-        "completed": max(0, record.completed - voided_completed),
-        "failed": max(0, record.failed - voided_failures),
-        "completed_by_table": {
-            name: count
-            for name, count in record.completed_by_table.items()
-            if name not in names
-        },
-        "building": building,
-        "failures": failures,
-    }
-    if not building and record.finished_at is None:
-        update["finished_at"] = datetime.now(timezone.utc)  # what it still watched is void
-    job.index_builds = record.model_copy(update=update)
-
-
 def _void_recorded_index_builds(handle: JobHandle, tables: "Collection[str]") -> None:
     """:func:`_void_index_builds` for ``tables`` on the handle's job, in one update (none
     for no table). A report only: it never raises into the run."""
@@ -732,64 +706,6 @@ def _void_recorded_index_builds(handle: JobHandle, tables: "Collection[str]") ->
         handle.update(lambda job, n=names: _void_index_builds(job, n))
     except Exception:  # noqa: BLE001 - the record of the builds, never the run's outcome
         _LOGGER.warning("Could not update the record of the index builds", exc_info=True)
-
-
-def _merge_index_builds(
-    job: MigrationJob,
-    table: str,
-    builds: "Sequence[IndexBuild]",
-    *,
-    recreated: bool,
-    data_loaded_at: Optional[datetime] = None,
-    before_load: bool = False,
-) -> None:
-    """Record on ``job`` the index builds the run's index pass submitted for ``table`` (P4b).
-
-    They void the records they replace: every record of a table this run recreated (its old
-    relation went with its indexes, :func:`_void_index_builds`), else the building or
-    failed record of an index submitted again (an index-only retry submits only one not on
-    the table). The counts stay ``submitted == completed + failed + len(building)``. A new
-    build sets ``data_loaded_at`` -- the start of this run's index pass, when every table
-    of it had loaded its data -- and ``submitted_at`` (now), and reopens a finished record.
-    Nothing to add or void: unchanged (no record is created for nothing).
-
-    ``before_load`` (P4d: builds submitted on an empty recreated table before its rows):
-    ``data_loaded_at`` is cleared instead -- no data has loaded yet -- until the run's index
-    pass stamps it once every table's has (:func:`_stamp_data_loaded`).
-    """
-    if recreated:
-        _void_index_builds(job, (table,))
-    if not builds:
-        return
-    record = job.index_builds or IndexBuilds()
-    again = {build.index for build in builds}
-
-    def _kept(old: IndexBuild) -> bool:
-        return old.table != table or old.index not in again
-
-    building = [old for old in record.building if _kept(old)]
-    failures = [old for old in record.failures if _kept(old)]
-    voided_failures = len(record.failures) - len(failures)
-    voided = len(record.building) - len(building) + voided_failures
-    now = datetime.now(timezone.utc)
-    job.index_builds = record.model_copy(update={
-        "submitted": max(0, record.submitted - voided) + len(builds),
-        "failed": max(0, record.failed - voided_failures),
-        "building": building + list(builds),
-        "failures": failures,
-        "data_loaded_at": None if before_load else (data_loaded_at or now),
-        "submitted_at": now,
-        "finished_at": None,
-    })
-
-
-def _stamp_data_loaded(job: MigrationJob, when: datetime) -> None:
-    """P4d: every table of the run has loaded its data by ``when``: a record whose builds
-    went in before the rows (``data_loaded_at`` cleared, :func:`_merge_index_builds`) takes
-    it. Anything else: unchanged."""
-    record = job.index_builds
-    if record is not None and record.submitted and record.data_loaded_at is None:
-        job.index_builds = record.model_copy(update={"data_loaded_at": when})
 
 
 def _fail_chunk(job: MigrationJob, chunk_id: str) -> None:
@@ -4481,40 +4397,6 @@ def _failed_build_failure(build: IndexBuild) -> str:
         f"{'UNIQUE ' if build.unique else ''}{build.index}: Aurora DSQL's build of the index "
         f"failed: {build.details or 'no details reported'}"
     )
-
-
-def _fold_builds_before_load(
-    job: MigrationJob,
-    reads: "Mapping",
-    read_at: datetime,
-    failed: "Collection[tuple[str, str]]",
-) -> None:
-    """P4d: one read of the builds submitted before the load, folded into the job's record as
-    the Data Migration step's watch folds it (P4b: a completed build is counted) -- except
-    that the ``failed`` ones ``(table, index)`` leave the record: the run reports each as an
-    index it could not create, with its table's index failures. The counts stay
-    ``submitted == completed + failed + len(building)``."""
-    from dsql_migrator.ui.data_migration._index_builds import fold_index_build_reads
-
-    record = job.index_builds
-    if record is None:
-        return
-    folded, _failed, _finished = fold_index_build_reads(record, reads, read_at)
-    gone = set(failed or ())
-    if gone:
-        building = [b for b in folded.building if (b.table, b.index) not in gone]
-        failures = [f for f in folded.failures if (f.table, f.index) not in gone]
-        dropped_failures = len(folded.failures) - len(failures)
-        dropped = len(folded.building) - len(building) + dropped_failures
-        folded = folded.model_copy(update={
-            "submitted": max(0, folded.submitted - dropped),
-            "failed": max(0, folded.failed - dropped_failures),
-            "building": building,
-            "failures": failures,
-            "finished_at": folded.finished_at
-            or (read_at if record.building and not building else None),
-        })
-    job.index_builds = folded
 
 
 def _wait_for_index_builds_before_load(
