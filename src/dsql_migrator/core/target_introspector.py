@@ -10,9 +10,12 @@ assembles a :class:`~dsql_migrator.core.models.TargetInventory` object tree
 object view (Requirement 10.1) and the pre-apply existence/conflict check
 (Requirement 10.3) used by the Schema Applier.
 
-Scope: this component is read-only and only ever touches the *target*. It does
-not access the source database and it does not execute any DDL/DML against the
-target -- applying converted DDL is the Schema Applier's responsibility.
+Scope: this module only ever touches the *target*; it does not access the source
+database. Its catalog reads (the :class:`TargetIntrospector` and the ``target_*`` /
+``read_*`` functions) are read-only. The one exception WRITES:
+:func:`sync_identity_sequences` runs ``ALTER TABLE ... ALTER COLUMN ... RESTART WITH``
+on each identity column after a load (Full Load, Validation and Cut over call it).
+Applying converted DDL is the Schema Applier's responsibility.
 
 Design seams:
 
