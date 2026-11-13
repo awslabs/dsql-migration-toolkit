@@ -14,13 +14,17 @@ only reference one set: the MySQL and PostgreSQL source plugins are mutually exc
 (``IsMySqlSource`` / ``IsPostgresSource``) and the offset-seeder Lambda seeds a MySQL
 binlog offset (``DeploySeederFunction`` ANDs ``IsMySqlSource``). The sink is shared.
 
-Bucket name is deterministic per identity: ``mysql-dsql-migrator-plugins-<account>-<region>``,
-so every tool build that deploys in an account and region shares it. The account ID in the
-name does NOT make the bucket this account's: anyone who knows the ID can create a bucket
-with that name first, in their own account. So every request to the bucket asserts this
-account as its owner (``ExpectedBucketOwner``, through
+The bucket is the tool's MANAGED bucket for the account and Region (:func:`managed_bucket_name`):
+``mysql-dsql-migrator-plugins-<account>-<region>-an``, in this account's S3 account regional
+namespace, which only this account can create a bucket in; or the EARLIER name
+``mysql-dsql-migrator-plugins-<account>-<region>`` (the global namespace) while a bucket by that
+name exists and is this account's, so an existing deployment keeps its bucket, and in the
+Regions with no such namespace. Every tool build that deploys in an account and Region shares
+it. The account ID in the earlier name does NOT make the bucket this account's: anyone who knows
+the ID can create a bucket with that name first, in their own account. So every request to the
+bucket asserts this account as its owner (``ExpectedBucketOwner``, through
 :class:`~dsql_migrator.core.s3_ownership.OwnedBucket`), and a bucket another account owns is
-refused (:class:`S3ProvisionError`), never adopted. Each artifact is uploaded to a
+never adopted. Each artifact is uploaded to a
 CONTENT-ADDRESSED key, ``cdc-plugins/<first 16 hex digits of its SHA-256>/<name>``: the
 key a deploy hands to its cdc-stack names the bytes that deploy hashed, and no other build
 writes different bytes there. Uploads are idempotent (skipped only when the object's size
@@ -37,16 +41,22 @@ the UI thread.
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
+from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.s3_ownership import (
+    BucketCreateDenied,
     BucketOwnershipError,
     OwnedBucket,
     caller_account_id,
+    is_access_denied,
+    is_missing,
     refusal_text,
 )
 
@@ -958,13 +968,282 @@ def get_account_id(sts_client: BotoSessionLike) -> str:
         raise S3ProvisionError(str(exc)) from exc
 
 
-def plugin_bucket_name(account_id: str, region: str) -> str:
-    """Return the deterministic managed-plugin bucket name for this identity.
+#: Regions with no S3 account regional namespace (Amazon S3 documentation): the managed
+#: bucket keeps its earlier, global-namespace name there.
+NO_ACCOUNT_REGIONAL_NAMESPACE = frozenset({"me-south-1", "me-central-1"})
+
+
+def earlier_plugin_bucket_name(account_id: str, region: str) -> str:
+    """The managed bucket's EARLIER name, in S3's global namespace (every version before the
+    account regional namespace used it, and the ECS Fargate app template still sets it for the
+    job and session state).
 
     Predictable from the account ID and Region, so the name says nothing about who owns the
     bucket: every request to it goes through an
     :class:`~dsql_migrator.core.s3_ownership.OwnedBucket` bound to the caller's own account."""
     return f"mysql-dsql-migrator-plugins-{account_id}-{region}"
+
+
+def regional_plugin_bucket_name(account_id: str, region: str) -> str:
+    """The managed bucket's name in this account's S3 account regional namespace (the earlier
+    name plus ``-an``): only this account can create a bucket by this name."""
+    return f"{earlier_plugin_bucket_name(account_id, region)}-an"
+
+
+# The managed bucket chosen for each (account, Region) in this process: chosen once, so every
+# part of the tool (Deploy CDC infrastructure, Start and Retry CDC, the ECS Fargate state
+# stores) uses the same one, and chosen again only when an earlier-named bucket it chose stops
+# answering as this account's (_still_usable).
+_MANAGED_BUCKETS: dict[tuple[str, str], str] = {}
+_MANAGED_LOCK = threading.Lock()
+
+
+def managed_bucket_name(
+    s3_client: BotoSessionLike,
+    account_id: str,
+    region: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """The tool's managed bucket in ``account_id`` and ``region``: it exists, and an
+    owner-checked request has just shown it to be this account's.
+
+    Chosen once per process for each account and Region (every request owner-checked):
+
+    1. A Region in :data:`NO_ACCOUNT_REGIONAL_NAMESPACE`: the earlier name, ensured as before
+       (created when absent; another account's is refused).
+    2. HeadBucket the regional name (:func:`regional_plugin_bucket_name`): 200 uses it. A 403
+       means this identity may not use it (an app stack template older than this version
+       grants only the earlier name).
+    3. HeadBucket the earlier name (:func:`earlier_plugin_bucket_name`): 200 uses it, so an
+       existing deployment keeps its bucket and the state in it (nothing is copied or moved).
+       A 403 (another account may hold the name) is never used.
+    4. Otherwise create the regional name in this account's regional namespace and use it.
+       Only when that CreateBucket is denied (or step 2 was a 403) and step 3 found no bucket
+       is the earlier name created instead, as before. Anything else is refused
+       (:class:`~dsql_migrator.core.s3_ownership.BucketOwnershipError`, naming both buckets).
+
+    Later calls check the chosen bucket again: the regional bucket is created again if it is
+    gone (only this account can); an earlier-named one that is gone or refused is never
+    created again, the choice is made again instead. The first choice is recorded in the
+    activity log, with why. Other errors (a network failure, throttling) propagate.
+    """
+    key = (account_id, region)
+    chosen: Optional[tuple[str, str, ActivityStatus]] = None
+    with _MANAGED_LOCK:
+        name = _MANAGED_BUCKETS.get(key)
+        if name is not None:
+            name = _still_usable(s3_client, account_id, region, name, sleep)
+        if name is None:
+            chosen = _choose_managed_bucket(s3_client, account_id, region, sleep)
+            name = _MANAGED_BUCKETS[key] = chosen[0]
+    if chosen is not None:
+        log_activity(
+            ActivityCategory.SYSTEM, "S3 bucket in use", status=chosen[2], target=name,
+            detail=chosen[1],
+        )
+    return name
+
+
+def _still_usable(
+    s3_client: Any, account_id: str, region: str, name: str, sleep: Callable[[float], None]
+) -> Optional[str]:
+    """``name``, the bucket chosen before, checked again owner-checked; ``None`` when an
+    earlier-named bucket in a Region with the regional namespace is gone (404) or refused
+    (403): it is never created again, the choice is made again. Caller holds the lock."""
+    bucket = OwnedBucket(s3_client, name, account_id)
+    if name == regional_plugin_bucket_name(account_id, region) or (
+        region in NO_ACCOUNT_REGIONAL_NAMESPACE
+    ):
+        bucket.ensure(region, sleep=sleep)
+        return name
+    try:
+        bucket.head()
+    except Exception as exc:  # noqa: BLE001 - classified below
+        if is_missing(exc) or is_access_denied(exc):
+            return None
+        raise
+    return name
+
+
+def _answer(bucket: OwnedBucket) -> Optional[BaseException]:
+    """An owner-checked HeadBucket: ``None`` for a 200, the error for a 404 or a 403; any
+    other error (a 400, a network failure) propagates."""
+    try:
+        bucket.head()
+    except Exception as exc:  # noqa: BLE001 - classified below
+        if is_missing(exc) or is_access_denied(exc):
+            return exc
+        raise
+    return None
+
+
+def _choose_managed_bucket(
+    s3_client: Any, account_id: str, region: str, sleep: Callable[[float], None]
+) -> tuple[str, str, ActivityStatus]:
+    """(name, why, activity status) by :func:`managed_bucket_name`'s rule. Caller holds the
+    lock."""
+    earlier = OwnedBucket(s3_client, earlier_plugin_bucket_name(account_id, region), account_id)
+    if region in NO_ACCOUNT_REGIONAL_NAMESPACE:
+        earlier.ensure(region, sleep=sleep)
+        return earlier.name, (
+            f"S3 bucket '{earlier.name}': {region} has no S3 account regional namespace, so "
+            "the tool uses the name earlier versions used; every request checks that this "
+            "account owns it"
+        ), ActivityStatus.INFO
+    regional = OwnedBucket(s3_client, regional_plugin_bucket_name(account_id, region), account_id)
+    regional_answer = _answer(regional)
+    if regional_answer is None:
+        return regional.name, (
+            f"S3 bucket '{regional.name}' (only this AWS account can create a bucket by this "
+            "name)"
+        ), ActivityStatus.INFO
+    earlier_answer = _answer(earlier)
+    if earlier_answer is None:
+        return earlier.name, (
+            f"S3 bucket '{earlier.name}': the tool keeps using the existing bucket earlier "
+            "versions created, which this account owns (every request checks that), and the "
+            "saved state in it"
+        ), ActivityStatus.INFO
+    earlier_missing = is_missing(earlier_answer)
+    denied: BaseException = regional_answer
+    if is_missing(regional_answer):
+        try:
+            regional.ensure(region, sleep=sleep)
+        except BucketCreateDenied as exc:
+            denied = exc
+        except BucketOwnershipError as exc:
+            raise BucketOwnershipError(
+                _no_managed_bucket_message(account_id, region, regional.name, exc,
+                                           earlier.name, earlier_answer)
+            ) from exc
+        else:
+            return regional.name, (
+                f"S3 bucket '{regional.name}', created in this account's S3 account regional "
+                "namespace (only this AWS account can create a bucket by this name)"
+            ), ActivityStatus.INFO
+    if not earlier_missing:
+        raise BucketOwnershipError(
+            _no_managed_bucket_message(account_id, region, regional.name, denied,
+                                       earlier.name, earlier_answer)
+        ) from denied
+    try:
+        earlier.ensure(region, sleep=sleep)
+    except BucketOwnershipError as exc:
+        raise BucketOwnershipError(
+            _no_managed_bucket_message(account_id, region, regional.name, denied,
+                                       earlier.name, exc)
+        ) from exc
+    return earlier.name, (
+        f"S3 bucket '{earlier.name}', created under the name earlier versions used, because "
+        f"this identity may not use '{regional.name}' in this account's S3 account regional "
+        "namespace (on ECS Fargate or EC2, an app stack template older than this version "
+        "grants only the earlier name); every request checks that this account owns it"
+    ), ActivityStatus.WARNING
+
+
+def _s3_answer(exc: BaseException) -> str:
+    return (str(exc).strip().splitlines() or [type(exc).__name__])[0].rstrip(".")
+
+
+def _no_managed_bucket_message(
+    account_id: str,
+    region: str,
+    regional: str,
+    regional_problem: BaseException,
+    earlier: str,
+    earlier_problem: BaseException,
+) -> str:
+    """The refusal when neither of the managed bucket's names can be used."""
+    if isinstance(regional_problem, BucketCreateDenied):
+        cause = regional_problem.__cause__ or regional_problem
+        regional_part = (
+            f"this identity may not create S3 bucket '{regional}', a name only this AWS "
+            f"account can create (CreateBucket: {_s3_answer(cause)})"
+        )
+    elif isinstance(regional_problem, BucketOwnershipError):
+        regional_part = f"S3 bucket '{regional}' could not be used: {regional_problem}"
+    else:
+        regional_part = (
+            f"S3 refused this identity a HeadBucket of '{regional}', a name only this AWS "
+            f"account can create (S3 answered: {_s3_answer(regional_problem)})"
+        )
+    if isinstance(earlier_problem, BucketOwnershipError):
+        earlier_part = (
+            f"'{earlier}', the name earlier versions used, does not exist in this account "
+            f"and could not be created instead: {earlier_problem}"
+        )
+    elif is_missing(earlier_problem):
+        earlier_part = (
+            f"'{earlier}', the name earlier versions used, does not exist in this account"
+        )
+    else:
+        earlier_part = (
+            f"S3 refused a HeadBucket of '{earlier}', the name earlier versions used, that "
+            f"required this account to own it (S3 answered: {_s3_answer(earlier_problem)}): "
+            "another AWS account may hold that name, or this identity may not reach it, so "
+            "the tool does not use it"
+        )
+    return (
+        f"The tool has no S3 bucket it can use in this account ({account_id}) and Region "
+        f"({region}), so it read and wrote nothing: {regional_part}; and {earlier_part}. "
+        f"Allow s3:CreateBucket and s3:ListBucket on '{regional}' for this identity (it is "
+        "created with s3:x-amz-bucket-namespace = account-regional; check SCPs and permissions "
+        "boundaries too); on ECS Fargate or EC2, update the app stack with this version's "
+        "template, which grants them. Then retry."
+    )
+
+
+class ManagedBucket(OwnedBucket):
+    """The managed bucket (:func:`managed_bucket_name`) bound to the account that owns it, for
+    a store that keeps state in it: its name is the bucket chosen for this account and Region
+    (chosen now when none is yet), and :meth:`ensure` checks it again by the same rule, so a
+    store follows the choice when it is made again (its name can change then)."""
+
+    def __init__(
+        self,
+        client: Any,
+        owner: str,
+        region: str,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__(client, regional_plugin_bucket_name(owner, region), owner)
+        self.region = region
+        self._sleep = sleep
+        with _MANAGED_LOCK:
+            name = _MANAGED_BUCKETS.get((owner, region))
+        if name is None:
+            name = managed_bucket_name(client, owner, region, sleep=sleep)
+            self.confirmed = True
+        self.name = name
+
+    def ensure(
+        self, region: Optional[str] = None, *, sleep: Optional[Callable[[float], None]] = None
+    ) -> None:
+        """:func:`managed_bucket_name` for this bucket's account and Region (``region`` is
+        that Region): the chosen bucket checked again, or chosen again, and this object
+        renamed to it."""
+        try:
+            self.name = managed_bucket_name(
+                self.client, self.owner, self.region, sleep=sleep or self._sleep
+            )
+        except Exception:
+            self.confirmed = False
+            raise
+        self.confirmed = True
+
+
+def state_bucket(
+    s3_client: Any, configured: str, owner: str, region: Optional[str]
+) -> OwnedBucket:
+    """The bucket a job or session state store (and the overlay ledger beside it) set to
+    ``configured`` uses, bound to ``owner``: the managed bucket (:class:`ManagedBucket`) when
+    ``configured`` is the managed bucket's earlier name for this account and Region -- what
+    the ECS Fargate app template sets -- else ``configured`` itself, owner-checked as given."""
+    if region and configured == earlier_plugin_bucket_name(owner, region):
+        return ManagedBucket(s3_client, owner, region)
+    return OwnedBucket(s3_client, configured, owner)
 
 
 def _repo_root() -> Path:
@@ -1000,15 +1279,12 @@ def _artifact_paths() -> tuple[Path, Path, Path, Path]:
 def ensure_plugin_bucket(
     s3_client: BotoSessionLike, account_id: str, region: str
 ) -> str:
-    """Return the managed plugin bucket name, creating it if absent; ``account_id`` (the
-    caller's own, from :func:`get_account_id`) must own it.
+    """Return the managed bucket's name (:func:`managed_bucket_name`), creating it when the
+    rule says to; ``account_id`` (the caller's own, from :func:`get_account_id`) must own it.
 
-    :meth:`OwnedBucket.ensure <dsql_migrator.core.s3_ownership.OwnedBucket.ensure>`: an
-    owner-checked ``head_bucket``; on a 404, ``create_bucket`` with the region's quirk
-    handled (us-east-1 rejects a ``LocationConstraint``), then the owner-checked
-    ``head_bucket`` again. A bucket we already own is fine (idempotent). A name another
-    account owns (a 403 to the owner-checked request, or ``BucketAlreadyExists``) is refused,
-    never adopted, and so is any other failure: :class:`S3ProvisionError`.
+    Every request is owner-checked. A name another account owns (a 403 to the owner-checked
+    request, or ``BucketAlreadyExists``) is never adopted, and any failure is an
+    :class:`S3ProvisionError`.
     """
     return _ensured_bucket(s3_client, account_id, region).name
 
@@ -1018,17 +1294,20 @@ def _ensured_bucket(
 ) -> OwnedBucket:
     """:func:`ensure_plugin_bucket`'s bucket, bound to ``account_id`` and confirmed to be its
     (:attr:`OwnedBucket.confirmed`), for the uploads that follow it."""
-    bucket = plugin_bucket_name(account_id, region)
     try:
-        owned = OwnedBucket(s3_client, bucket, account_id)
-        owned.ensure(region)
+        owned = OwnedBucket(
+            s3_client, managed_bucket_name(s3_client, account_id, region), account_id
+        )
     except BucketOwnershipError as exc:
         raise S3ProvisionError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise S3ProvisionError(
-            f"Could not check or create plugin bucket '{bucket}': "
+            "Could not check or create the tool's S3 bucket "
+            f"('{regional_plugin_bucket_name(account_id, region)}', or "
+            f"'{earlier_plugin_bucket_name(account_id, region)}' while it exists): "
             f"{(str(exc).splitlines() or [type(exc).__name__])[0]}"
         ) from exc
+    owned.confirmed = True  # managed_bucket_name has just reached it, owner-checked
     return owned
 
 
@@ -1317,7 +1596,12 @@ __all__ = [
     "build_s3_client",
     "build_sts_client",
     "get_account_id",
-    "plugin_bucket_name",
+    "NO_ACCOUNT_REGIONAL_NAMESPACE",
+    "ManagedBucket",
+    "earlier_plugin_bucket_name",
+    "regional_plugin_bucket_name",
+    "managed_bucket_name",
+    "state_bucket",
     "ensure_plugin_bucket",
     "upload_plugin",
     "ensure_and_upload_plugins",

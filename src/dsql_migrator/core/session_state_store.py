@@ -52,9 +52,11 @@ from dsql_migrator.core.models import (
 from dsql_migrator.core.s3_ownership import (
     CallerAccountError,
     OwnedBucket,
+    error_code,
     refusal_text,
     session_caller_account,
 )
+from dsql_migrator.core.s3_provision import state_bucket
 
 
 class SessionSnapshot(BaseModel):
@@ -620,12 +622,19 @@ class S3SessionStateStore:
 
     def _ops(self) -> OwnedBucket:
         """The bucket bound to the account that must own it: every request through it
-        asserts that account (raises ``BucketOwnershipError`` while it cannot be read)."""
+        asserts that account (raises ``BucketOwnershipError`` while it cannot be read). The
+        managed bucket when the configured name is its earlier name for this account and
+        Region (:func:`~dsql_migrator.core.s3_provision.state_bucket`)."""
         owned = self._owned
         if owned is None:
-            owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
             self._owned = owned
         return owned
+
+    def _bucket_name(self) -> str:
+        """The bucket in use (the managed bucket's chosen name, once bound), for messages."""
+        owned = self._owned
+        return owned.name if owned is not None else self._bucket
 
     def _ensure_bucket(self) -> None:
         """Create the bucket if absent and confirm this account owns it (idempotent): a
@@ -648,7 +657,14 @@ class S3SessionStateStore:
         runs, that of a bucket another account took over). So a bucket another account owns is
         recorded after an STS failure at startup as well. The next save or prune checks the
         bucket again (``_ensure_bucket``) instead of trusting the earlier check, so the bucket
-        is used again once this account owns it."""
+        is used again once this account owns it.
+
+        A bucket deleted while the app runs (NoSuchBucket) is checked again too: the managed
+        bucket is then chosen again (an earlier-named one is never created again), and a
+        bucket set by name is created again, as at startup."""
+        if error_code(exc) == "NoSuchBucket":
+            with self._lock:
+                self._ensured = False
         refusal = refusal_text(exc, self._owned)
         if refusal is None:
             return False
@@ -719,13 +735,15 @@ class S3SessionStateStore:
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; must never break the UI
             if not self._log_refusal(
-                f"Could not persist session {snapshot.session_id} to s3://{self._bucket}", exc
+                f"Could not persist session {snapshot.session_id} to "
+                f"s3://{self._bucket_name()}",
+                exc,
             ):
                 _LOGGER.warning(
                     "Could not persist session %s to s3://%s (resume may not work "
                     "after a restart)",
                     snapshot.session_id,
-                    self._bucket,
+                    self._bucket_name(),
                     exc_info=True,
                 )
 
@@ -759,7 +777,7 @@ class S3SessionStateStore:
         if not done:
             _LOGGER.warning(
                 "Session snapshots not uploaded to s3://%s within %ss: %s",
-                self._bucket, timeout, ", ".join(unwritten),
+                self._bucket_name(), timeout, ", ".join(unwritten),
             )
         return done
 
@@ -783,14 +801,14 @@ class S3SessionStateStore:
             payload = obj["Body"].read().decode("utf-8")
         except Exception as exc:  # noqa: BLE001
             if self._log_refusal(
-                f"Could not read session {session_id} from s3://{self._bucket}", exc
+                f"Could not read session {session_id} from s3://{self._bucket_name()}", exc
             ):
                 return None
             if not self._is_absent(exc):
                 _LOGGER.warning(
                     "Could not read session %s from s3://%s",
                     session_id,
-                    self._bucket,
+                    self._bucket_name(),
                     exc_info=True,
                 )
             return None
@@ -813,12 +831,12 @@ class S3SessionStateStore:
             self._ops().delete(self._key(session_id))
         except Exception as exc:  # noqa: BLE001 - best-effort
             if not self._log_refusal(
-                f"Could not delete session {session_id} from s3://{self._bucket}", exc
+                f"Could not delete session {session_id} from s3://{self._bucket_name()}", exc
             ):
                 _LOGGER.warning(
                     "Could not delete session %s from s3://%s",
                     session_id,
-                    self._bucket,
+                    self._bucket_name(),
                     exc_info=True,
                 )
 
@@ -845,9 +863,11 @@ class S3SessionStateStore:
                     deleted.append(session_id)
             return deleted
         except Exception as exc:  # noqa: BLE001 - best-effort; skip pruning on error
-            if not self._log_refusal(f"Could not prune sessions in s3://{self._bucket}", exc):
+            if not self._log_refusal(
+                f"Could not prune sessions in s3://{self._bucket_name()}", exc
+            ):
                 _LOGGER.warning(
-                    "Could not prune sessions in s3://%s", self._bucket, exc_info=True
+                    "Could not prune sessions in s3://%s", self._bucket_name(), exc_info=True
                 )
             return []
 

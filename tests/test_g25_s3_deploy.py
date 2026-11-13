@@ -59,7 +59,9 @@ from dsql_migrator.core.s3_provision import (
 
 _REGION = "us-east-1"
 _ACCOUNT = "123456789012"
-_BUCKET = s3_provision.plugin_bucket_name(_ACCOUNT, _REGION)
+# The managed bucket a deploy chooses here: the -an name (this fake answers every HeadBucket).
+_BUCKET = s3_provision.regional_plugin_bucket_name(_ACCOUNT, _REGION)
+_EARLIER_BUCKET = s3_provision.earlier_plugin_bucket_name(_ACCOUNT, _REGION)
 _STACK = "dsql-cdc-g25"
 _BASE_KEYS = (DEBEZIUM_PLUGIN_KEY, DEBEZIUM_PG_PLUGIN_KEY, DSQL_SINK_PLUGIN_KEY, LAMBDA_SEEDER_KEY)
 # The cdc-stack parameters that locate (or name) a plugin artifact.
@@ -715,7 +717,7 @@ def _statements(template: dict, role: str) -> list[dict]:
     return out
 
 
-def _resolved(resource) -> str:
+def _resolved(resource, bucket: str) -> str:
     if isinstance(resource, dict):  # only Fn::Sub can name these objects
         resource = resource.get("Fn::Sub", "")
         if isinstance(resource, list):  # Fn::Sub: [template, {variables}]
@@ -725,7 +727,7 @@ def _resolved(resource) -> str:
         "AWS::Partition": "aws",
         "AWS::AccountId": _ACCOUNT,
         "AWS::Region": _REGION,
-        "PluginBucketArn": f"arn:aws:s3:::{_BUCKET}",
+        "PluginBucketArn": f"arn:aws:s3:::{bucket}",
     }
     for name, value in names.items():
         text = text.replace("${" + name + "}", value)
@@ -757,8 +759,12 @@ def _iam_matches(pattern: str, arn: str) -> bool:
 )
 def test_the_plugin_roles_cover_the_content_addressed_keys(template, role, action) -> None:
     statements = _statements(_load_template(template), role)
+    # The app templates grant the managed bucket's earlier name (a deployment keeps that
+    # bucket while it exists, and the tool falls back to creating it where the -an name is
+    # not granted).
+    bucket = _EARLIER_BUCKET
     for base_key in _BASE_KEYS:
-        arn = f"arn:aws:s3:::{_BUCKET}/{s3_provision._content_key(base_key, '0' * 64)}"
+        arn = f"arn:aws:s3:::{bucket}/{s3_provision._content_key(base_key, '0' * 64)}"
         granted = False
         for st in statements:
             actions = st.get("Action")
@@ -766,7 +772,7 @@ def test_the_plugin_roles_cover_the_content_addressed_keys(template, role, actio
             resources = st.get("Resource")
             resources = resources if isinstance(resources, list) else [resources]
             if st.get("Effect") == "Allow" and action in actions and any(
-                _iam_matches(_resolved(r), arn) for r in resources
+                _iam_matches(_resolved(r, bucket), arn) for r in resources
             ):
                 granted = True
         assert granted, (template, role, action, arn)

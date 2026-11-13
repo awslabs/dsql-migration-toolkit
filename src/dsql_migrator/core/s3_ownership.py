@@ -3,13 +3,17 @@
 
 """S3 bucket ownership for the bucket names the tool derives.
 
-The tool names its managed bucket after the account and region,
-``mysql-dsql-migrator-plugins-<account>-<region>``
-(:func:`~dsql_migrator.core.s3_provision.plugin_bucket_name`; the ECS Fargate app template
-derives the same name for its job and session state). Such a name can be predicted, and a bucket
-name does not say which account owns the bucket: anyone who knows the account ID can create a
-bucket with that name in their own account first, and a request that names it then reaches
-THEIR bucket.
+The tool names its managed bucket after the account and region:
+``mysql-dsql-migrator-plugins-<account>-<region>-an``, a name in this account's S3 account
+regional namespace, which only this account can create, or the earlier
+``mysql-dsql-migrator-plugins-<account>-<region>`` in the global namespace
+(:func:`~dsql_migrator.core.s3_provision.managed_bucket_name` picks one; the ECS Fargate app
+template sets the earlier name for its job and session state). A global-namespace name can be
+predicted, and a bucket name does not say which account owns the bucket: anyone who knows the
+account ID can create a bucket with that name in their own account first, and a request that
+names it then reaches THEIR bucket. :meth:`OwnedBucket.ensure` creates a name of the form
+``<prefix>-<this account>-<region>-an`` in this account's regional namespace
+(``BucketNamespace=account-regional``).
 
 So every request the tool sends to a bucket whose name it derived carries ``ExpectedBucketOwner``
 = the caller's own account ID, read with ``sts:GetCallerIdentity`` (which needs no IAM
@@ -52,6 +56,13 @@ from typing import Any, Callable, Iterator, Optional
 
 # ExpectedBucketOwner takes an AWS account ID: 12 digits (S3 accepts no other form).
 _ACCOUNT_ID = re.compile(r"\d{12}")
+
+# A bucket in an S3 account regional namespace is named <prefix>-<account>-<region>-an, and
+# CreateBucket makes it there only when it sends this namespace (x-amz-bucket-namespace).
+ACCOUNT_REGIONAL_NAMESPACE = "account-regional"
+_ACCOUNT_REGIONAL_SUFFIX = re.compile(
+    r"-(?P<account>\d{12})-(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+)-an\Z"
+)
 
 # A status code in an error's text, not inside a longer number (an account ID, say).
 _STATUS_403 = re.compile(r"(?<!\d)403(?!\d)")
@@ -108,6 +119,20 @@ class BucketOwnershipError(RuntimeError):
 class CallerAccountError(BucketOwnershipError):
     """The caller's own AWS account ID could not be read (or was not a 12-digit ID), so no
     request was sent to the bucket: there was no owner to assert. S3 refused nothing."""
+
+
+class BucketCreateDenied(BucketOwnershipError):
+    """CreateBucket answered 403: no bucket by that name was found for this account, and this
+    identity may not create one (an SCP, a permissions boundary, no s3:CreateBucket)."""
+
+
+def account_regional_region(name: str, owner: str) -> Optional[str]:
+    """The Region in ``name`` when it is a bucket name in ``owner``'s S3 account regional
+    namespace (``<prefix>-<owner>-<region>-an``); ``None`` for any other name."""
+    match = _ACCOUNT_REGIONAL_SUFFIX.search(name or "")
+    if match is None or match.group("account") != owner:
+        return None
+    return match.group("region")
 
 
 def _first_line(exc: BaseException) -> str:
@@ -181,6 +206,18 @@ def not_owned_message(bucket: str, owner: str, exc: Optional[BaseException] = No
     request = f"a {operation} request" if operation else "a request"
     allows = f"allows {permission} on it" if permission else "allows the request"
     answer = f" S3 answered: {_first_line(exc).rstrip('.')}." if exc is not None else ""
+    if account_regional_region(bucket, owner) is not None:
+        # A name in this account's regional namespace: no other account can create it, so a
+        # 403 is this identity's permissions, not another account's bucket.
+        return (
+            f"This identity cannot reach S3 bucket '{bucket}', so the tool did not use it: S3 "
+            f"refused {request} that required this account ({owner}) to own it, so that "
+            f"request read and wrote nothing.{answer} The bucket is in this account's S3 "
+            "account regional namespace, where only this account can create a bucket, so "
+            f"check that this identity's IAM policy {allows}, and check SCPs and permissions "
+            "boundaries too; on ECS Fargate or EC2, update the app stack with this version's "
+            "template, which grants it."
+        )
     return (
         f"S3 bucket '{bucket}' is owned by another AWS account, or this identity cannot reach "
         f"it, so the tool did not use it: S3 refused {request} that required this account "
@@ -210,6 +247,12 @@ def create_denied_message(bucket: str, owner: str, exc: BaseException) -> str:
         "any bucket by that name and wrote nothing. Allow s3:CreateBucket on it for this "
         "identity (check SCPs and permissions boundaries too), or create the bucket in this "
         "account yourself, then retry."
+        + (
+            " The tool creates it in this account's S3 account regional namespace, so a policy "
+            "condition on s3:x-amz-bucket-namespace applies to it as well."
+            if account_regional_region(bucket, owner) is not None
+            else ""
+        )
     )
 
 
@@ -374,9 +417,12 @@ class OwnedBucket:
         bucket, or this identity cannot reach it) raises :class:`BucketOwnershipError` and
         creates nothing; a 404 creates the bucket (with the Region's LocationConstraint; a
         bucket in us-east-1 takes none) and checks it again, which must then answer 200.
-        CreateBucket ``BucketAlreadyExists`` raises :class:`BucketOwnershipError`, never an
-        adoption; ``BucketAlreadyOwnedByYou`` goes on to that check like a new bucket. Any other
-        error propagates.
+        A name in this account's regional namespace (:func:`account_regional_region`) is
+        created there (``BucketNamespace=account-regional``), in the Region its name carries
+        when ``region`` is ``None``. CreateBucket ``BucketAlreadyExists`` raises
+        :class:`BucketOwnershipError`, never an adoption; a 403 raises
+        :class:`BucketCreateDenied`; ``BucketAlreadyOwnedByYou`` goes on to that check like a
+        new bucket. Any other error propagates.
         """
         try:
             self.head()
@@ -388,14 +434,17 @@ class OwnedBucket:
                 ) from exc
             if not is_missing(exc):
                 raise
+        namespace_region = account_regional_region(self.name, self.owner)
+        region = region or namespace_region
+        create: dict[str, Any] = {"Bucket": self.name}
+        if region and region != "us-east-1":
+            create["CreateBucketConfiguration"] = {"LocationConstraint": region}
+        if namespace_region is not None:
+            # Only this account can create a name in its regional namespace, and S3 creates
+            # the bucket there only when the request says so.
+            create["BucketNamespace"] = ACCOUNT_REGIONAL_NAMESPACE
         try:
-            if region and region != "us-east-1":
-                self.client.create_bucket(
-                    Bucket=self.name,
-                    CreateBucketConfiguration={"LocationConstraint": region},
-                )
-            else:
-                self.client.create_bucket(Bucket=self.name)
+            self.client.create_bucket(**create)
         except Exception as exc:  # noqa: BLE001 - classified below
             if _code_is(exc, "BucketAlreadyOwnedByYou"):
                 pass  # an earlier create, or a race: checked below like a new bucket
@@ -407,7 +456,7 @@ class OwnedBucket:
                 # A denied CreateBucket is this identity's permissions (an SCP, a boundary,
                 # no s3:CreateBucket), not another account's bucket: that answers
                 # BucketAlreadyExists. Fail closed all the same, with the cause it is.
-                raise BucketOwnershipError(
+                raise BucketCreateDenied(
                     create_denied_message(self.name, self.owner, exc)
                 ) from exc
             else:
@@ -445,10 +494,13 @@ def refusal_text(exc: BaseException, bucket: OwnedBucket | None = None) -> Optio
 
 
 __all__ = [
+    "ACCOUNT_REGIONAL_NAMESPACE",
+    "BucketCreateDenied",
     "BucketOwnershipError",
     "CallerAccount",
     "CallerAccountError",
     "OwnedBucket",
+    "account_regional_region",
     "already_exists_message",
     "caller_account_id",
     "create_denied_message",

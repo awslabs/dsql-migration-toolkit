@@ -39,9 +39,11 @@ from dsql_migrator.core.models import MigrationJob
 from dsql_migrator.core.s3_ownership import (
     CallerAccountError,
     OwnedBucket,
+    error_code,
     refusal_text,
     session_caller_account,
 )
+from dsql_migrator.core.s3_provision import state_bucket
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -298,12 +300,19 @@ class S3JobStore:
 
     def _ops(self) -> OwnedBucket:
         """The bucket bound to the account that must own it: every request through it
-        asserts that account (raises ``BucketOwnershipError`` while it cannot be read)."""
+        asserts that account (raises ``BucketOwnershipError`` while it cannot be read). The
+        managed bucket when the configured name is its earlier name for this account and
+        Region (:func:`~dsql_migrator.core.s3_provision.state_bucket`)."""
         owned = self._owned
         if owned is None:
-            owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
             self._owned = owned
         return owned
+
+    def _bucket_name(self) -> str:
+        """The bucket in use (the managed bucket's chosen name, once bound), for messages."""
+        owned = self._owned
+        return owned.name if owned is not None else self._bucket
 
     def _ensure_bucket(self) -> None:
         """Create the bucket if absent and confirm this account owns it (idempotent): a
@@ -326,7 +335,14 @@ class S3JobStore:
         runs, that of a bucket another account took over). So a bucket another account owns is
         recorded after an STS failure at startup as well. The next save, restore or prune
         checks the bucket again (``_ensure_bucket``) instead of trusting the earlier check, so
-        the bucket is used again once this account owns it."""
+        the bucket is used again once this account owns it.
+
+        A bucket deleted while the app runs (NoSuchBucket) is checked again too: the managed
+        bucket is then chosen again (an earlier-named one is never created again), and a
+        bucket set by name is created again, as at startup."""
+        if error_code(exc) == "NoSuchBucket":
+            with self._lock:
+                self._ensured = False
         refusal = refusal_text(exc, self._owned)
         if refusal is None:
             return False
@@ -397,13 +413,13 @@ class S3JobStore:
                 self._last_put[job.job_id] = self._clock()
         except Exception as exc:  # noqa: BLE001 - best-effort; must never break the UI
             if not self._log_refusal(
-                f"Could not persist job {job.job_id} to s3://{self._bucket}", exc
+                f"Could not persist job {job.job_id} to s3://{self._bucket_name()}", exc
             ):
                 _LOGGER.warning(
                     "Could not persist job %s to s3://%s (resume may not work after a "
                     "restart)",
                     job.job_id,
-                    self._bucket,
+                    self._bucket_name(),
                     exc_info=True,
                 )
 
@@ -420,9 +436,9 @@ class S3JobStore:
                         entries.append((obj["Key"], obj.get("LastModified") or epoch))
             entries.sort(key=lambda kv: kv[1])  # oldest update first (protocol)
         except Exception as exc:  # noqa: BLE001 - no store yet / transient; nothing to load
-            if not self._log_refusal(f"Could not list jobs in s3://{self._bucket}", exc):
+            if not self._log_refusal(f"Could not list jobs in s3://{self._bucket_name()}", exc):
                 _LOGGER.warning(
-                    "Could not list jobs in s3://%s", self._bucket, exc_info=True
+                    "Could not list jobs in s3://%s", self._bucket_name(), exc_info=True
                 )
             return out
         for key, _ in entries:
@@ -440,12 +456,12 @@ class S3JobStore:
             self._ops().delete(self._key(job_id))
         except Exception as exc:  # noqa: BLE001 - best-effort
             if not self._log_refusal(
-                f"Could not delete job {job_id} from s3://{self._bucket}", exc
+                f"Could not delete job {job_id} from s3://{self._bucket_name()}", exc
             ):
                 _LOGGER.warning(
                     "Could not delete job %s from s3://%s",
                     job_id,
-                    self._bucket,
+                    self._bucket_name(),
                     exc_info=True,
                 )
         with self._lock:
@@ -484,9 +500,9 @@ class S3JobStore:
                 deleted.append(job_id)
             return deleted
         except Exception as exc:  # noqa: BLE001 - best-effort; skip pruning on error
-            if not self._log_refusal(f"Could not prune jobs in s3://{self._bucket}", exc):
+            if not self._log_refusal(f"Could not prune jobs in s3://{self._bucket_name()}", exc):
                 _LOGGER.warning(
-                    "Could not prune jobs in s3://%s", self._bucket, exc_info=True
+                    "Could not prune jobs in s3://%s", self._bucket_name(), exc_info=True
                 )
             return []
 

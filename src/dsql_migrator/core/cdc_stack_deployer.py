@@ -270,11 +270,12 @@ class CdcStackDeployer:
         self._session = session
         # When the cdc-stack template exceeds CloudFormation's 51,200-byte inline
         # TemplateBody limit, it must be uploaded to S3 and passed as TemplateURL.
-        # The caller sets this to the managed plugin bucket NAME (already provisioned
-        # for the connector artifacts) so the deployer can stage the template there.
+        # The caller sets this to the managed bucket's NAME (s3_provision's
+        # managed_bucket_name, checked and created when missing with the app's own identity)
+        # so the deployer can stage the template there.
         self.template_s3_bucket: Optional[str] = None
         # This deployer's own account (sts:GetCallerIdentity), read once: the owner the
-        # template upload asserts, and the account Start CDC names the bucket after.
+        # template upload asserts.
         self._caller_account = CallerAccount(lambda: self._client("sts"))
         # The bucket the template was last staged in, bound to that account: kept, so a
         # Start's preflight (preflight_template) and the update after it share what the
@@ -347,10 +348,15 @@ class CdcStackDeployer:
             if refusal is not None:
                 raise CdcDeployError(f"{not_staged}: {refusal}") from exc
             if is_missing(exc):
+                # Start CDC, Retry CDC and Deploy CDC infrastructure each check the tool's
+                # bucket (and create it when missing) before staging, so this is a bucket
+                # deleted since: running the action again creates it. Nothing here calls for
+                # deleting the CDC infrastructure (that drops the stream position).
                 raise CdcDeployError(
-                    f"{not_staged}: S3 bucket '{bucket_name}' does not exist. Deploy CDC "
-                    "infrastructure creates it; if it was deleted after that, delete the CDC "
-                    "infrastructure and deploy it again."
+                    f"{not_staged}: S3 bucket '{bucket_name}' does not exist (it was deleted "
+                    "after the tool checked it). Run the action again: Start CDC, Retry CDC "
+                    "and Deploy CDC infrastructure check the bucket first and create it when "
+                    "it is missing. Nothing was deleted."
                 ) from exc
             raise CdcDeployError(
                 f"{not_staged}: could not upload it to S3 bucket '{bucket_name}': "

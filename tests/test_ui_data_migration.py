@@ -3850,11 +3850,13 @@ def test_start_cdc_deploy_defers_blocking_setup_to_the_job_body(monkeypatch) -> 
 
     calls = {"deployer": 0, "template": 0, "run": 0}
 
+    from tests.test_s3_bucket_owner import fake_app_identity
+
+    # The Start CDC worker chooses (and creates) the managed bucket with the app's identity.
+    fake_app_identity(monkeypatch, "111122223333")
+
     class _Deployer:
         template_s3_bucket = ""
-
-        def caller_account_id(self):  # the Start CDC worker's bucket lookup (STS, once)
-            return "111122223333"
 
     def _build(*_a, **_k):
         calls["deployer"] += 1
@@ -4016,11 +4018,13 @@ def _run_start_cdc_capture(
     details: list = []
     events: list = []
 
+    from tests.test_s3_bucket_owner import fake_app_identity
+
+    # The Start CDC worker chooses (and creates) the managed bucket with the app's identity.
+    fake_app_identity(monkeypatch, "111122223333")
+
     class _Deployer:
         template_s3_bucket = ""
-
-        def caller_account_id(self):  # the Start CDC worker's bucket lookup (STS, once)
-            return "111122223333"
 
     if describe_params is not None:
         _Deployer.describe_stack_or_none = (
@@ -20057,11 +20061,13 @@ def test_start_cdc_job_proceeds_when_the_target_has_no_enforced_foreign_keys(
         def notify(self, *_a, **_k):
             return None
 
+    from tests.test_s3_bucket_owner import fake_app_identity
+
+    # The Start CDC worker chooses (and creates) the managed bucket with the app's identity.
+    fake_app_identity(monkeypatch, "123456789012")
+
     class _Deployer:
         template_s3_bucket = ""
-
-        def caller_account_id(self):  # the Start CDC worker's bucket lookup (STS, once)
-            return "123456789012"
 
     ran = {"start": 0}
     monkeypatch.setattr(_cdcui, "_log_cdc_event", lambda *a, **k: None)

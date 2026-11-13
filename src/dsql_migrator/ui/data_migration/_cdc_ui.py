@@ -9615,25 +9615,37 @@ def _start_cdc_deploy(
             region, aws_profile=aws_profile, assume_role_arn=assume_role_arn
         )
         # The cdc-stack template exceeds CFn's 51,200-byte inline limit, so the deployer
-        # stages it in S3 via TemplateURL, in the tool's managed bucket for the deployer's own
-        # account and region (the bucket the infra deploy created). The deployer reads that
-        # account once, and its upload asserts it as the bucket's owner, so a bucket another
-        # account holds under that name is refused. Both stop the Start HERE, before anything
-        # changes: a Start that cannot read the account, and a template that cannot be staged
+        # stages it in S3 via TemplateURL, in the tool's managed bucket for this account and
+        # region. The bucket is chosen (managed_bucket_name: the -an bucket, or the earlier
+        # name while it exists and is this account's) and created when missing with the APP's
+        # identity, as Deploy CDC infrastructure does -- the deploy role may not list or create
+        # it -- so a Start no longer meets a missing bucket. The deployer's upload then asserts
+        # its own account as the bucket's owner, so a bucket another account holds under that
+        # name is refused. All of it stops the Start HERE, before anything changes: a Start
+        # that cannot read the account or use the bucket, and a template that cannot be staged
         # -- staged once now (preflight_template), ahead of the overlay below (it ALTERs the
         # target and writes the ledger) and of run_cdc_start's Kafka prep; the update stages
         # it again, owner-checked, right before its call. Through _start_refusal like the
         # other worker refusals: the job keeps 300 characters, and the fix comes last.
+        from dsql_migrator.core import s3_provision as _s3p
         from dsql_migrator.core.cdc_deployer import CdcDeployError
-        from dsql_migrator.core.s3_ownership import BucketOwnershipError
-        from dsql_migrator.core.s3_provision import plugin_bucket_name as _pbucket
 
         try:
-            deployer.template_s3_bucket = _pbucket(deployer.caller_account_id(), region)
-        except BucketOwnershipError as exc:
+            _account = _s3p.get_account_id(_s3p.build_sts_client(aws_profile, region))
+        except _s3p.S3ProvisionError as exc:
             raise _start_refusal(
                 migration_state,
                 ("error", "", "The AWS account of this identity could not be read", str(exc)),
+                getattr(handle, "job_id", None),
+            ) from exc
+        try:
+            deployer.template_s3_bucket = _s3p.ensure_plugin_bucket(
+                _s3p.build_s3_client(aws_profile, region), _account, region
+            )
+        except _s3p.S3ProvisionError as exc:
+            raise _start_refusal(
+                migration_state,
+                ("error", "", "The tool's S3 bucket could not be used", str(exc)),
                 getattr(handle, "job_id", None),
             ) from exc
         template_body = _read_cdc_template_body()

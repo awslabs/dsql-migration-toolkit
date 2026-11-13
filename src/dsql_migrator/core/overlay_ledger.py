@@ -47,9 +47,11 @@ from dsql_migrator.core.column_exclusion import set_digest
 from dsql_migrator.core.s3_ownership import (
     BucketOwnershipError,
     OwnedBucket,
+    error_code,
     refusal_text,
     session_caller_account,
 )
+from dsql_migrator.core.s3_provision import state_bucket
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import TargetConnectionConfig
@@ -641,18 +643,23 @@ class S3OverlayLedger(_BlobLedger):
 
     def _ops(self) -> OwnedBucket:
         """The bucket bound to the account that must own it (raises BucketOwnershipError
-        while that account cannot be read)."""
+        while that account cannot be read): the session store's, the managed bucket when the
+        configured name is its earlier name for this account and Region
+        (:func:`~dsql_migrator.core.s3_provision.state_bucket`)."""
         if self._owned is None:
-            self._owned = OwnedBucket(self._s3(), self._bucket, self._owner.get())
+            self._owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
         return self._owned
 
     def _object_key(self, key: str) -> str:
         return f"{self._prefix}{key}.json"
 
-    @staticmethod
-    def _refused(exc: BaseException, ops: OwnedBucket) -> BaseException:
+    def _refused(self, exc: BaseException, ops: OwnedBucket) -> BaseException:
         """``exc`` as the bucket's refusal when it is one (a 403 to the owner-checked request),
-        so a read's ``unreadable`` error and a write's failure say what to do."""
+        so a read's ``unreadable`` error and a write's failure say what to do. A bucket deleted
+        while the app runs (NoSuchBucket) is bound again on the next request, so the ledger
+        follows the session store when that store chooses the managed bucket again."""
+        if error_code(exc) == "NoSuchBucket":
+            self._owned = None
         refusal = refusal_text(exc, ops)
         return BucketOwnershipError(refusal) if refusal is not None else exc
 

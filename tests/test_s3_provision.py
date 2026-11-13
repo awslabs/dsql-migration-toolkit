@@ -16,8 +16,9 @@ from dsql_migrator.core.s3_provision import (
     ensure_and_upload_plugins,
     ensure_plugin_bucket,
     extract_secret_name,
+    earlier_plugin_bucket_name,
     get_account_id,
-    plugin_bucket_name,
+    regional_plugin_bucket_name,
     upload_plugin,
 )
 
@@ -80,14 +81,19 @@ def _upload(s3, *args, **kwargs) -> None:
 
 
 # ---------------------------------------------------------------------------
-# plugin_bucket_name / get_account_id
+# the managed bucket's names / get_account_id
 # ---------------------------------------------------------------------------
 
 
-def test_plugin_bucket_name_is_deterministic() -> None:
+def test_the_managed_bucket_names_are_deterministic() -> None:
     assert (
-        plugin_bucket_name("123", "us-east-1")
+        earlier_plugin_bucket_name("123", "us-east-1")
         == "mysql-dsql-migrator-plugins-123-us-east-1"
+    )
+    # The account regional namespace's form: <prefix>-<account>-<region>-an.
+    assert (
+        regional_plugin_bucket_name("123", "us-east-1")
+        == "mysql-dsql-migrator-plugins-123-us-east-1-an"
     )
 
 
@@ -103,7 +109,7 @@ def test_get_account_id() -> None:
 def test_ensure_bucket_noop_when_exists() -> None:
     s3 = _FakeS3(bucket_exists=True)
     name = ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
-    assert name == f"mysql-dsql-migrator-plugins-{_ACCOUNT}-us-east-1"
+    assert name == f"mysql-dsql-migrator-plugins-{_ACCOUNT}-us-east-1-an"
     assert not any(c[0] == "create_bucket" for c in s3.calls)
     # The probe asserted this account as the owner: a 200 now means it is ours.
     assert s3.calls == [("head_bucket", {"Bucket": name, "ExpectedBucketOwner": _ACCOUNT})]
@@ -114,8 +120,12 @@ def test_ensure_bucket_creates_when_absent_us_east_1() -> None:
     ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
     create = next(c for c in s3.calls if c[0] == "create_bucket")
     assert "CreateBucketConfiguration" not in create[1]
-    # ...and checked again, as this account's, once created.
-    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket", "head_bucket"]
+    assert create[1]["BucketNamespace"] == "account-regional"
+    # Neither name is there (the -an one, then the earlier one), so the -an one is created
+    # -- checked once more just before -- and checked again, as this account's, once created.
+    assert [c[0] for c in s3.calls] == [
+        "head_bucket", "head_bucket", "head_bucket", "create_bucket", "head_bucket"
+    ]
 
 
 def test_ensure_bucket_creates_with_constraint_other_region() -> None:
@@ -131,7 +141,9 @@ def test_ensure_bucket_already_owned_is_ok() -> None:
         "mysql-dsql-migrator-plugins"
     )
     # Ours, and still shown to be ours by the owner-checked HeadBucket after it.
-    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket", "head_bucket"]
+    assert [c[0] for c in s3.calls] == [
+        "head_bucket", "head_bucket", "head_bucket", "create_bucket", "head_bucket"
+    ]
 
 
 def test_ensure_bucket_other_account_raises() -> None:
@@ -141,17 +153,20 @@ def test_ensure_bucket_other_account_raises() -> None:
         ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
     assert "already exists in another AWS account" in str(exc.value)
     assert "AWS Support" in str(exc.value)
-    assert [c[0] for c in s3.calls] == ["head_bucket", "create_bucket"]
+    assert [c[0] for c in s3.calls] == [
+        "head_bucket", "head_bucket", "head_bucket", "create_bucket"
+    ]
 
 
 def test_ensure_bucket_owned_by_another_account_is_refused_not_adopted() -> None:
     # FAILS WITHOUT THE FIX: a HeadBucket that answered 200 returned the bucket, whoever owned
     # it. With this account asserted as the owner, another account's bucket answers 403.
+    # This fake answers 403 for both of the managed bucket's names.
     s3 = _FakeS3(bucket_exists=True, foreign=True)
     with pytest.raises(S3ProvisionError) as exc:
         ensure_plugin_bucket(s3, _ACCOUNT, "us-east-1")
-    assert "owned by another AWS account" in str(exc.value)
-    assert [c[0] for c in s3.calls] == ["head_bucket"]  # no create is tried
+    assert "another AWS account may hold that name" in str(exc.value)
+    assert [c[0] for c in s3.calls] == ["head_bucket", "head_bucket"]  # no create is tried
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +409,7 @@ def test_ensure_and_upload_returns_result(tmp_path: Path, monkeypatch) -> None:
     )
     s3 = _FakeS3(head_object=None)  # always upload
     result = ensure_and_upload_plugins(s3, _FakeSts(), "us-east-1")
-    assert result.bucket_name == "mysql-dsql-migrator-plugins-123456789012-us-east-1"
+    assert result.bucket_name == "mysql-dsql-migrator-plugins-123456789012-us-east-1-an"
     assert result.bucket_arn.endswith(result.bucket_name)
     assert result.debezium_key.endswith("debezium-mysql-plugin.zip")
     # No source_engine was passed, so the engine is unknown here and ALL FOUR artifacts

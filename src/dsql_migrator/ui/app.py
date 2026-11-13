@@ -1458,7 +1458,8 @@ def _render_activity_log_controls(activity_log_path: str) -> None:
 
 def _build_overlay_ledger(config, s3_cls, sqlite_cls):
     """The overlay ledger for this deployment: S3 with a session-state bucket (durable
-    across a task replacement), else the local SQLite session-state file."""
+    across a task replacement; the same setting and Region as the session store, so it
+    resolves to the same managed bucket), else the local SQLite session-state file."""
     if config.session_state_bucket:
         return s3_cls(
             config.session_state_bucket,
@@ -1557,7 +1558,9 @@ def main() -> None:
     from dsql_migrator.core.job_store import S3JobStore, SqliteJobStore
 
     # A DURABLE S3 store (when a bucket is configured -- the container deploy points
-    # DSQL_MIGRATOR_JOB_STATE_BUCKET at the tool's managed plugin bucket) survives a
+    # DSQL_MIGRATOR_JOB_STATE_BUCKET at the tool's managed plugin bucket, by its earlier
+    # name, which the store reads as "the managed bucket": core.s3_provision.state_bucket
+    # resolves it on first use, as CDC does) survives a
     # Fargate task replacement, so an interrupted Full Load AND the per-table
     # migration monitor resume across a redeploy instead of being lost with the
     # task's EPHEMERAL /tmp SQLite file. Local dev (no bucket) keeps the on-disk

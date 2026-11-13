@@ -699,7 +699,12 @@ def test_the_teardown_guides_delete_the_plugin_bucket_no_stack_owns(suffix: str)
     # links to §Teardown, already said so.
     from dsql_migrator.core import s3_provision
 
-    assert s3_provision.plugin_bucket_name("<account>", "<region>") == _PLUGIN_BUCKET
+    # The guides' teardown names the managed bucket's earlier name (the -an name is added
+    # with the guides' account-regional update).
+    assert s3_provision.earlier_plugin_bucket_name("<account>", "<region>") == _PLUGIN_BUCKET
+    assert s3_provision.regional_plugin_bucket_name("<account>", "<region>") == (
+        f"{_PLUGIN_BUCKET}-an"
+    )
     templates = [*DEPLOY.glob("*.yaml"), *DEPLOY.glob("cdc-stack/*.yaml")]
     assert len(templates) >= 4, templates
     for path in templates:

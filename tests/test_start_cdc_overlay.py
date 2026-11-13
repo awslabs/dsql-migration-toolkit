@@ -356,30 +356,35 @@ def test_the_dialog_probe_lists_the_statements_or_says_it_cannot():
 def _drive_start_cdc(monkeypatch, *, overlay_raises=False, run_raises=False, backstop_raises=False,
                      exclude=False, cancel_in_overlay=False, swap_target=False,
                      account_unreadable=False, template_refused=False, seen=None,
-                     deployer=None, template="T"):
+                     deployer=None, template="T", app_s3=None):
     import dsql_migrator.config as _config
     import dsql_migrator.core.cdc_deployer as _dep
+    import dsql_migrator.core.s3_provision as _s3p
     import dsql_migrator.ui.data_migration._cdc_ui as _cdcui
     from dsql_migrator.core.models import SourceType, TableSelection
     from dsql_migrator.ui.data_migration import DataMigrationState
 
+    from tests.test_s3_bucket_owner import OwnerCheckingS3
     from tests.test_ui_data_migration import _inventory
 
     order = []
 
-    class _Deployer:
-        template_s3_bucket = ""
-
-        def caller_account_id(self):  # the bucket the template is staged in (STS, once)
+    class _AppSts:  # the APP's identity: the account the managed bucket is named after (STS)
+        def get_caller_identity(self):
             order.append("account")
             if account_unreadable:
-                from dsql_migrator.core.s3_ownership import BucketOwnershipError
+                raise RuntimeError("ExpiredToken: The security token is expired")
+            return {"Account": "111122223333"}
 
-                raise BucketOwnershipError(
-                    "Could not read this identity's AWS account ID (sts:GetCallerIdentity: "
-                    "ExpiredToken)."
-                )
-            return "111122223333"
+    # The app's own S3 client, which chooses (and creates) the managed bucket before staging.
+    app_s3 = app_s3 if app_s3 is not None else OwnerCheckingS3()
+    monkeypatch.setattr(_s3p, "build_sts_client", lambda *_a, **_k: _AppSts())
+    monkeypatch.setattr(_s3p, "build_s3_client", lambda *_a, **_k: app_s3)
+    if seen is not None:
+        seen["app_s3"] = app_s3
+
+    class _Deployer:
+        template_s3_bucket = ""
 
         def preflight_template(self, body):  # stages the template before anything changes
             order.append(("template", body))
@@ -480,8 +485,11 @@ def test_the_overlay_runs_after_the_backstops_and_before_the_deployer(monkeypatc
     seen: dict = {}
     order, error = _drive_start_cdc(monkeypatch, seen=seen)
     assert error is None
-    # The template goes to the managed bucket of the deployer's own account and region.
-    assert seen["deployer"].template_s3_bucket == "mysql-dsql-migrator-plugins-111122223333-us-east-1"
+    # The template goes to the managed bucket of this account and region, which the app's own
+    # identity created (in the account regional namespace) because neither name was there.
+    regional = "mysql-dsql-migrator-plugins-111122223333-us-east-1-an"
+    assert seen["deployer"].template_s3_bucket == regional
+    assert set(seen["app_s3"].buckets) == {regional}
     # The deployer is built (and describes the stack) BEFORE the overlay, so the
     # exclusion-set staleness refusal runs before anything changes; connectors are only
     # created by run_cdc_start, after the overlay. The account that names the template's
@@ -517,26 +525,87 @@ def test_a_start_whose_template_cannot_be_staged_stops_before_anything_changes(m
     assert "overlay" not in order and "run_cdc_start" not in order
 
 
-def test_a_start_against_another_accounts_bucket_changes_nothing(monkeypatch):
-    # The REAL deployer, its template (over the inline limit) and a bucket by the managed name
-    # that another account owns: refused at the preflight, before the overlay.
+def _real_deployer(s3):
+    """The REAL deployer, whose identity is the app's (a local run), with a CloudFormation
+    that has no such stack yet."""
     from types import SimpleNamespace as _NS
 
     from dsql_migrator.core.cdc_stack_deployer import CdcStackDeployer
-    from tests.test_s3_bucket_owner import _BIG, OwnerCheckingS3, _foreign, _Sts
+    from tests.test_s3_bucket_owner import _Sts
+
+    def _describe_stacks(**_kw):
+        raise RuntimeError("Stack with id dsql-cdc does not exist")
+
+    clients = {"s3": s3, "sts": _Sts(), "cloudformation": _NS(describe_stacks=_describe_stacks)}
+    return CdcStackDeployer(
+        "us-east-1", session=_NS(client=lambda name, region_name=None: clients[name])
+    )
+
+
+def test_a_start_against_another_accounts_bucket_changes_nothing(monkeypatch):
+    # The REAL deployer, its template (over the inline limit), the managed bucket's earlier
+    # name held by another account, and an identity the -an name is not granted to (an app
+    # stack template older than this version): no bucket is this account's to use, so the
+    # Start is refused before the overlay, and nothing is staged anywhere.
+    from tests.test_s3_bucket_owner import _BIG, OwnerCheckingS3, _foreign
 
     s3 = OwnerCheckingS3()
     theirs = _foreign(s3)
-    real = CdcStackDeployer(
-        "us-east-1",
-        session=_NS(client=lambda name, region_name=None: {"s3": s3, "sts": _Sts()}[name]),
+    regional = "mysql-dsql-migrator-plugins-111122223333-us-east-1-an"
+    s3.no_grant = {regional}
+    order, error = _drive_start_cdc(
+        monkeypatch, deployer=_real_deployer(s3), template=_BIG, exclude=True, app_s3=s3
     )
-    order, error = _drive_start_cdc(monkeypatch, deployer=real, template=_BIG, exclude=True)
     assert isinstance(error, RuntimeError)
-    assert "mysql-dsql-migrator-plugins-111122223333-us-east-1" in str(error)
-    assert "a PutObject request" in str(error) and "s3:PutObject" in str(error)
+    pointer, notice = str(error).split("\n", 1)
+    assert pointer.startswith("Start CDC blocked: The tool's S3 bucket could not be used.")
+    assert "mysql-dsql-migrator-plugins-111122223333-us-east-1'" in notice
+    assert f"'{regional}'" in notice and "another AWS account may hold that name" in notice
     assert "overlay" not in order and "run_cdc_start" not in order
-    assert s3.ops() == ["PutObject"] and theirs.objects == {} and s3.violations == []
+    assert s3.ops() == ["HeadBucket", "HeadBucket"]  # no create, no PutObject
+    assert theirs.objects == {} and s3.violations == []
+
+
+def test_a_start_stages_its_template_in_the_regional_bucket_when_the_earlier_name_is_taken(
+    monkeypatch,
+):
+    # FAILS WITHOUT THE FIX: Start CDC derived the earlier name, which another account holds,
+    # and its staging was refused, so CDC could not start in this account and Region. Now the
+    # app's identity creates the -an bucket (only this account can) and the template goes
+    # there; the other account's bucket gets nothing.
+    from tests.test_s3_bucket_owner import _BIG, OwnerCheckingS3, _foreign
+
+    s3 = OwnerCheckingS3()
+    theirs = _foreign(s3)
+    regional = "mysql-dsql-migrator-plugins-111122223333-us-east-1-an"
+    seen: dict = {}
+    order, error = _drive_start_cdc(
+        monkeypatch, deployer=_real_deployer(s3), template=_BIG, app_s3=s3, seen=seen
+    )
+    assert error is None and "run_cdc_start" in order
+    assert seen["deployer"].template_s3_bucket == regional
+    assert list(s3.buckets[regional].objects) == ["cdc-plugins/cdc-stack.yaml"]
+    assert theirs.objects == {} and s3.reads == [] and s3.violations == []
+
+
+def test_a_start_creates_a_missing_managed_bucket_before_it_stages_the_template(monkeypatch):
+    # FAILS WITHOUT THE FIX: a local run or an EC2 host whose bucket is gone (or that never
+    # had one under the name this version derives) was refused at staging -- "does not exist
+    # ... delete the CDC infrastructure and deploy it again", which drops the stream
+    # position. Start (and Retry) now create the managed bucket with the app's own identity
+    # before they stage.
+    from tests.test_s3_bucket_owner import _BIG, OwnerCheckingS3
+
+    s3 = OwnerCheckingS3()
+    regional = "mysql-dsql-migrator-plugins-111122223333-us-east-1-an"
+    order, error = _drive_start_cdc(
+        monkeypatch, deployer=_real_deployer(s3), template=_BIG, exclude=True, app_s3=s3
+    )
+    assert error is None and order.index("overlay") < order.index("run_cdc_start")
+    create = next(p for op, p in s3.calls if op == "CreateBucket")
+    assert create["Bucket"] == regional and create["BucketNamespace"] == "account-regional"
+    assert "cdc-plugins/cdc-stack.yaml" in s3.buckets[regional].objects
+    assert s3.violations == []
 
 
 def test_a_start_with_overlay_columns_marks_the_ledger_in_use_before_submit(monkeypatch):

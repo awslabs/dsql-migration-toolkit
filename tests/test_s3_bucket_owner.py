@@ -66,9 +66,10 @@ from dsql_migrator.core.s3_ownership import (
 )
 from dsql_migrator.core.s3_provision import (
     S3ProvisionError,
+    earlier_plugin_bucket_name,
     ensure_and_upload_plugins,
     ensure_plugin_bucket,
-    plugin_bucket_name,
+    regional_plugin_bucket_name,
     upload_plugin,
 )
 from dsql_migrator.core.session_state_store import S3SessionStateStore, SessionSnapshot
@@ -76,7 +77,14 @@ from dsql_migrator.core.session_state_store import S3SessionStateStore, SessionS
 _ME = "111122223333"
 _THEM = "444455556666"
 _REGION = "us-east-1"
-_BUCKET = plugin_bucket_name(_ME, _REGION)
+# The managed bucket's earlier name (the global namespace's, which another account can create
+# first) and its name in this account's S3 account regional namespace.
+_BUCKET = earlier_plugin_bucket_name(_ME, _REGION)
+_REGIONAL = regional_plugin_bucket_name(_ME, _REGION)
+# A state bucket set to a name of the operator's own is used as given (owner-checked): the case
+# in which the state stores below refuse a bucket another account holds. (A setting equal to
+# the managed bucket's earlier name means the managed bucket, which the tool chooses.)
+_CUSTOM = "team-migration-state"
 _SRC = Path(__file__).resolve().parents[1] / "src" / "dsql_migrator"
 
 
@@ -157,6 +165,13 @@ class OwnerCheckingS3:
         self.head_denied = False
         # Operations this identity's IAM policy denies, in a bucket it owns too (403).
         self.iam_denied: set[str] = set()
+        # Buckets this identity's IAM policy grants nothing on (an app stack template older
+        # than this version grants only the earlier name): every request to one is a 403,
+        # CreateBucket included, whether or not the bucket exists.
+        self.no_grant: set[str] = set()
+        # Buckets this identity may not create (CreateBucket answers AccessDenied: an SCP that
+        # forbids the account regional namespace, say), though it may list them.
+        self.create_denied: set[str] = set()
 
     # -- set-up ---------------------------------------------------------------
     def bucket(self, name: str, owner: Optional[str] = None, **kw) -> _Bucket:
@@ -172,6 +187,8 @@ class OwnerCheckingS3:
         expected = params.get("ExpectedBucketOwner")
         if expected is None:
             self.violations.append(operation)
+        if params["Bucket"] in self.no_grant:
+            raise _error(operation, "403" if head else "AccessDenied", 403)
         bucket = self.buckets.get(params["Bucket"])
         if bucket is None:
             raise _error(operation, "404" if head else "NoSuchBucket", 404)
@@ -203,6 +220,8 @@ class OwnerCheckingS3:
     def create_bucket(self, **params):
         self.calls.append(("CreateBucket", dict(params)))
         name = params["Bucket"]
+        if name in self.no_grant or name in self.create_denied:
+            raise _error("CreateBucket", "AccessDenied", 403, "Access Denied")
         location = (params.get("CreateBucketConfiguration") or {}).get("LocationConstraint")
         if (location or "us-east-1") != self.region:
             raise _error("CreateBucket", "IllegalLocationConstraintException", 400)
@@ -267,6 +286,26 @@ class ManagedOwnerCheckingS3(OwnerCheckingS3):
         bucket.objects[Key] = (Path(Filename).read_bytes(), dict(params.get("Metadata") or {}))
 
 
+class AppIdentityS3(OwnerCheckingS3):
+    """:class:`OwnerCheckingS3` for a bucket in any Region: the app's own identity, with which
+    Start CDC chooses (and creates) the managed bucket before it stages its template."""
+
+    def create_bucket(self, **params):
+        location = (params.get("CreateBucketConfiguration") or {}).get("LocationConstraint")
+        self.region = location or "us-east-1"
+        return super().create_bucket(**params)
+
+
+def fake_app_identity(monkeypatch, account: str = _ME) -> OwnerCheckingS3:
+    """The app's own identity (``s3_provision.build_s3_client`` / ``build_sts_client``) as a
+    fake S3 and STS for ``account``, for a test that runs the Start CDC worker. Returns the
+    fake S3."""
+    s3 = AppIdentityS3(caller=account)
+    monkeypatch.setattr(s3_provision, "build_s3_client", lambda *_a, **_k: s3)
+    monkeypatch.setattr(s3_provision, "build_sts_client", lambda *_a, **_k: _Sts(account))
+    return s3
+
+
 class _Sts:
     def __init__(self, account: str = _ME) -> None:
         self.account = account
@@ -316,7 +355,7 @@ def test_the_error_classes_follow_s3s_answers() -> None:
     assert not is_missing(_error("PutObject", "SlowDown", 503))
     assert not is_access_denied(_error("PutObject", "SlowDown", 503))
     # A status code inside the account ID in a message is not a status.
-    unreachable = f"could not connect to {plugin_bucket_name('123404567890', 'x')}"
+    unreachable = f"could not connect to {earlier_plugin_bucket_name('123404567890', 'x')}"
     assert not is_missing(RuntimeError(unreachable))
     assert is_missing(RuntimeError("404 Not Found"))
 
@@ -444,10 +483,13 @@ def test_no_module_calls_s3_except_through_the_owned_bucket() -> None:
         if calls:
             offenders[str(path.relative_to(_SRC))] = calls
     assert offenders == {}
-    # ...and the modules that reach the derived bucket do go through it.
-    for name in ("s3_provision", "cdc_stack_deployer", "job_store", "session_state_store",
-                 "overlay_ledger"):
+    # ...and the modules that reach the derived bucket do go through it (the state stores
+    # through s3_provision.state_bucket, which binds an OwnedBucket or the ManagedBucket).
+    for name in ("s3_provision", "cdc_stack_deployer"):
         assert "OwnedBucket(" in (_SRC / "core" / f"{name}.py").read_text(encoding="utf-8"), name
+    for name in ("job_store", "session_state_store", "overlay_ledger"):
+        source = (_SRC / "core" / f"{name}.py").read_text(encoding="utf-8")
+        assert "= state_bucket(self._s3(), self._bucket, self._owner.get()" in source, name
 
 
 def test_every_s3_call_in_the_owned_bucket_asserts_the_owner() -> None:
@@ -515,19 +557,26 @@ def _artifacts(tmp_path: Path, monkeypatch) -> dict[str, Path]:
 
 
 @pytest.mark.parametrize("client", [OwnerCheckingS3, ManagedOwnerCheckingS3])
-def test_a_plugin_bucket_another_account_owns_is_refused_not_adopted(
+def test_a_plugin_bucket_another_account_holds_under_the_earlier_name_is_never_used(
     client, tmp_path: Path, monkeypatch
 ) -> None:
-    # FAILS WITHOUT THE FIX: HeadBucket answered 200 (the squatter's policy lets us in) and the
-    # bucket was adopted; the four artifacts went into it and their keys into the cdc-stack.
+    # FAILS WITHOUT THE FIX: before v0.1.587, HeadBucket answered 200 (the squatter's policy
+    # lets us in) and the bucket was adopted: the four artifacts went into it and their keys
+    # into the cdc-stack. v0.1.587 refused it, and Deploy CDC infrastructure could not go on
+    # in this account and Region at all. Now the tool creates its bucket in this account's S3
+    # account regional namespace, where no other account can create one, and the other
+    # account's bucket gets nothing.
     _artifacts(tmp_path, monkeypatch)
     s3 = client()
     theirs = _foreign(s3)
-    with pytest.raises(S3ProvisionError) as exc:
-        ensure_and_upload_plugins(s3, _Sts(), _REGION, source_engine=SourceType.MYSQL)
-    _assert_refusal(str(exc.value))
-    assert s3.ops() == ["HeadBucket"]  # no create, no upload
-    assert theirs.objects == {}
+    result = ensure_and_upload_plugins(s3, _Sts(), _REGION, source_engine=SourceType.MYSQL)
+    assert (result.bucket_name, result.bucket_arn) == (_REGIONAL, f"arn:aws:s3:::{_REGIONAL}")
+    assert s3.ops()[:5] == ["HeadBucket", "HeadBucket", "HeadBucket", "CreateBucket", "HeadBucket"]
+    assert [p["Bucket"] for _op, p in s3.calls[:2]] == [_REGIONAL, _BUCKET]
+    assert s3.calls[3][1]["BucketNamespace"] == "account-regional"
+    assert {p["Bucket"] for _op, p in s3.calls[2:]} == {_REGIONAL}
+    assert s3.buckets[_REGIONAL].owner == _ME and len(s3.buckets[_REGIONAL].objects) == 3
+    assert theirs.objects == {} and s3.reads == []
     assert s3.violations == []
 
 
@@ -547,24 +596,36 @@ def test_a_pre_seeded_plugin_in_another_accounts_bucket_is_never_used(
             b"!" * len(data), {"sha256": digest}
         )
     planted = dict(theirs.objects)
-    with pytest.raises(S3ProvisionError):
-        ensure_and_upload_plugins(s3, _Sts(), _REGION)
+    result = ensure_and_upload_plugins(s3, _Sts(), _REGION)
     assert theirs.objects == planted
-    assert "HeadObject" not in s3.ops()
+    # Each object is proven (and uploaded) in this account's own -an bucket only.
+    assert {p["Bucket"] for op, p in s3.calls if op in ("HeadObject", "PutObject")} == {
+        _REGIONAL
+    }
+    stored = s3.buckets[_REGIONAL].objects
+    assert {stored[k][0] for k in (result.debezium_key, result.dsql_sink_key)} == {
+        files[s3_provision.DEBEZIUM_PLUGIN_KEY].read_bytes(),
+        files[s3_provision.DSQL_SINK_PLUGIN_KEY].read_bytes(),
+    }
     assert s3.violations == []
 
 
 def test_bucket_already_exists_at_create_is_refused(tmp_path: Path, monkeypatch) -> None:
-    # HeadBucket found nothing, and another account created the name before our CreateBucket.
+    # HeadBucket found nothing, and another account created the name before our CreateBucket:
+    # in a Region with no account regional namespace, where the tool still creates its bucket
+    # under the earlier, global-namespace name.
     _artifacts(tmp_path, monkeypatch)
-    s3 = OwnerCheckingS3()
+    region = "me-south-1"
+    name = earlier_plugin_bucket_name(_ME, region)
+    s3 = OwnerCheckingS3(region=region)
     s3.squatter_creates_first = _THEM
     with pytest.raises(S3ProvisionError) as exc:
-        ensure_and_upload_plugins(s3, _Sts(), _REGION)
-    _assert_refusal(str(exc.value))
+        ensure_and_upload_plugins(s3, _Sts(), region)
+    _assert_refusal(str(exc.value), name)
     assert "BucketAlreadyExists" in str(exc.value)
     assert s3.ops() == ["HeadBucket", "CreateBucket"]
-    assert s3.buckets[_BUCKET].objects == {}
+    assert "BucketNamespace" not in s3.calls[1][1]
+    assert s3.buckets[name].objects == {}
 
 
 @pytest.mark.parametrize("region", ["eu-west-1", "us-east-1"])
@@ -572,7 +633,7 @@ def test_a_bucket_this_account_already_owns_is_accepted_after_the_owner_check(re
     # BucketAlreadyOwnedByYou (us-east-1: a 200) is ours, and passes the owner-checked
     # HeadBucket after it like a new bucket. Here the first HeadBucket was a 404 (a race).
     s3 = OwnerCheckingS3(region=region)
-    name = plugin_bucket_name(_ME, region)
+    name = regional_plugin_bucket_name(_ME, region)
     real_head = s3.head_bucket
     first = {"done": False}
 
@@ -585,31 +646,34 @@ def test_a_bucket_this_account_already_owns_is_accepted_after_the_owner_check(re
         return real_head(**params)
 
     s3.head_bucket = racing_head  # type: ignore[method-assign]
-    assert ensure_plugin_bucket(s3, _ME, region) == name
+    OwnedBucket(s3, name, _ME).ensure(region, sleep=lambda _s: None)
     assert s3.ops() == ["HeadBucket", "CreateBucket", "HeadBucket"]
+    assert s3.calls[1][1]["BucketNamespace"] == "account-regional"
     assert s3.calls[0][1]["ExpectedBucketOwner"] == s3.calls[-1][1]["ExpectedBucketOwner"] == _ME
     assert s3.violations == []
 
 
 def test_a_bucket_this_account_may_create_but_not_reach_is_refused() -> None:
     s3 = OwnerCheckingS3(region="eu-west-1")
-    name = plugin_bucket_name(_ME, "eu-west-1")
+    name = earlier_plugin_bucket_name(_ME, "eu-west-1")
     s3.bucket(name)
     s3.head_denied = True
-    with pytest.raises(S3ProvisionError) as exc:
-        ensure_plugin_bucket(s3, _ME, "eu-west-1")
+    with pytest.raises(BucketOwnershipError) as exc:
+        OwnedBucket(s3, name, _ME).ensure("eu-west-1", sleep=lambda _s: None)
     _assert_refusal(str(exc.value), name)
     assert "s3:ListBucket" in str(exc.value)
     assert "CreateBucket" not in s3.ops()
 
 
-def _refused_after_create(already_owned: bool) -> tuple[OwnerCheckingS3, str]:
+def _refused_after_create(
+    already_owned: bool, name: Optional[str] = None
+) -> tuple[OwnerCheckingS3, str]:
     """A bucket whose first HeadBucket answers 404 and whose HeadBucket after CreateBucket
     answers 403: created by this call (and this identity may not list it), or there already,
     in this account (CreateBucket: BucketAlreadyOwnedByYou), yet refused to that check."""
     region = "eu-west-1"
     s3 = OwnerCheckingS3(region=region)
-    name = plugin_bucket_name(_ME, region)
+    name = name or earlier_plugin_bucket_name(_ME, region)
     if not already_owned:
         s3.iam_denied = {"HeadBucket"}  # the missing bucket answers 404 before IAM is asked
         return s3, name
@@ -645,7 +709,7 @@ def test_a_bucket_the_check_after_create_refuses_is_refused_not_adopted(already_
     s3, name = _refused_after_create(already_owned)
     with pytest.raises(S3ProvisionError):
         ensure_plugin_bucket(s3, _ME, "eu-west-1")
-    s3, name = _refused_after_create(already_owned)
+    s3, name = _refused_after_create(already_owned, _CUSTOM)
     store = S3JobStore(name, region="eu-west-1", s3_client=s3, sts_client=_Sts())
     store.save(_job("j1"), None)
     assert "PutObject" not in s3.ops() and s3.buckets[name].objects == {}
@@ -655,7 +719,7 @@ def test_a_bucket_the_check_after_create_refuses_is_refused_not_adopted(already_
 @pytest.mark.parametrize("region", ["us-east-1", "ap-northeast-2"])
 def test_a_missing_bucket_is_created_then_verified(region) -> None:
     s3 = OwnerCheckingS3(region=region)
-    name = plugin_bucket_name(_ME, region)
+    name = earlier_plugin_bucket_name(_ME, region)
     s3.new_bucket_misses = 1  # a brand-new bucket is not found for a moment
     sleeps: list[float] = []
     OwnedBucket(s3, name, _ME).ensure(region, sleep=sleeps.append)
@@ -694,11 +758,11 @@ def test_every_provisioning_request_asserts_the_owner(client, tmp_path: Path, mo
     files = _artifacts(tmp_path, monkeypatch)
     s3 = client()
     result = ensure_and_upload_plugins(s3, _Sts(), _REGION)
-    assert result.bucket_name == _BUCKET
+    assert result.bucket_name == _REGIONAL
     assert {op for op in s3.ops()} == {"HeadBucket", "CreateBucket", "HeadObject", "PutObject"}
     assert s3.violations == []
     assert all(p.get("ExpectedBucketOwner") == _ME for op, p in s3.calls if op != "CreateBucket")
-    stored = s3.buckets[_BUCKET].objects
+    stored = s3.buckets[_REGIONAL].objects
     assert {stored[k][0] for k in (result.debezium_key, result.dsql_sink_key)} == {
         files[s3_provision.DEBEZIUM_PLUGIN_KEY].read_bytes(),
         files[s3_provision.DSQL_SINK_PLUGIN_KEY].read_bytes(),
@@ -771,12 +835,16 @@ def test_a_real_boto3_client_sends_the_expected_owner_on_every_request(
 def test_the_infra_deploy_creates_no_stack_in_another_accounts_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
+    # Another account holds the earlier name, and this identity may not use the -an name (an
+    # app stack template older than this version grants only the earlier one): no bucket is
+    # this account's to use, so the deploy stops before any stack is created.
     from dsql_migrator.core.cdc_deployer import run_cdc_infra_deploy
     from tests.test_g25_s3_deploy import _Handle, _mysql_infra_params
 
     _artifacts(tmp_path, monkeypatch)
     s3 = OwnerCheckingS3()
-    _foreign(s3)
+    theirs = _foreign(s3)
+    s3.no_grant = {_REGIONAL}
     created: list = []
     deployer = SimpleNamespace(
         region=_REGION, template_s3_bucket=None,
@@ -791,7 +859,10 @@ def test_the_infra_deploy_creates_no_stack_in_another_accounts_bucket(
             on_log=lambda _ts, msg: log.append(msg), region=_REGION,
             s3_client=s3, sts_client=_Sts(), sleep=lambda _s: None,
         )
-    _assert_refusal(str(exc.value))
+    text = str(exc.value)
+    assert f"'{_REGIONAL}'" in text and f"'{_BUCKET}'" in text, text  # names both buckets
+    assert "another AWS account may hold that name" in text and "Then retry." in text
+    assert "CreateBucket" not in s3.ops() and theirs.objects == {}
     assert created == [] and deployer.template_s3_bucket is None
     assert any("another AWS account" in line for line in log)  # the deploy log says why
 
@@ -825,7 +896,7 @@ def _deployer(s3: OwnerCheckingS3, sts=None, region: str = _REGION):
     clients = {"s3": s3, "sts": sts or _Sts(), "cloudformation": cfn}
     session = SimpleNamespace(client=lambda name, region_name=None: clients[name])
     deployer = CdcStackDeployer(region, session=session)
-    deployer.template_s3_bucket = plugin_bucket_name(_ME, region)
+    deployer.template_s3_bucket = earlier_plugin_bucket_name(_ME, region)
     return deployer, cfn
 
 
@@ -879,11 +950,11 @@ def test_start_cdc_updates_no_stack_from_another_accounts_template_bucket() -> N
 
     cfn = g25._FakeCfn(g25._deployed("mysql", "content"))
     s3 = OwnerCheckingS3(caller=g25._ACCOUNT)
-    theirs = s3.bucket(g25._BUCKET, _THEM, lets_me_in=True)
+    theirs = s3.bucket(g25._EARLIER_BUCKET, _THEM, lets_me_in=True)
     session = g25._FakeSession(cfn)
     session._clients.update({"s3": s3, "sts": _Sts(g25._ACCOUNT)})
     deployer = CdcStackDeployer(g25._REGION, session=session)
-    deployer.template_s3_bucket = g25._BUCKET
+    deployer.template_s3_bucket = g25._EARLIER_BUCKET
     params = build_cdc_stack_params(
         DebeziumSourceConfig(name="mysql-source", table_include_list=["shop.orders"]),
         SinkConnectorConfig(name="mysql-sink", topics=["shop.orders"], dlq_topic="dsql-sink-dlq"),
@@ -897,7 +968,7 @@ def test_start_cdc_updates_no_stack_from_another_accounts_template_bucket() -> N
             on_log=lambda _ts, msg: log.append(msg), template_body=_BIG,
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0, sleep=lambda _s: None,
         )
-    _assert_refusal(str(exc.value), g25._BUCKET)
+    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET)
     assert cfn.updates == []
     assert theirs.objects == {}
     assert any("another AWS account" in line for line in log)
@@ -915,11 +986,16 @@ def test_a_template_upload_without_the_account_is_refused() -> None:
 
 
 def test_a_missing_template_bucket_says_what_to_do() -> None:
+    # FAILS WITHOUT THE FIX: the refusal told the operator to delete the CDC infrastructure and
+    # deploy it again -- which drops the stream position -- although Start CDC, Retry CDC and
+    # Deploy CDC infrastructure now each create a missing bucket before they stage.
     s3 = OwnerCheckingS3()
     deployer, cfn = _deployer(s3)
     with pytest.raises(CdcDeployError) as exc:
         deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
-    assert "does not exist" in str(exc.value) and "Deploy CDC" in str(exc.value)
+    text = str(exc.value)
+    assert "does not exist" in text and "Start CDC" in text and "Deploy CDC" in text
+    assert "delete the CDC infrastructure" not in text and "Nothing was deleted." in text
     assert "update_stack" not in cfn.calls
 
 
@@ -978,11 +1054,11 @@ def test_start_cdc_refuses_another_accounts_template_bucket_before_the_kafka_pre
 
     cfn = g25._FakeCfn(g25._deployed("mysql", "content"))
     s3 = OwnerCheckingS3(caller=g25._ACCOUNT)
-    theirs = s3.bucket(g25._BUCKET, _THEM, lets_me_in=True)
+    theirs = s3.bucket(g25._EARLIER_BUCKET, _THEM, lets_me_in=True)
     session = g25._FakeSession(cfn)
     session._clients.update({"s3": s3, "sts": _Sts(g25._ACCOUNT)})
     deployer = CdcStackDeployer(g25._REGION, session=session)
-    deployer.template_s3_bucket = g25._BUCKET
+    deployer.template_s3_bucket = g25._EARLIER_BUCKET
     params = build_cdc_stack_params(
         DebeziumSourceConfig(name="mysql-source", table_include_list=["shop.orders"]),
         SinkConnectorConfig(name="mysql-sink", topics=["shop.orders"], dlq_topic="dsql-sink-dlq"),
@@ -998,7 +1074,7 @@ def test_start_cdc_refuses_another_accounts_template_bucket_before_the_kafka_pre
             seed_fn=lambda *a, **k: seeded.append(k) or "seeded",
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0, sleep=lambda _s: None,
         )
-    _assert_refusal(str(exc.value), g25._BUCKET)
+    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET)
     assert seeded == [] and cfn.updates == [] and theirs.objects == {}
     assert s3.ops() == ["PutObject"] and s3.violations == []
     # Stopped while validating: the bootstrap brokers were never even read.
@@ -1022,8 +1098,8 @@ def test_a_refusal_names_the_refused_request_its_permission_and_s3s_answer(
     deployer, _cfn = _deployer(s3)
     with pytest.raises(CdcDeployError) as staged:
         deployer.preflight_template(_BIG)
-    with pytest.raises(S3ProvisionError) as ensured:
-        ensure_plugin_bucket(s3, _ME, _REGION)
+    with pytest.raises(BucketOwnershipError) as ensured:
+        OwnedBucket(s3, _BUCKET, _ME).ensure(_REGION, sleep=lambda _s: None)
     managed = ManagedOwnerCheckingS3()
     _foreign(managed)
     artifact = tmp_path / "a.zip"
@@ -1141,22 +1217,22 @@ def test_a_state_bucket_another_account_takes_over_while_the_app_runs_is_refused
     # same, so nothing reached the other account's bucket either way).
     recorded = _record_activity(monkeypatch)
     s3 = OwnerCheckingS3()
-    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    jobs = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     sessions = S3SessionStateStore(
-        _BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts(), background=background
+        _CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts(), background=background
     )
     jobs.save(_job("j1"), None)  # creates the bucket and shows it is this account's
     sessions.save(SessionSnapshot(session_id="s1"))
     assert sessions.flush(5.0)
-    theirs = _take_over(s3)
+    theirs = _take_over(s3, _CUSTOM)
     with caplog.at_level(logging.WARNING):
         jobs.save(_job("j1", "DONE"), None)
         sessions.save(SessionSnapshot(session_id="s2"))
         assert sessions.flush(5.0)
         assert sessions.load("s1") is None
     assert theirs.objects == {} and s3.reads == [] and s3.violations == []
-    _assert_refusal(jobs.bucket_refusal or "")
-    _assert_refusal(sessions.bucket_refusal or "")
+    _assert_refusal(jobs.bucket_refusal or "", _CUSTOM)
+    _assert_refusal(sessions.bucket_refusal or "", _CUSTOM)
     stores = ("dsql_migrator.core.job_store", "dsql_migrator.core.session_state_store")
     logged = [r for r in caplog.records if r.name in stores]
     assert logged and all(r.levelno == logging.ERROR for r in logged)
@@ -1169,16 +1245,16 @@ def test_a_state_bucket_another_account_takes_over_while_the_app_runs_is_refused
     jobs.save(_job("j2"), None)
     assert s3.ops() == ["HeadBucket"] and len(recorded) == 2
     # ...so once the other account's bucket is gone, it creates this account's and saves.
-    del s3.buckets[_BUCKET]
+    del s3.buckets[_CUSTOM]
     jobs.save(_job("j3"), None)
     sessions.save(SessionSnapshot(session_id="s3"))
     assert sessions.flush(5.0)
-    assert s3.buckets[_BUCKET].owner == _ME
-    assert {"jobs/j3.json", "sessions/s3.json"} <= set(s3.buckets[_BUCKET].objects)
+    assert s3.buckets[_CUSTOM].owner == _ME
+    assert {"jobs/j3.json", "sessions/s3.json"} <= set(s3.buckets[_CUSTOM].objects)
     assert jobs.bucket_refusal is None and sessions.bucket_refusal is None
     assert s3.violations == []
     # A takeover after the bucket was usable again is a new refusal, recorded again.
-    _take_over(s3)
+    _take_over(s3, _CUSTOM)
     jobs.save(_job("j4"), None)
     sessions.save(SessionSnapshot(session_id="s4"))
     assert sessions.flush(5.0)
@@ -1243,10 +1319,10 @@ def test_the_job_store_uses_and_restores_nothing_from_another_accounts_bucket(ca
     # FAILS WITHOUT THE FIX: the store adopted the bucket, restored the forged job (its DONE
     # chunks are skipped on resume), and saved every job snapshot into it.
     s3 = OwnerCheckingS3()
-    theirs = _foreign(s3)
+    theirs = _foreign(s3, _CUSTOM)
     _forged_job(theirs)
     planted = dict(theirs.objects)
-    store = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    store = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     with caplog.at_level(logging.ERROR, logger="dsql_migrator.core.job_store"):
         assert store.load_all() == []
         store.save(_job("j1"), None)
@@ -1255,7 +1331,7 @@ def test_the_job_store_uses_and_restores_nothing_from_another_accounts_bucket(ca
     assert theirs.objects == planted
     assert s3.reads == []
     assert s3.violations == []
-    _assert_refusal(store.bucket_refusal or "")
+    _assert_refusal(store.bucket_refusal or "", _CUSTOM)
     errors = [
         r for r in caplog.records
         if r.levelno == logging.ERROR and r.name == "dsql_migrator.core.job_store"
@@ -1276,17 +1352,22 @@ def test_the_job_store_without_the_account_makes_no_s3_call() -> None:
 
 
 def test_the_job_store_asserts_the_owner_on_every_request() -> None:
+    # Set to the managed bucket's earlier name, as on ECS Fargate: with neither bucket there,
+    # the store keeps its state in the -an bucket it creates.
     s3 = OwnerCheckingS3(region="eu-west-1")
     sts = _Sts()
-    name = plugin_bucket_name(_ME, "eu-west-1")
-    store = S3JobStore(name, region="eu-west-1", s3_client=s3, sts_client=sts)
+    name = regional_plugin_bucket_name(_ME, "eu-west-1")
+    store = S3JobStore(
+        earlier_plugin_bucket_name(_ME, "eu-west-1"), region="eu-west-1", s3_client=s3,
+        sts_client=sts,
+    )
     store.save(_job("j1", "DONE"), None)  # creates the missing bucket, then checks it
     store.save(_job("j2"), "boom")
     assert [p.job.job_id for p in store.load_all()] == ["j1", "j2"]
     assert store.prune_terminal(0) == ["j1"]
     store.delete("j2")
-    assert s3.buckets[name].objects == {}
-    assert s3.ops()[:3] == ["HeadBucket", "CreateBucket", "HeadBucket"]
+    assert set(s3.buckets) == {name} and s3.buckets[name].objects == {}
+    assert s3.ops()[:5] == ["HeadBucket", "HeadBucket", "HeadBucket", "CreateBucket", "HeadBucket"]
     assert s3.violations == [] and sts.calls == 1
     assert store.bucket_refusal is None
 
@@ -1294,9 +1375,9 @@ def test_the_job_store_asserts_the_owner_on_every_request() -> None:
 def test_the_job_store_refuses_a_name_another_account_creates_first() -> None:
     s3 = OwnerCheckingS3()
     s3.squatter_creates_first = _THEM
-    store = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    store = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     store.save(_job("j1"), None)
-    assert s3.buckets[_BUCKET].objects == {}
+    assert s3.buckets[_CUSTOM].objects == {}
     assert "BucketAlreadyExists" in (store.bucket_refusal or "")
 
 
@@ -1312,12 +1393,12 @@ def test_the_session_store_uses_and_restores_nothing_from_another_accounts_bucke
     # FAILS WITHOUT THE FIX: a reconnecting browser restored the squatter's snapshot (its
     # edited target DDL and CDC start point are acted on), and every save went to them.
     s3 = OwnerCheckingS3()
-    theirs = _foreign(s3)
+    theirs = _foreign(s3, _CUSTOM)
     forged = SessionSnapshot(session_id="s1", generated_node_ids=["table:forged"])
     theirs.objects["sessions/s1.json"] = (forged.model_dump_json().encode(), {})
     planted = dict(theirs.objects)
     store = S3SessionStateStore(
-        _BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts(), background=background
+        _CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts(), background=background
     )
     with caplog.at_level(logging.ERROR, logger="dsql_migrator.core.session_state_store"):
         assert store.load("s1") is None
@@ -1328,7 +1409,7 @@ def test_the_session_store_uses_and_restores_nothing_from_another_accounts_bucke
     assert theirs.objects == planted
     assert s3.reads == []
     assert s3.violations == []
-    _assert_refusal(store.bucket_refusal or "")
+    _assert_refusal(store.bucket_refusal or "", _CUSTOM)
     assert any(
         r.levelno == logging.ERROR and "starts over" in r.getMessage() for r in caplog.records
     )
@@ -1356,7 +1437,8 @@ def test_the_session_store_asserts_the_owner_on_every_request() -> None:
     assert store.prune(0) == ["s1"]
     store.save(SessionSnapshot(session_id="s2"))
     store.delete("s2")
-    assert s3.buckets[_BUCKET].objects == {}
+    # Set to the managed bucket's earlier name: neither bucket was there, so the -an one is.
+    assert set(s3.buckets) == {_REGIONAL} and s3.buckets[_REGIONAL].objects == {}
     assert s3.violations == []
 
 
@@ -1429,12 +1511,12 @@ def test_a_refused_state_bucket_is_recorded_in_the_activity_log_once(monkeypatch
 
     recorded = _record_activity(monkeypatch)
     s3 = OwnerCheckingS3()
-    _foreign(s3)
-    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    _foreign(s3, _CUSTOM)
+    jobs = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     jobs.load_all()
     jobs.save(_job("j1"), None)
     jobs.prune_terminal(0)
-    sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    sessions = S3SessionStateStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     sessions.prune(200)
     sessions.save(SessionSnapshot(session_id="s1"))
     assert sessions.load("s1") is None
@@ -1445,11 +1527,11 @@ def test_a_refused_state_bucket_is_recorded_in_the_activity_log_once(monkeypatch
     for _action, kwargs in recorded:
         assert kwargs["category"] is ActivityCategory.SYSTEM
         assert kwargs["status"] is ActivityStatus.FAILURE
-        _assert_refusal(kwargs["detail"])
+        _assert_refusal(kwargs["detail"], _CUSTOM)
     # A usable bucket records nothing; nor does a 403 that is this identity's IAM policy.
     recorded.clear()
     own = OwnerCheckingS3()
-    usable = S3JobStore(_BUCKET, region=_REGION, s3_client=own, sts_client=_Sts())
+    usable = S3JobStore(_CUSTOM, region=_REGION, s3_client=own, sts_client=_Sts())
     usable.load_all()
     own.iam_denied = {"PutObject"}
     usable.save(_job("j1"), None)
@@ -1479,17 +1561,17 @@ def test_a_foreign_bucket_after_an_unreadable_account_is_recorded_too(
     # bucket refused" although no S3 request had been sent. Each kind is recorded once now.
     recorded = _record_activity(monkeypatch)
     s3 = OwnerCheckingS3()
-    theirs = _foreign(s3)
+    theirs = _foreign(s3, _CUSTOM)
     sts = _StsFailsFirst()
     if store == "jobs":
-        jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=sts)
+        jobs = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=sts)
         jobs.load_all()  # the account read fails: nothing is sent
         assert s3.calls == []
         jobs.save(_job("j1"), None)  # the account is read: the bucket is another account's
         jobs.save(_job("j2"), None)
         refusal, prefix = jobs.bucket_refusal, "Job"
     else:
-        sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=sts)
+        sessions = S3SessionStateStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=sts)
         sessions.prune(200)
         assert s3.calls == []
         sessions.save(SessionSnapshot(session_id="s1"))
@@ -1501,7 +1583,7 @@ def test_a_foreign_bucket_after_an_unreadable_account_is_recorded_too(
         f"{prefix} state is not saved: S3 bucket refused",
     ]
     assert "sts:GetCallerIdentity" in recorded[0][1]["detail"]
-    _assert_refusal(recorded[1][1]["detail"])
+    _assert_refusal(recorded[1][1]["detail"], _CUSTOM)
     assert recorded[1][1]["detail"] == refusal
     assert theirs.objects == {} and s3.reads == [] and s3.violations == []
 
@@ -1630,9 +1712,9 @@ def test_the_page_reads_each_state_stores_refusal_when_it_renders(monkeypatch) -
 
     monkeypatch.setattr(app_module, "build_workflow_sidebar", _spy_sidebar)
     s3 = OwnerCheckingS3()
-    _foreign(s3)
-    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
-    sessions = S3SessionStateStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    _foreign(s3, _CUSTOM)
+    jobs = S3JobStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
+    sessions = S3SessionStateStore(_CUSTOM, region=_REGION, s3_client=s3, sts_client=_Sts())
     monkeypatch.setattr(app_module, "JOB_MANAGER", JobManager(stall_timeout_seconds=None))
     monkeypatch.setattr(app_module, "SESSION_STATE_STORE", sessions)
     getter = app_module._state_bucket_refusals
@@ -1646,8 +1728,8 @@ def test_the_page_reads_each_state_stores_refusal_when_it_renders(monkeypatch) -
         for store in ("SESSION_STORE", "DATA_MIGRATION_STORE"):
             getattr(app_module, store).clear(session_id)
     assert hooks["state_bucket_refusals_getter"] is getter
-    _assert_refusal(getter()[0] or "")
-    _assert_refusal(getter()[1] or "")
+    _assert_refusal(getter()[0] or "", _CUSTOM)
+    _assert_refusal(getter()[1] or "", _CUSTOM)
     assert getter() == (jobs.bucket_refusal, sessions.bucket_refusal)
     assert s3.reads == [] and s3.violations == []
 
