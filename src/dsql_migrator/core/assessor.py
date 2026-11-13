@@ -733,6 +733,85 @@ class CascadeForeignKeyRule(Rule):
         return findings
 
 
+class CdcTopicNameRule(Rule):
+    """Advise on tables CDC cannot stream because of their Kafka topic's name.
+
+    CDC names each table's Kafka topic ``dsqlcdc.<database or schema>.<table>``, and Kafka
+    refuses two kinds of topic name: one holding a character other than ASCII letters,
+    digits, '.', '_' and '-', and the second of two names that differ only in a '.'
+    against a '_' (``shop.orders.v2`` with ``shop.orders_v2``). Data Migration refuses such
+    a capture before Start CDC (:func:`~dsql_migrator.core.cdc.topic_name_refusal`); this
+    says it at planning time, judged as that check judges CDC infrastructure whose sink
+    plugin streams a table whose name holds a '.'
+    (:func:`~dsql_migrator.core.cdc.topic_name_problems`), so such a name gets nothing on
+    its own. A Full load only migration is not affected, so this is ADVICE, filed as a
+    ``RECOMMENDATION`` like FK_PRESERVED: the table stays AUTO, is not an AI candidate, and
+    adds no effort. A '.' inside a database or schema name is DOTTED_SCHEMA_NAME, which the
+    catalog read decides (:func:`dotted_schema_findings`); this rule reads the inventory
+    alone and does not see it.
+    """
+
+    rule_id = "CDC_TOPIC_NAME"
+
+    def evaluate(self, inventory: SourceInventory) -> list[Finding]:
+        from dsql_migrator.core.cdc import (
+            CDC_DEFAULT_TOPIC_PREFIX,
+            _shown_name,
+            topic_name_problems,
+        )
+
+        illegal, groups = topic_name_problems(table.name for table in inventory.tables)
+        group_of = {name: group for group in groups for name in group}
+        refused = set(illegal)
+        findings: list[Finding] = []
+        for table in inventory.tables:
+            name = table.name
+            if name in refused:
+                risk = (
+                    f"CDC cannot stream {_shown_name(name)}: its Kafka topic is named after "
+                    "its database or schema and its table, and Kafka allows only ASCII "
+                    "letters, digits, '.', '_' and '-'. A Full load only migration is not "
+                    "affected."
+                )
+                recommendation = (
+                    "With Full load + CDC or CDC only, leave it out of the CDC pipeline: "
+                    "copy it in a Full load only migration once its writes stop, or rename "
+                    "it at the source."
+                )
+            elif name in group_of:
+                *first, last = sorted(group_of[name])
+                pair = len(first) == 1
+                risk = (
+                    f"CDC can stream only one of {', '.join(first)} and {last}: each "
+                    f"table's Kafka topic is named {CDC_DEFAULT_TOPIC_PREFIX}.<database or "
+                    "schema>.<table>, and Kafka does not allow two topics whose names differ "
+                    "only in a '.' against a '_'. A Full load only migration is not affected."
+                )
+                recommendation = (
+                    "With Full load + CDC or CDC only, capture only one of them: copy "
+                    + (
+                        "the other in a Full load only migration once its writes stop, or "
+                        "rename one at the source."
+                        if pair
+                        else "the others in a Full load only migration once their writes "
+                        "stop, or rename all but one at the source."
+                    )
+                )
+            else:
+                continue
+            findings.append(
+                Finding(
+                    object=ObjectKey(KIND_TABLE, name),
+                    rule_id=self.rule_id,
+                    classification=Classification.MANUAL,
+                    risk=risk,
+                    recommendation=recommendation,
+                    note_kind=ConversionNoteKind.RECOMMENDATION,
+                )
+            )
+        return findings
+
+
 class TriggerRule(Rule):
     """Flag triggers (Aurora DSQL has no trigger object at all)."""
 
@@ -4196,6 +4275,7 @@ def default_rules(source_type: SourceType = SourceType.MYSQL) -> list[Rule]:
         ForeignKeyRule(),
         CheckConstraintRule(),
         CascadeForeignKeyRule(),
+        CdcTopicNameRule(),
         TriggerRule(),
         ProcedureRule(),
         EventRule(),
@@ -5001,6 +5081,7 @@ __all__ = [
     "SpatialTypeRule",
     "TooManyColumnsRule",
     "NameCollisionRule",
+    "CdcTopicNameRule",
     "IdentifierLengthRule",
     "OversizedLobRule",
     "DecimalPrecisionRule",

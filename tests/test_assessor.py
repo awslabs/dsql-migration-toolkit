@@ -642,6 +642,7 @@ def test_default_rules_contains_all_documented_rule_ids() -> None:
         "FK_PRESERVED",
         "CHECK_CONSTRAINT_DROPPED",
         "FK_CASCADE_CDC_GAP",
+        "CDC_TOPIC_NAME",
         "TRIGGER_UNSUPPORTED",
         "PROC_PLPGSQL",
         "EVENT_UNSUPPORTED",

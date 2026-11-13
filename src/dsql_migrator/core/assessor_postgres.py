@@ -1612,6 +1612,7 @@ def default_rules() -> "list[Rule]":
     """
     from dsql_migrator.core.assessor import (
         ByteaKeyRule,
+        CdcTopicNameRule,
         CheckConstraintRule,
         DecimalPrecisionRule,
         NameCollisionRule,
@@ -1690,6 +1691,8 @@ def default_rules() -> "list[Rule]":
         ViewDefinitionUnreadableRule(is_postgres=True),
         # What CDC cannot carry, said at Step 1 as the Step 3 check says it.
         PgCdcUncarryableColumnRule(),
+        # ... and the tables whose Kafka topic name CDC cannot use (shared with MySQL).
+        CdcTopicNameRule(),
         PgViewRemodelledColumnRule(),
         # Conversion warnings Evaluation had no finding for (the parity test's known gaps).
         pg_index_not_preserved_rule(),

@@ -31,6 +31,8 @@ _EXPECTED_PG_RULE_IDS = {
     "VIEW_DEFINITION_UNREADABLE",
     # PG-specific: a column type a CDC change event cannot carry (Step 3's classifier).
     "CDC_UNCARRYABLE_COLUMN",
+    # A table whose Kafka topic name CDC cannot use (shared with MySQL, advisory).
+    "CDC_TOPIC_NAME",
     # PG-specific conversion warnings, decided by the converter's own helpers.
     "PG_INDEX_NOT_PRESERVED",
     "PG_UNINDEXABLE_COLUMN",
