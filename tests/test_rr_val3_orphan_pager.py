@@ -267,3 +267,48 @@ def test_the_full_load_has_no_pager_of_its_own() -> None:
         source = inspect.getsource(module)
         assert "build_pg_orphan_page_first_sql" not in source
         assert "build_pg_orphan_page_next_sql" not in source
+
+
+def test_a_full_orphan_page_that_does_not_move_past_its_cursor_raises() -> None:
+    # FAILS WITHOUT THE FIX: the single-column pager bound the same last key again and read
+    # the same page forever (the composite pager and the count/checksum pagers stop there).
+    calls: list = []
+
+    def page(statement, parameters):
+        calls.append(parameters)
+        assert len(calls) <= 3, "the pager looped on a page that did not move"
+        return (0, "2", 2)
+
+    with pytest.raises(v.PagedReadError, match="did not move past"):
+        v.target_orphan_count_keyset(None, CHILD, FK, "id", 2, page_row=page)
+    assert calls == [None, {"last": "2"}]  # stopped at the repeat, never looped
+
+
+def test_the_exact_target_count_stops_on_a_full_page_that_does_not_move() -> None:
+    # The same guard on the single-column exact count (Validation's COUNT mode).
+    class _Rows:
+        def __init__(self) -> None:
+            self.executed: list = []
+
+        def cursor(self):
+            outer = self
+
+            class _C:
+                def execute(self, statement, *parameters):
+                    outer.executed.append(parameters)
+                    assert len(outer.executed) <= 3, "the count looped on a page that did not move"
+
+                def fetchall(self):
+                    return [("1",), ("2",)]
+
+                def close(self):
+                    pass
+
+            return _C()
+
+    table = TableDef(name="app.t", columns=[ColumnDef(name="id", mysql_type="varchar(10)")],
+                     primary_key=["id"])
+    conn = _Rows()
+    with pytest.raises(v.PagedReadError, match="did not move past"):
+        v._target_count_keyset(conn, table, "id", 2)
+    assert len(conn.executed) == 2

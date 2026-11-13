@@ -1243,6 +1243,8 @@ def _target_count_keyset(
             if proof is not None:
                 proof.complete = True
             return total
+        if rows[-1][0] == last:
+            raise _stalled("target")
         last = rows[-1][0]
 
 
@@ -2058,6 +2060,10 @@ def target_orphan_count_keyset(
             on_orphans(None if last is None else (last,))
         if count is None or int(count) < page_size:
             return total
+        # A full page that did not move past its cursor would repeat forever (as in
+        # target_orphan_count_composite and the count/checksum pagers).
+        if last_pk == last:
+            raise _stalled("target")
         last = last_pk
 
 
