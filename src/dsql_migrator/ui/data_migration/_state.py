@@ -27,6 +27,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_STACK_NAME,
     CdcResumePoint,
+    normalize_start_gtid_mode,
 )
 from dsql_migrator.core.cdc_coords import normalize_gtid_set
 from dsql_migrator.core.error_log import ErrorLogStore
@@ -2259,9 +2260,9 @@ class DataMigrationState:
         """Record the source gtid_mode the stack's last MySQL Start positioned under (its
         StartGtidMode, G20; upper-cased, at most 32 characters). Blank or ``None``: no
         record."""
-        text = str(value or "").strip().upper()[:32]
+        text = normalize_start_gtid_mode(value)
         with self._lock:
-            self.cdc_deployed_gtid_mode = text or None
+            self.cdc_deployed_gtid_mode = text
 
     def set_cdc_deployed_snapshot_mode(self, value: Optional[str]) -> None:
         """Record the SnapshotMode of a stack whose connectors exist (``None``: none)."""

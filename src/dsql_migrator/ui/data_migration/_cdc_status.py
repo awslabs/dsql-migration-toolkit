@@ -1191,10 +1191,12 @@ def cdc_deployed_gtid_mode(parameters: "Optional[Mapping[str, str]]") -> Optiona
     started, or one whose starts could not read the mode. The GTID start check treats any
     value other than exactly ``ON`` as "not ON" (fail closed), never as ON.
     """
-    from dsql_migrator.core.cdc import CDC_START_GTID_MODE_PARAM
+    from dsql_migrator.core.cdc import (
+        CDC_START_GTID_MODE_PARAM,
+        normalize_start_gtid_mode,
+    )
 
-    value = str((parameters or {}).get(CDC_START_GTID_MODE_PARAM, "") or "")
-    return value.strip().upper()[:32] or None
+    return normalize_start_gtid_mode((parameters or {}).get(CDC_START_GTID_MODE_PARAM, ""))
 
 
 def cdc_live_snapshot_mode(parameters: "Optional[Mapping[str, str]]") -> Optional[str]:

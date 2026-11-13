@@ -1352,6 +1352,34 @@ def test_g20_cdc_deployed_gtid_mode_parses_the_stack_record():
     assert f({"WatermarkBinlogFile": "", "StartGtidMode": "ON"}) == "ON"
 
 
+def test_cdccore_4_one_start_gtid_mode_normalization():
+    # cdccore-4: ONE rule (core.cdc.normalize_start_gtid_mode) for the StartGtidMode form,
+    # used where the record is written (Start CDC's stack parameter), cached (the session
+    # state) and read back (cdc_deployed_gtid_mode) -- so the three cannot drift.
+    import inspect
+
+    import dsql_migrator.core.cdc_deployer as cdc_deployer
+    from dsql_migrator.core.cdc import (
+        CDC_START_GTID_MODE_MAX_LEN,
+        normalize_start_gtid_mode,
+    )
+
+    assert CDC_START_GTID_MODE_MAX_LEN == 32
+    assert normalize_start_gtid_mode(None) is None
+    assert normalize_start_gtid_mode("") is None and normalize_start_gtid_mode("  ") is None
+    assert normalize_start_gtid_mode(" on ") == "ON"
+    assert normalize_start_gtid_mode("off_permissive") == "OFF_PERMISSIVE"
+    assert normalize_start_gtid_mode("x" * 100) == "X" * 32
+    for value in (None, "", "   ", " on ", "off_permissive", "x" * 100):
+        expected = normalize_start_gtid_mode(value)
+        assert _status.cdc_deployed_gtid_mode({"StartGtidMode": value or ""}) == expected
+        state = DataMigrationState()
+        state.set_cdc_deployed_gtid_mode(value)
+        assert state.cdc_deployed_gtid_mode == expected
+    deployer_src = inspect.getsource(cdc_deployer.run_cdc_start)
+    assert "normalize_start_gtid_mode(start_gtid_mode)" in deployer_src
+
+
 def test_g20_the_phase_probe_caches_the_gtid_mode_record_and_adopt_clears_it():
     import dsql_migrator.core.cdc_deployer as dmod
 

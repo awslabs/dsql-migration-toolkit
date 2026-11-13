@@ -2741,6 +2741,21 @@ CDC_WATERMARK_PARAM_KEYS: tuple[str, ...] = (
 # when its GTID check read the mode; every other update keeps it (UsePreviousValue).
 CDC_START_GTID_MODE_PARAM = "StartGtidMode"
 
+
+CDC_START_GTID_MODE_MAX_LEN = 32
+
+
+def normalize_start_gtid_mode(value: "Optional[str]") -> "Optional[str]":
+    """The StartGtidMode form of a source ``gtid_mode`` reading: ONE rule. Pure.
+
+    Stripped, upper-cased and capped at ``CDC_START_GTID_MODE_MAX_LEN`` characters;
+    ``None`` when there is nothing left (no reading, or a blank one). Used wherever the
+    record is written or read -- Start CDC's stack parameter, the session state's copy of
+    it, and the read back off a stack's parameters -- so the three cannot drift (the
+    GTID start check compares the value against exactly ``ON``).
+    """
+    return str(value or "").strip().upper()[:CDC_START_GTID_MODE_MAX_LEN] or None
+
 # The cdc-stack parameter that makes the source connector capture exactly the selected tables,
 # letter case included: otherwise Debezium matches each table.include.list entry ignoring case,
 # so capturing shop.users also captured an unselected shop.Users. Start CDC sends it "true" only

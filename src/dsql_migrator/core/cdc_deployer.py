@@ -75,6 +75,7 @@ from dsql_migrator.core.cdc import (
     cdc_expected_connector_names,
     cdc_stack_params_started,
     list_parameter_size_refusal,
+    normalize_start_gtid_mode,
     rekey_parameter_size_refusal,
     rekey_routing_log_lines,
     topic_name_refusal,
@@ -2297,7 +2298,7 @@ def run_cdc_start(
             # Only with a template that declares it: the bundled one (always sent by the
             # UI's Start), or the stack's own when it already has the parameter -- sent with
             # UsePreviousTemplate to an older stack it would fail the update.
-            _recorded_mode = str(start_gtid_mode or "").strip().upper()[:32]
+            _recorded_mode = normalize_start_gtid_mode(start_gtid_mode)
             if _recorded_mode and (
                 template_body is not None
                 or CDC_START_GTID_MODE_PARAM in (discovery.current_parameters or {})
