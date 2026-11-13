@@ -300,7 +300,7 @@ def _reason_tags() -> dict[str, Any]:
     body = src[src.index("static String opSuffix(ChangeEvent event) {") :]
     body = body[: body.index("\n  }\n")]
     ops = re.findall(r'return "( \| op: [^"]+)";', body)
-    assert len(ops) == 4, ops  # tombstone, delete, insert, update
+    assert len(ops) == 3, ops  # delete, insert, update (a tombstone is skipped since v57)
     return {"sqlstate": "sqlstate={} ", "pk": " | pk: {}", "ops": ops, "sql": " | sql: {}"}
 
 

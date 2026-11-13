@@ -694,6 +694,38 @@ class DsqlSinkUniqueHoldTest {
   }
 
   @Test
+  void aTombstoneInTheLookAheadDoesNotReplaceTheHeldChangeItsDeleteDoes() throws Exception {
+    // FAILS WITHOUT THE FIX (plugin v57): the look-ahead parsed a tombstone as a delete of the
+    // held row (its table read from the topic), so a tombstone alone ended the hold as replaced
+    // and the partition was rewound past the held insert. A tombstone applies nothing since v57,
+    // so it replaces nothing; the op=d before it still does.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, "a", "b");
+    RecordingReporter dlq = new RecordingReporter();
+    HoldTask task = task(dsql, dlq);
+    task.put(List.of(create(P1, 0, 100005, "a", "b")));
+    assertEquals(Map.of(P1, 0L), task.heldOffsets());
+    assertFalse(task.ctx.paused.contains(P1)); // read one poll further first
+
+    task.put(List.of(tombstone(P1, 1, 100005))); // the look-ahead brings only a tombstone
+    assertEquals(Map.of(P1, 0L), task.heldOffsets()); // still held...
+    assertTrue(task.ctx.paused.contains(P1)); // ...rewound to the held insert and paused
+    assertEquals(0L, task.ctx.rewinds.get(P1));
+    assertTrue(dlq.records.isEmpty(), () -> String.valueOf(dlq.causes));
+
+    // The same insert, its op=d and tombstone in the look-ahead: the delete replaces it.
+    FakeDsql other = new FakeDsql();
+    other.seed(5, "a", "b");
+    HoldTask replaced = task(other, dlq);
+    replaced.put(List.of(create(P1, 0, 100005, "a", "b")));
+    replaced.put(List.of(delete(P1, 1, 100005), tombstone(P1, 2, 100005)));
+    assertTrue(replaced.heldOffsets().isEmpty());
+    assertFalse(replaced.ctx.paused.contains(P1));
+    assertEquals(1L, replaced.ctx.rewinds.get(P1)); // fetched again past the moot insert
+    assertTrue(dlq.records.isEmpty(), () -> String.valueOf(dlq.causes));
+  }
+
+  @Test
   void aReplayedOlderImageWhoseNewerImageIsInTheNextPollIsNotDeadLettered() throws Exception {
     // A restart replays partition 1 from an older commit: the target already holds row 1 = b
     // and row 2 = a. update(1, a) arrives alone in a poll, its newer image update(1, b) in the

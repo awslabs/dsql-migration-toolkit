@@ -118,7 +118,8 @@ handling DSQL's constraints directly:
 - **≤ 3,000 rows / transaction** — small idempotent batches (`Batches` +
   `DsqlSinkTask`).
 - **PK-keyed idempotent upsert/delete** — `INSERT ... ON CONFLICT (pk) DO
-  UPDATE` for Debezium `c/r/u`, `DELETE` for `d` and tombstones (`DsqlDialect`).
+  UPDATE` for Debezium `c/r/u`, `DELETE` for `d` (`DsqlDialect`). A tombstone
+  is skipped: the `d` before it already applied the source DELETE.
 
 **Java is a consequence of the runtime, not a preference.** The CDC runtime is
 managed **MSK Connect** = managed **Apache Kafka Connect**, whose connector
@@ -145,7 +146,7 @@ errors — it does **not** run this connector in-process. This connector is the
 | `DsqlSinkConnector.java` | `SinkConnector` entrypoint; distributes config to tasks |
 | `DsqlSinkConnectorConfig.java` | Connector config: `dsql.cluster.endpoint`/`dsql.region`/`dsql.database`/`dsql.username`/`delete.enabled`/`batch.size`/`occ.*`/`metrics.*`/`target.key.columns` (re-keyed tables keyed on the source primary key, with the composite key the sink writes each by — the cdc-stack `SinkKeyColumns` parameter; absent = none) |
 | `DsqlSinkTask.java` | `SinkTask`: parse → batch (≤3,000) → OCC/`XX000`-retried upsert/delete → commit; IAM-token reconnect; a unique conflict (`23505`) held on its partition, for up to 5 min per held change (restarted after a transient failure of that task), until the earlier change that frees the value applies, released only when a put returns normally and counted as its table's lag meanwhile; failures re-thrown for the Connect DLQ |
-| `DebeziumEvents.java` | Maps a Debezium envelope `SinkRecord` to a `ChangeEvent` (record key = PK; `c/r/u`→upsert, `d`/tombstone→delete). A table listed in `target.key.columns` whose record is keyed on the SOURCE primary key is written by its composite key instead: an `UPDATE` of a composite-key column becomes delete-old + insert-new in one transaction, a delete uses the exact composite key of its before-image (or the source key once its unique index is valid), and its tombstone is skipped |
+| `DebeziumEvents.java` | Maps a Debezium envelope `SinkRecord` to a `ChangeEvent` (record key = PK; `c/r/u`→upsert, `d`→delete; the target table is `source` db/schema + table, read back at its first '.', so a table name may hold a '.' but a change whose database or schema name holds one, or that has no `source.table`, is dead-lettered). A table listed in `target.key.columns` whose record is keyed on the SOURCE primary key is written by its composite key instead: an `UPDATE` of a composite-key column becomes delete-old + insert-new in one transaction, and a delete uses the exact composite key of its before-image (or the source key once its unique index is valid). `DsqlSinkTask` skips every tombstone before parsing |
 | `ChangeEvent.java` | Parsed change event (table, delete flag, columns/values, pk columns/values) |
 | `DsqlDialect.java` | Pure DSQL SQL builders: identifier quoting, `INSERT ... ON CONFLICT` upsert, `DELETE` |
 | `Batches.java` | Partitions events into ≤`batch.size` chunks (rows weighted: a move counts 2) |

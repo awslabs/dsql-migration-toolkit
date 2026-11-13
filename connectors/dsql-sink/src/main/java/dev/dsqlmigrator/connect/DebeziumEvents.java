@@ -29,12 +29,19 @@ import org.apache.kafka.connect.sink.SinkRecord;
  *
  * <p>The record key carries the primary-key columns ({@code pk.mode=record_key}).
  * The value is the Debezium envelope Struct ({@code op}, {@code before},
- * {@code after}, {@code source}); a {@code null} value is a tombstone. Mapping:
+ * {@code after}, {@code source}). Mapping:
  * {@code c/r/u} (or any op with an after-image) becomes an upsert from the
- * after-image; {@code d} and tombstones become a delete keyed by the PK
+ * after-image; {@code d} becomes a delete keyed by the PK
  * (falling back to the before-image when the message has no key); {@code t} (a source
  * TRUNCATE) has no correct apply on Aurora DSQL and is dead-lettered by name (see
- * {@link #truncateNotApplicable}).
+ * {@link #truncateNotApplicable}). The target table is the event's own {@code source} block,
+ * never its topic ({@link #resolveTable}).
+ *
+ * <p>A tombstone (a keyed record with a {@code null} value, which Debezium sends right after
+ * each {@code op=d} with the same key) is never parsed: {@code DsqlSinkTask} skips it, because
+ * the {@code op=d} before it already applied the source DELETE by that key, and a tombstone
+ * carries no source block -- its table could only be read from the topic, which a table name
+ * holding a '.' makes ambiguous.
  *
  * <p><b>Source-keyed re-keyed tables (G15).</b> A table Schema Conversion re-keyed (its
  * Aurora DSQL primary key is the whole source primary key plus an added leading column) and
@@ -88,13 +95,19 @@ final class DebeziumEvents {
    */
   static ChangeEvent parse(SinkRecord record, Map<String, List<String>> targetKeys) {
     Object value = record.value();
+    if (value == null) {
+      // Defensive: DsqlSinkTask skips every tombstone before parsing (see the class javadoc).
+      throw new DataException(
+          "Cannot apply a tombstone (a record with no value): it carries no change of its own;"
+              + " the delete event before it applies the source DELETE");
+    }
     Struct envelope = (value instanceof Struct) ? (Struct) value : null;
     Struct source = envelope != null ? optStruct(envelope, "source") : null;
     // Determine the origin engine (Debezium's source.connector) EARLY so PostgreSQL-specific
     // value handling applies to the key/before PK extraction too, not just the after-image:
     //   - the TOAST unavailable-value omission (see extractAfterImage), and
     //   - PG bit/varbit rendered as the bit-string text (see convertField / pgBitString).
-    // A MySQL -- or unknown/tombstone -- source keeps byte-identical prior behavior (MySQL
+    // A MySQL -- or unknown -- source keeps byte-identical prior behavior (MySQL
     // BIT stays an integer; the sentinel string is only ever real user data there).
     boolean pgSource = source != null && "postgresql".equals(optString(source, "connector"));
 
@@ -102,21 +115,13 @@ final class DebeziumEvents {
     List<Object> pkValues = new ArrayList<>();
     extractStruct(record.key(), pkColumns, pkValues, pgSource);
 
-    if (value == null) {
-      // Tombstone -> delete by key. No envelope, so no source.ts_ms (lag unknown). Flagged
-      // as a tombstone so the applied-ops metric counts one source DELETE ONCE: Debezium
-      // emits an op=d envelope AND a tombstone for the same row, and counting both reported
-      // DeletesApplied=2 for one deleted row. The APPLY is unchanged -- still an idempotent
-      // DELETE by key.
-      return buildTombstone(tableFromTopic(record.topic()), pkColumns, pkValues);
-    }
     if (envelope == null) {
       throw new DataException(
           "Unsupported record value type; expected a Debezium Struct envelope");
     }
 
     String op = optString(envelope, "op");
-    String table = resolveTable(envelope, record.topic());
+    String table = resolveTable(envelope);
     // Source commit time for the end-to-end replication-lag metric (now - ts at
     // apply). 0 when the source block omits ts_ms -> lag simply not recorded.
     long sourceTsMs = optLong(source, "ts_ms");
@@ -284,33 +289,10 @@ final class DebeziumEvents {
   }
 
   /**
-   * True for a TOMBSTONE of a source-keyed table. {@code DsqlSinkTask} skips it before parsing:
-   * Debezium emits it right after the op=d with the same key, so on the same partition, and
-   * that delete has already been applied -- applying it as well would only add a second delete
-   * by the source key (a full scan while the unique index on it is still building). The table
-   * comes from the topic, as for any tombstone.
-   */
-  static boolean isSourceKeyedTombstone(
-      SinkRecord record, Map<String, List<String>> targetKeys) {
-    if (record.value() != null || targetKeys.isEmpty() || !(record.key() instanceof Struct key)) {
-      return false;
-    }
-    String topic = record.topic();
-    if (topic == null || topic.isEmpty()) {
-      return false;
-    }
-    List<String> keyColumns = new ArrayList<>();
-    for (Field field : key.schema().fields()) {
-      keyColumns.add(field.name());
-    }
-    return sourceKeyedComposite(targetKeys, tableFromTopic(topic), keyColumns) != null;
-  }
-
-  /**
    * {@code targetKeys}' entry for {@code table}, matched EXACTLY, or null. Both sides spell the
    * name from the same source catalog (the control plane's table name; Debezium's source
-   * db/schema + table, or the topic), so a table whose name differs only in case is a different
-   * table -- one that is not listed keeps its own record key.
+   * db/schema + table), so a table whose name differs only in case is a different table -- one
+   * that is not listed keeps its own record key.
    */
   private static List<String> compositeFor(Map<String, List<String>> targetKeys, String table) {
     return table == null ? null : targetKeys.get(table);
@@ -443,22 +425,10 @@ final class DebeziumEvents {
                 + " would be applied to 0 rows. On a PostgreSQL source this means the"
                 + " UPDATE/DELETE before-image does not carry that column: run"
                 + " ALTER TABLE "
-                + table
+                + DsqlDialect.quoteQualified(table)
                 + " REPLICA IDENTITY FULL.");
       }
     }
-  }
-
-  private static ChangeEvent buildTombstone(
-      String table, List<String> pkColumns, List<Object> pkValues) {
-    if (pkColumns.isEmpty()) {
-      throw new DataException(
-          "Cannot build DELETE for table "
-              + table
-              + ": no primary key in record key or before-image");
-    }
-    requireNoNullKeyComponent(table, pkColumns, pkValues, "DELETE");
-    return ChangeEvent.tombstone(table, pkColumns, pkValues, 0L);
   }
 
   /**
@@ -644,41 +614,56 @@ final class DebeziumEvents {
    * table: a MySQL source puts the database (which is the schema) in {@code db},
    * a PostgreSQL-style source in {@code schema}. The namespace MUST be preserved
    * so a captured {@code cdc_monitor.heartbeat} lands in DSQL's {@code cdc_monitor}
-   * schema — the same schema-qualified target the Full Load writes to. Dropping it
+   * schema -- the same schema-qualified target the Full Load writes to. Dropping it
    * would silently route streamed changes to {@code public} (DSQL's default
    * {@code search_path}), splitting one table across two schemas and colliding any
    * two source databases that share a table name.
+   *
+   * <p>The result is read back at its FIRST '.' ({@link DsqlDialect#quoteQualified},
+   * {@link ValueFit#catalogKey}), so a table name may hold a '.' ({@code shop.orders.v2} is
+   * table {@code orders.v2} of {@code shop}) but the namespace may not. An event this cannot
+   * name exactly is dead-lettered ({@code DsqlSinkTask.put} quarantines a
+   * {@link DataException}) rather than written to a table guessed at: one with no
+   * {@code source.table} (the topic is not read -- {@code <prefix>.<db>.<table>} cannot be
+   * split when a name holds a '.'), one whose database or schema name holds a '.', and one
+   * with no namespace whose table name holds a '.'.
    */
-  private static String resolveTable(Struct envelope, String topic) {
+  private static String resolveTable(Struct envelope) {
     Struct source = optStruct(envelope, "source");
-    if (source != null) {
-      String table = optString(source, "table");
-      if (table != null && !table.isEmpty()) {
-        String schema = optString(source, "schema");
-        if (schema == null || schema.isEmpty()) {
-          schema = optString(source, "db");
-        }
-        return (schema != null && !schema.isEmpty()) ? schema + "." + table : table;
+    String table = source == null ? null : optString(source, "table");
+    if (table == null || table.isEmpty()) {
+      throw new DataException(
+          "Cannot resolve the target table: the change event has no source.table, and the sink"
+              + " does not guess a table from its topic.");
+    }
+    String ns = optString(source, "schema");
+    if (ns == null || ns.isEmpty()) {
+      ns = optString(source, "db");
+    }
+    if (ns == null || ns.isEmpty()) {
+      if (table.indexOf('.') >= 0) {
+        throw new DataException(
+            "Cannot apply a change to table "
+                + table
+                + ": the change event names no database or schema, and the table name holds a"
+                + " '.', so the change is dead-lettered rather than written to a table read from"
+                + " a split name.");
       }
+      return table;
     }
-    return tableFromTopic(topic);
-  }
-
-  /**
-   * Fall back to the topic name when {@code source.table} is absent. Per-table
-   * topics are {@code <prefix>.<db>.<table>} (see cdc-stack.yaml), so the last two
-   * dotted segments are {@code db.table} — the schema-qualified target. Keep both;
-   * keeping only the last segment would drop the schema (see {@link #resolveTable}).
-   */
-  private static String tableFromTopic(String topic) {
-    if (topic == null || topic.isEmpty()) {
-      throw new DataException("Cannot resolve target table: empty topic and no source.table");
+    if (ns.indexOf('.') >= 0) {
+      throw new DataException(
+          "Cannot apply a change to table "
+              + ns
+              + "."
+              + table
+              + ": its database or schema name, "
+              + ns
+              + ", holds a '.', which the tool does not support (Evaluation reports it"
+              + " Unsupported, DOTTED_SCHEMA_NAME), so the change is dead-lettered rather than"
+              + " written to a table read from a split name.");
     }
-    String[] parts = topic.split("\\.");
-    if (parts.length >= 2) {
-      return parts[parts.length - 2] + "." + parts[parts.length - 1];
-    }
-    return topic;
+    return ns + "." + table;
   }
 
   private static String optString(Struct struct, String field) {

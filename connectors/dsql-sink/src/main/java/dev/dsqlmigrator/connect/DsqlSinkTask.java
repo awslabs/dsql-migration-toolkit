@@ -102,6 +102,12 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * identified and quarantined while every healthy row still lands. Re-applying a
  * healthy row is safe (idempotent {@code ON CONFLICT} upsert / PK delete).
  *
+ * <p>A Debezium tombstone (a keyed record with no value) is skipped, unparsed and unwritten: it
+ * follows the {@code op=d} of the same key on the same partition, and that delete already
+ * applied the source DELETE. It carries no source block, so its table could only be read from
+ * the topic -- {@code <prefix>.<db>.<table>}, which cannot be split when a table name holds a
+ * '.'. The topics are not compacted, so nothing relies on it as a delete marker.
+ *
  * <p>Two kinds of row are refused BEFORE any write, so they never cost a chunk rollback or a
  * per-row replay: a bytea value over DSQL's per-value byte limit ({@link #oversizedColumn}), and a
  * number its target column would silently change -- a number other than 0/1 for a boolean,
@@ -130,9 +136,8 @@ import software.amazon.awssdk.services.cloudwatch.model.StandardUnit;
  * DSQL's unique index on it is valid ({@link SourceKeyIndex}: one catalog read per table, read
  * only when such a delete or move arrives, so a delete is never a full scan); an UPDATE with no
  * before-image (its old composite key unknown) is, once that index is valid, a move that
- * replaces the row holding its source key, and until then a plain upsert; and its tombstone,
- * which follows that delete on the same partition, is skipped. Every other table, and an empty
- * {@code target.key.columns}, takes exactly the path described above.
+ * replaces the row holding its source key, and until then a plain upsert. Every other table,
+ * and an empty {@code target.key.columns}, takes exactly the path described above.
  */
 public class DsqlSinkTask extends SinkTask {
 
@@ -582,11 +587,12 @@ public class DsqlSinkTask extends SinkTask {
         }
         continue;
       }
-      // A source-keyed table's TOMBSTONE: Debezium emits it right after the op=d with the same
-      // key, so on the same partition, and that delete is already applied (G15).
-      if (!targetKeys.isEmpty()
-          && record.value() == null
-          && DebeziumEvents.isSourceKeyedTombstone(record, targetKeys)) {
+      // A TOMBSTONE (no value), of any table: Debezium emits it right after the op=d with the
+      // same key, so on the same partition, and that delete has applied the source DELETE (it
+      // is idempotent, and it falls back to the before-image when the key is empty). Applying
+      // the tombstone would only add a second delete by that key, of a table read from its
+      // topic. Its offset is committed with the rest of the batch.
+      if (record.value() == null) {
         continue;
       }
       ChangeEvent event;
@@ -1224,6 +1230,9 @@ public class DsqlSinkTask extends SinkTask {
       }
       boolean superseded = false;
       for (SinkRecord r : entry.getValue()) {
+        if (r.value() == null) {
+          continue; // a tombstone applies nothing, so it replaces nothing (see put)
+        }
         ChangeEvent le;
         try {
           le = DebeziumEvents.parse(r, targetKeys);
@@ -1278,7 +1287,7 @@ public class DsqlSinkTask extends SinkTask {
     if (putHeldTail == null) {
       List<Applicable> tail = new ArrayList<>();
       for (SinkRecord r : putRecords) {
-        if (isHeldTail(r)) {
+        if (isHeldTail(r) && r.value() != null) { // a tombstone replaces nothing (see put)
           try {
             tail.add(new Applicable(r, DebeziumEvents.parse(r, targetKeys)));
           } catch (RuntimeException e) {
@@ -2266,16 +2275,12 @@ public class DsqlSinkTask extends SinkTask {
    *
    * <p>Debezium's own letters, so the tag matches the envelope the operator can read in the
    * DLQ topic: {@code c} create, {@code u} update, {@code d} delete, {@code r} snapshot read.
-   * A tombstone is reported as {@code d} with a marker, because it APPLIES as a delete.
    */
   // Package-private so a unit test can assert the rendering directly, the same seam
   // sqlStateTag/safeCauseMessage already use.
   static String opSuffix(ChangeEvent event) {
     if (event == null) {
       return "";
-    }
-    if (event.isTombstone()) {
-      return " | op: d (tombstone)";
     }
     if (event.isDelete()) {
       return " | op: d";
@@ -2917,19 +2922,10 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   // Package-private (not private) so a same-package test can assert the COUNTING rule
-  // directly -- that a tombstone does not count as a second delete.
+  // directly. One source DELETE is counted once: put() skips the tombstone Debezium sends
+  // after its op=d, so only the op=d is applied and counted.
   void recordOps(ChangeEvent event) {
     if (!metricsEnabled) {
-      return;
-    }
-    // A TOMBSTONE is not a second delete. Debezium emits both an op=d envelope and a
-    // tombstone for one source DELETE, so counting both made DeletesApplied report 2 for a
-    // single deleted row -- contradicting this metric's own definition ("how many deletes it
-    // APPLIED", since the tombstone applies nothing new: same key, idempotent) and breaking
-    // comparison with Inserts/Updates, which are 1:1. Returning here is safe for ordering:
-    // recordOps runs AFTER the apply. Lag is unaffected -- a tombstone carries no
-    // source.ts_ms, so the `src > 0` gate of recordLag already skipped it.
-    if (event.isTombstone()) {
       return;
     }
     // Count the applied op by KIND (inserts / updates / deletes). Unlike the old net

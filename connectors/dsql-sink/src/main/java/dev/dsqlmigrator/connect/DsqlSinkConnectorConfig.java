@@ -65,7 +65,7 @@ public class DsqlSinkConnectorConfig extends AbstractConfig {
               Type.BOOLEAN,
               true,
               Importance.MEDIUM,
-              "Apply Debezium delete events (and tombstones) as DSQL DELETEs.")
+              "Apply Debezium delete events as DSQL DELETEs (a tombstone is always skipped).")
           .define(
               BATCH_SIZE,
               Type.INT,

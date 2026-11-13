@@ -290,6 +290,41 @@ class DsqlSinkHoldRedeliveryTest {
   }
 
   @Test
+  void aTombstoneInTheHeldTailReplacesNothingInTheRedeliveriesOfItsPut() throws Exception {
+    // The put above with a tombstone of row 100005 after its update (P1@12), with no delete of
+    // that row before it. A tombstone applies nothing since plugin v57, so it replaces nothing:
+    // the update is held, the redeliveries read the held tail -- the update and the tombstone --
+    // and skip the insert because of the update alone, and the row ends as the update left it.
+    // FAILS WITHOUT THE FIX (plugin v57): the tombstone, parsed as a delete of the row (its table
+    // read from the topic), replaced the update, so nothing was held and row 100005 was never
+    // written.
+    FakeDsql dsql = new FakeDsql();
+    dsql.seed(5, "a", "b5");
+    RecordingReporter dlq = new RecordingReporter();
+    HoldTask task = task(dsql, dlq);
+    ConnectSinkLoop connect = connect(task);
+    connect.declare(P1, 10);
+    connect.declare(P0, 0);
+    connect.append(
+        create(P1, 10, 100005, "a", "b5"), update(P1, 11, 100005, "a", "b6"),
+        tombstone(P1, 12, 100005), create(P0, 0, 50, "q", "q0"));
+    dropRow50(dsql, 2);
+    connect.start(task, task.ctx);
+    assertFalse(connect.poll());
+    assertEquals(Map.of(P1, 11L), task.heldOffsets()); // the update; the insert was skipped
+    assertFalse(connect.poll()); // the first redelivery meets the second drop
+    assertTrue(connect.poll()); // the second redelivery
+    assertTrue(dlq.records.isEmpty(), () -> "dead-lettered " + dlq.names());
+    assertEquals(Map.of(P1, 11L), task.heldOffsets());
+
+    connect.append(delete(P0, 1, 5), tombstone(P0, 2, 5));
+    connect.drain(200);
+    assertEquals(List.of("50:q:q0", "100005:a:b6"), dsql.rows());
+    assertTrue(dlq.records.isEmpty(), () -> "dead-lettered " + dlq.names());
+    assertEquals(13L, connect.commit(false).get(P1));
+  }
+
+  @Test
   void anUpdateSkippedAsReplacedIsNotDeadLetteredByARedeliveryWhenItsReplacementIsTheHold()
       throws Exception {
     // X(1)=a, Y(9)=b. X a->b (P1@10) and X keeping b (P1@11) while Y b->y lags on P0: X@10 is

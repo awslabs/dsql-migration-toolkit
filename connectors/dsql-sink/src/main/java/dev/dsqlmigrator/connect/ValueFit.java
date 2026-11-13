@@ -49,8 +49,8 @@ import org.postgresql.util.PGobject;
  * Validation compares such a column at scale 6. So a value from an UNCONSTRAINED source
  * {@code numeric} (Debezium {@code VariableScaleDecimal}) is exempt from the scale rule when
  * the target is that default -- whether the catalog reports it as NULL/NULL or as 18/6. The
- * Full Load applies the same rule (core/exporter.py {@code value_fit_rule}); the shared verdict
- * table is tests/fixtures/value_fit_contract.tsv.
+ * Full Load applies the same rule (core/exporter_mysql.py {@code value_fit_rule}, which
+ * core/exporter.py calls); the shared verdict table is tests/fixtures/value_fit_contract.tsv.
  *
  * <p>Not checked (documented residuals, the same on both write paths): a {@code double}/
  * {@code float} value for a {@code numeric} column (PostgreSQL first renders it to 15
@@ -307,14 +307,16 @@ final class ValueFit {
   }
 
   /**
-   * {@code {schema, table}} for a {@code schema.table} target, or {@code null} for any other
-   * shape (fail open: the table is then not guarded).
+   * {@code {schema, table}} for a {@code schema.table} target, split at its FIRST '.' as
+   * {@link DsqlDialect#quoteQualified} writes it ({@code shop.orders.v2} is
+   * {@code {shop, orders.v2}}), or {@code null} for a name with no '.' or an empty part (fail
+   * open: the table is then not guarded).
    */
   static String[] catalogKey(String table) {
     if (table == null) {
       return null;
     }
-    String[] parts = table.split("\\.", -1);
+    String[] parts = table.split("\\.", 2);
     if (parts.length != 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
       return null;
     }
