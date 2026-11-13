@@ -96,6 +96,13 @@ _DELETED_NAMES: dict[str, tuple[str, ...]] = {
         "build_cutover_chat_system",
         "_cutover_recovery_context",
     ),
+    # ...and the module the system prompts now live in (A11).
+    "dsql_migrator.core.ai_prompts": (
+        "build_assessment_prompt",
+        "build_object_guidance_prompt",
+        "build_cutover_chat_system",
+        "_cutover_recovery_context",
+    ),
     # X1b: the HTML export's AI section (its ai_report argument was never passed).
     "dsql_migrator.core.assessor": ("_render_ai_html_section",),
     # ...and the module the export now lives in (A8).

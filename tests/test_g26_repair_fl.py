@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 import pytest
 
 from dsql_migrator import config
-from dsql_migrator.core import assessment_strategist
+from dsql_migrator.core import ai_prompts, assessment_strategist
 from dsql_migrator.core.assessment_strategist import (
     _FULL_LOAD_RECOVERY_CONTEXT,
     _validation_recovery_context,
@@ -96,12 +96,13 @@ def test_re_run_all_tables_names_the_retry_button_its_row_draws(monkeypatch, eng
 
 @pytest.mark.parametrize(
     "module",
-    [_full_load_ui, assessment_strategist, _full_load_engine, _foreign_keys, config],
-    ids=["full_load_ui", "strategist", "full_load_engine", "foreign_keys", "config"],
+    [_full_load_ui, assessment_strategist, ai_prompts, _full_load_engine, _foreign_keys, config],
+    ids=["full_load_ui", "strategist", "ai_prompts", "full_load_engine", "foreign_keys", "config"],
 )
 def test_no_string_in_the_module_names_the_retired_label(module) -> None:
     # FAILS WITHOUT THE FIX: the tooltip (_full_load_ui), two grounding bullets plus the chat
-    # builder's docstring (assessment_strategist), the 'Load failed' job error in both of
+    # builder's docstring (assessment_strategist; since A11 core/ai_prompts.py, which it
+    # re-exports), the 'Load failed' job error in both of
     # incomplete_load_message's branches, an anchor-lost table's recorded reason (which its
     # AI Assist chat takes as authoritative facts) and the re-read activity line
     # (_full_load_engine), and two Settings help texts (config). Comments may keep the old
