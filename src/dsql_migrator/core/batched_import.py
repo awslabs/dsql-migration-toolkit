@@ -1455,27 +1455,15 @@ class BatchedImporter:
         ``shard_id`` namespaces the ``chunk_id`` for one reader shard (batch ``index``
         restarts at 0 per shard). ``skipped_lock`` guards the shared skip counter when
         K shard producers run concurrently; ``None`` (single reader) needs no lock.
+
+        The stream is ONE page of range ``shard_id`` to :meth:`_iter_work_pages`, which
+        holds the batching and skip rule; as lazy as before (nothing runs until the first
+        batch is asked for).
         """
-        columns_tuple = tuple(columns)
-        key_tuple = tuple(key_columns)
-        high_water = skip_watermark.get(_shard_key(shard_id), -1)
-        batch_size = _effective_batch_size(self._options.batch_size, len(columns_tuple))
-        for index, batch in enumerate(
-            _iter_batches(rows, batch_size, MAX_BATCH_BYTES)
-        ):
-            if index <= high_water:
-                skip_counter.add(locked=skipped_lock is not None)
-                continue
-            yield _BatchWork(
-                chunk_id=batch_chunk_id(table.name, index, shard_id),
-                table_name=table.name,
-                columns=columns_tuple,
-                key_columns=key_tuple,
-                on_conflict=on_conflict,
-                rows=tuple(batch),
-                shard_id=shard_id,
-                batch_index=index,
-            )
+        return self._iter_work_pages(
+            ((shard_id, rows),), table, columns, key_columns, skip_watermark,
+            skip_counter, on_conflict, skip_locked=skipped_lock is not None,
+        )
 
     def _iter_work_pages(
         self,
@@ -1486,6 +1474,8 @@ class BatchedImporter:
         skip_watermark: Mapping[str, int],
         skip_counter: "_SkipCounter",
         on_conflict: OnConflictMode,
+        *,
+        skip_locked: bool = False,
     ) -> Iterator[_BatchWork]:
         """Yield a work item per non-skipped batch of ONE reader's key-range pages (P2).
 
@@ -1496,7 +1486,9 @@ class BatchedImporter:
         (``batch_chunk_id(table, i, r)``, resume key ``str(r)``) is the same primary-key
         slice of one snapshot however the ranges' pages interleave, and a resume skips per
         range. Pulled lazily, one batch at a time; the rows of a page are read to its end
-        before the next page is asked for. One producer, so the skip count takes no lock.
+        before the next page is asked for. One producer, so the skip count takes no lock --
+        unless ``skip_locked``: :meth:`_iter_work`'s one page of a reader shard whose K
+        siblings share ``skip_counter``.
         """
         columns_tuple = tuple(columns)
         key_tuple = tuple(key_columns)
@@ -1508,7 +1500,7 @@ class BatchedImporter:
             index = next_index.get(shard_id, 0)
             for batch in _iter_batches(page, batch_size, MAX_BATCH_BYTES):
                 if index <= high_water:
-                    skip_counter.add(locked=False)
+                    skip_counter.add(locked=skip_locked)
                 else:
                     yield _BatchWork(
                         chunk_id=batch_chunk_id(table.name, index, shard_id),
