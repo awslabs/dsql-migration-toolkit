@@ -304,6 +304,29 @@ def cdc_source_secret_name(stack_name: str) -> str:
     return f"mysql-dsql-migrator/cdc/{stack_name}/source"
 
 
+def extract_secret_name(secret_id: str) -> str:
+    """Return the colon-free Secrets Manager secret NAME from an ARN or a name.
+
+    The cdc-stack needs the secret *name* (no colons) for the connector's
+    ``${secretsManager:<name>:<key>}`` provider syntax, separate from the ARN. For
+    a full ARN ``arn:aws:secretsmanager:<region>:<acct>:secret:<name>-<6char>`` the
+    name is the segment after ``:secret:`` with the random 6-char suffix stripped.
+    A plain name is returned unchanged.
+    """
+    secret_id = (secret_id or "").strip()
+    if not secret_id.startswith("arn:"):
+        return secret_id
+    marker = ":secret:"
+    idx = secret_id.find(marker)
+    if idx < 0:
+        return secret_id
+    tail = secret_id[idx + len(marker):]
+    # Strip the Secrets Manager random suffix: "-XXXXXX" (6 chars) at the end.
+    if len(tail) > 7 and tail[-7] == "-" and tail[-6:].isalnum():
+        return tail[:-7]
+    return tail
+
+
 def ensure_source_secret(
     *,
     stack_name: str,
@@ -489,6 +512,7 @@ __all__ = [
     "SecretProvisionError",
     "resolve_source_secret",
     "cdc_source_secret_name",
+    "extract_secret_name",
     "ensure_source_secret",
     "delete_source_secret",
 ]

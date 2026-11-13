@@ -496,6 +496,15 @@ def test_extract_secret_name_arn_without_suffix() -> None:
     assert extract_secret_name(arn) == "plainname"
 
 
+def test_extract_secret_name_lives_with_the_secret_handling() -> None:
+    # cdccore-11: the function reads a Secrets Manager ARN, so it is core/secrets.py's;
+    # this module re-exports it, so the name stays importable from here (the UI does).
+    from dsql_migrator.core.secrets import extract_secret_name as from_secrets
+
+    assert extract_secret_name is from_secrets
+    assert from_secrets.__module__ == "dsql_migrator.core.secrets"
+
+
 # --- Engine-aware artifact selection ------------------------------------------
 # The cdc-stack can only reference one set (the two source plugins are mutually
 # exclusive; the offset-seeder Lambda seeds a MySQL binlog offset), so uploading the

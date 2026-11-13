@@ -61,6 +61,10 @@ from dsql_migrator.core.s3_ownership import (
     is_missing,
     refusal_text,
 )
+# extract_secret_name reads a Secrets Manager ARN, so it lives with the rest of the secret
+# handling (core/secrets.py, cdccore-11). Re-exported here so this module's callers --
+# the UI and the tests -- keep importing it from here.
+from dsql_migrator.core.secrets import extract_secret_name  # noqa: F401
 
 # The artifacts' BASE keys. An upload goes to the content-addressed key derived from one
 # (_content_key: cdc-plugins/<sha256[:16]>/<name>), which is what PluginUploadResult and the
@@ -1634,29 +1638,6 @@ def ensure_and_upload_plugins(
         lambda_seeder_key=keys.get(LAMBDA_SEEDER_KEY, ""),
         plugin_version=PLUGIN_VERSION,
     )
-
-
-def extract_secret_name(secret_id: str) -> str:
-    """Return the colon-free Secrets Manager secret NAME from an ARN or a name.
-
-    The cdc-stack needs the secret *name* (no colons) for the connector's
-    ``${secretsManager:<name>:<key>}`` provider syntax, separate from the ARN. For
-    a full ARN ``arn:aws:secretsmanager:<region>:<acct>:secret:<name>-<6char>`` the
-    name is the segment after ``:secret:`` with the random 6-char suffix stripped.
-    A plain name is returned unchanged.
-    """
-    secret_id = (secret_id or "").strip()
-    if not secret_id.startswith("arn:"):
-        return secret_id
-    marker = ":secret:"
-    idx = secret_id.find(marker)
-    if idx < 0:
-        return secret_id
-    tail = secret_id[idx + len(marker):]
-    # Strip the Secrets Manager random suffix: "-XXXXXX" (6 chars) at the end.
-    if len(tail) > 7 and tail[-7] == "-" and tail[-6:].isalnum():
-        return tail[:-7]
-    return tail
 
 
 __all__ = [
