@@ -1200,6 +1200,10 @@ class BatchedImporter:
         # Total poison rows seen this load (the retained list is capped at
         # _MAX_QUARANTINE_RECORDS; this counts every one so the result reports the true total).
         self._quarantine_total = 0
+        # The identities (_quarantined_row_identity) of the rows quarantined so far: a re-read
+        # of an already-dropped row is not counted again, and a resumed import_rows carries
+        # them with the records it carries.
+        self._quarantine_seen: set[tuple] = set()
         self._quarantine_lock = threading.Lock()
         # Each bulk INSERT shape (table, columns, rows, mode, keys) rendered once to the
         # bytes the server receives, in bounded memory (_RenderedInserts). For a typical
@@ -1373,8 +1377,7 @@ class BatchedImporter:
             self._quarantine = carried
             self._quarantine_total = len(carried) if resuming else 0
             # The dropped rows' identities carry with their records (_quarantined_row_identity).
-            seen = getattr(self, "_quarantine_seen", None)
-            self._quarantine_seen = set(seen or ()) if resuming else set()
+            self._quarantine_seen = set(self._quarantine_seen) if resuming else set()
         # OWN the resume high-water HERE (seeded from the prior attempt's watermark) rather
         # than inside _run_data_batches, so the completed contiguous prefix survives even
         # when the SOURCE READ raises mid-load: _run_data_batches records into THIS tracker,
@@ -1910,12 +1913,9 @@ class BatchedImporter:
             # per-value cap fails identically every time), so counting it again would
             # inflate the drop total the operator has to reconcile.
             key = _quarantined_row_identity(work, row)
-            seen = getattr(self, "_quarantine_seen", None)
-            if seen is None:
-                seen = self._quarantine_seen = set()
-            if key in seen:
+            if key in self._quarantine_seen:
                 return
-            seen.add(key)
+            self._quarantine_seen.add(key)
             self._quarantine_total += 1
             if len(self._quarantine) < self._max_quarantine:
                 self._quarantine.append(record)
