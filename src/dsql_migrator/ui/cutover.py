@@ -37,6 +37,8 @@ from dsql_migrator.core.activity_log import (
     log_activity,
 )
 from dsql_migrator.core.job_manager import JobManager
+# core's job_is_live under this module's name (ui.validation re-exports it)
+from dsql_migrator.core.job_manager import job_is_live as _job_live
 from dsql_migrator.core.models import (
     CdcCatalogDriftWaiver,
     CdcDlqWaiver,
@@ -315,16 +317,6 @@ def _run_cutover_identity_sync(
         job_manager.submit(_work)
     else:
         _work()
-
-
-def _job_live(job_manager: "Optional[JobManager]", job_id: Optional[str]) -> bool:
-    """Whether ``job_id`` is PENDING or RUNNING (unknown / no manager: not live)."""
-    if not job_id or job_manager is None:
-        return False
-    try:
-        return getattr(job_manager.get_status(job_id), "status", None) in ("PENDING", "RUNNING")
-    except Exception:  # noqa: BLE001 - an unknown id is not a live job
-        return False
 
 
 def cutover_job_block(migration_state, job_manager: "Optional[JobManager]") -> Optional[str]:

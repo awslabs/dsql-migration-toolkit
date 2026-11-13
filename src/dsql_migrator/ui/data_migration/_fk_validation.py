@@ -34,6 +34,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping, Optional, Sequence
 
 from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, log_activity
+# core's job_is_live under this module's name (_index_builds, the Data Migration and Cut over
+# screens, and the e2e harness import it from here)
+from dsql_migrator.core.job_manager import job_is_live as _job_live
 from dsql_migrator.core.models import ForeignKeyDef
 from dsql_migrator.core.schema_applier import validate_foreign_key
 from dsql_migrator.core.target_introspector import (
@@ -523,16 +526,6 @@ def _call_safely(callback: Optional[Callable[[], None]]) -> None:
         callback()
     except Exception:  # noqa: BLE001 - a refresh of a page that went away
         _LOGGER.debug("Foreign-key validation refresh failed", exc_info=True)
-
-
-def _job_live(job_manager: object, job_id: Optional[str]) -> bool:
-    if not job_id or job_manager is None:
-        return False
-    try:
-        status = getattr(job_manager.get_status(job_id), "status", None)  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - an unknown id is not a live job
-        return False
-    return status in ("PENDING", "RUNNING")
 
 
 def _defs_provider(fk_defs) -> "Callable[[], Mapping[tuple[str, str], ForeignKeyDef]]":

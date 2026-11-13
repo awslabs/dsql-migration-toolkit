@@ -93,6 +93,21 @@ def is_interrupted_by_restart(error: Optional[str]) -> bool:
     """
     return bool(error) and INTERRUPTED_BY_RESTART_MESSAGE in error
 
+
+def job_is_live(job_manager: object, job_id: Optional[str]) -> bool:
+    """Whether ``job_id`` is ``PENDING`` or ``RUNNING`` on ``job_manager``.
+
+    No id, no manager, or an id the manager cannot report (unknown to it): not live. The
+    Cut over screen's job gates and the foreign-key validation watch read a job this way.
+    """
+    if not job_id or job_manager is None:
+        return False
+    try:
+        status = getattr(job_manager.get_status(job_id), "status", None)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - an unknown id is not a live job
+        return False
+    return status in ("PENDING", "RUNNING")
+
 # A monotonic clock (injectable for deterministic tests; never wall-clock so it
 # is immune to system time jumps).
 Clock = Callable[[], float]
@@ -670,4 +685,5 @@ __all__ = [
     "JobManager",
     "INTERRUPTED_BY_RESTART_MESSAGE",
     "is_interrupted_by_restart",
+    "job_is_live",
 ]
