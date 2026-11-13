@@ -659,20 +659,42 @@ Resources:
                 Resource:
                   - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/dsql-cdc-*:*
                   - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/msk-connect/mysql-dsql-cdc-*:*
-              # The tool manages a single per-account/region plugin bucket
-              # (mysql-dsql-migrator-plugins-<account>-<region>). It holds the two
-              # bundled connector artifacts, the durable per-session resume snapshots
+              # The tool manages a single per-account/region plugin bucket. It holds the
+              # two bundled connector artifacts, the durable per-session resume snapshots
               # (sessions/ prefix), AND the durable Full Load job snapshots (jobs/
               # prefix). CreateBucket makes it self-provisioning; ListBucket backs
-              # snapshot pruning; the object-level grant on /* covers both prefixes
-              # (incl. head_object via s3:GetObject). Scoped to that bucket only.
-              # Every grant on the derived bucket name carries s3:ResourceAccount = this
-              # account, so S3 refuses this role on a bucket by that name another account
-              # owns, even for a request that would not assert the owner itself
-              # (the app's requests also send ExpectedBucketOwner). CreateBucket has its own
-              # statement without it: creating a name another account owns fails with
-              # BucketAlreadyExists, so the condition would add nothing there.
+              # HeadBucket and snapshot pruning; the object-level grant on /* covers both
+              # prefixes (incl. head_object via s3:GetObject). Scoped to that bucket only.
+              # The bucket has one of two names, and every grant below names both:
+              #   - mysql-dsql-migrator-plugins-<account>-<region>-an, in this account's
+              #     S3 account regional namespace (only this account can create a bucket
+              #     by that name). A new deployment uses it.
+              #   - mysql-dsql-migrator-plugins-<account>-<region>, the earlier name, in
+              #     S3's global namespace. A deployment that already has it keeps using
+              #     it (with its saved state), an app version older than this template
+              #     knows only this name, and me-south-1 and me-central-1 have no
+              #     account regional namespace.
+              # Every grant on either name carries s3:ResourceAccount = this account, so S3
+              # refuses this role on a bucket by that name another account owns, even for
+              # a request that would not assert the owner itself (the app's requests also
+              # send ExpectedBucketOwner). CreateBucket has its own statements without it:
+              # creating a name another account owns fails with BucketAlreadyExists, so
+              # the condition would add nothing there. CreateBucket on the -an name
+              # requires s3:x-amz-bucket-namespace = account-regional, so this role can
+              # create that name only inside this account's account regional namespace.
               - Sid: CreatePluginBucket
+                Effect: Allow
+                Action: s3:CreateBucket
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}-an
+                Condition:
+                  StringEquals:
+                    s3:x-amz-bucket-namespace: account-regional
+              # The earlier name, created only in a Region without the account regional
+              # namespace (me-south-1, me-central-1), when a create of the -an name is
+              # denied and neither bucket exists yet, or by an app version older than
+              # this template.
+              - Sid: CreateEarlierPluginBucket
                 Effect: Allow
                 Action: s3:CreateBucket
                 Resource:
@@ -681,7 +703,8 @@ Resources:
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}-an
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
                 Condition:
                   StringEquals:
                     s3:ResourceAccount:
@@ -695,7 +718,8 @@ Resources:
                   - s3:GetObject
                   - s3:DeleteObject
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}-an/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
                 Condition:
                   StringEquals:
                     s3:ResourceAccount:
@@ -881,14 +905,17 @@ Resources:
                   - cloudformation:ListStacks
                 Resource: "*"
               # Stage the oversize cdc-stack template in the plugin bucket: this role
-              # does the PutObject; CloudFormation reads it back (TemplateURL) too.
+              # does the PutObject; CloudFormation reads it back (TemplateURL) too. Both
+              # names of the plugin bucket (the -an one and the earlier one): Start
+              # stages in whichever of them the app uses.
               - Sid: StageCdcStackTemplate
                 Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:GetObject
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/cdc-plugins/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}-an/cdc-plugins/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/cdc-plugins/*
                 Condition:
                   StringEquals:
                     s3:ResourceAccount:
@@ -1265,12 +1292,16 @@ Resources:
                 Resource:
                   - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:dsql-cdc-*
                   - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:mysql-dsql-cdc-*
-              # CustomPlugin reads the plugin artifact from the managed bucket.
+              # CustomPlugin reads the plugin artifact from the managed bucket. Both names
+              # of the plugin bucket: a CDC stack's PluginBucketArn names the bucket the
+              # app used when it deployed that stack (the earlier one for a stack an
+              # earlier version deployed), and an update keeps it.
               - Sid: ReadPluginArtifacts
                 Effect: Allow
                 Action: s3:GetObject
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}-an/*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
                 Condition:
                   StringEquals:
                     s3:ResourceAccount:
