@@ -918,16 +918,13 @@ public class DsqlSinkTask extends SinkTask {
    */
   private void applyChunk(List<Applicable> chunk) {
     try {
-      OccRetry.withRetry(
+      retried(
           () -> {
             Connection conn = connection();
             applyChunkBatched(conn, chunk);
             conn.commit();
             return null;
-          },
-          this::beforeRetry,
-          config.maxRetries(),
-          config.retryBackoffMs());
+          });
       recordOps(chunk); // committed: count the chunk's per-table applied ops
     } catch (SQLException e) {
       rollbackQuietly();
@@ -972,16 +969,7 @@ public class DsqlSinkTask extends SinkTask {
         continue; // its partition was held earlier in this chunk: fetched again later
       }
       try {
-        OccRetry.withRetry(
-            () -> {
-              Connection conn = connection();
-              executeOne(conn, a.event());
-              conn.commit();
-              return null;
-            },
-            this::beforeRetry,
-            config.maxRetries(),
-            config.retryBackoffMs());
+        commitOne(a.event());
         recordOps(a.event()); // committed this row: count its applied op
         if (!driftCooldown.isEmpty()) {
           clearDriftCooldownOnSuccess(a.event());
@@ -1351,16 +1339,7 @@ public class DsqlSinkTask extends SinkTask {
       TopicPartition tp = entry.getKey();
       ChangeEvent event = hold.head.event();
       try {
-        OccRetry.withRetry(
-            () -> {
-              Connection conn = connection();
-              executeOne(conn, event);
-              conn.commit();
-              return null;
-            },
-            this::beforeRetry,
-            config.maxRetries(),
-            config.retryBackoffMs());
+        commitOne(event);
       } catch (SQLException e) {
         rollbackQuietly();
         if (isTransient(e)) {
@@ -1760,11 +1739,7 @@ public class DsqlSinkTask extends SinkTask {
       return null;
     }
     try {
-      return OccRetry.withRetry(
-          () -> loadTargetTypes(key[0], key[1]),
-          this::beforeRetry,
-          config.maxRetries(),
-          config.retryBackoffMs());
+      return retried(() -> loadTargetTypes(key[0], key[1]));
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
@@ -1842,11 +1817,7 @@ public class DsqlSinkTask extends SinkTask {
       return null;
     }
     try {
-      return OccRetry.withRetry(
-          () -> loadSourceKeyIndex(key[0], key[1], columns),
-          this::beforeRetry,
-          config.maxRetries(),
-          config.retryBackoffMs());
+      return retried(() -> loadSourceKeyIndex(key[0], key[1], columns));
     } catch (SQLException e) {
       rollbackQuietly();
       if (isTransient(e)) {
@@ -2171,6 +2142,21 @@ public class DsqlSinkTask extends SinkTask {
       executeStatement(conn, event.moveDelete());
     }
     executeStatement(conn, event);
+  }
+
+  /**
+   * Apply {@code event} alone in one transaction and commit it, under {@link #retried}: a row of
+   * {@link #applyRecordByRecord} and a held change's try ({@link #resolveDueHolds}). The caller
+   * rolls back on the error it throws.
+   */
+  private void commitOne(ChangeEvent event) throws SQLException {
+    retried(
+        () -> {
+          Connection conn = connection();
+          executeOne(conn, event);
+          conn.commit();
+          return null;
+        });
   }
 
   private void executeStatement(Connection conn, ChangeEvent event) throws SQLException {
@@ -2782,8 +2768,20 @@ public class DsqlSinkTask extends SinkTask {
   }
 
   /**
-   * {@link OccRetry}'s step between attempts at every call site: count the retry by its
-   * SQLSTATE (logged once per offset commit, {@link #logRetrySummary}), then
+   * {@code work} under {@link OccRetry} with this task's budget ({@code occ.max.retries}
+   * attempts, {@code occ.retry.backoff.ms} base backoff) and step between attempts
+   * ({@link #beforeRetry}). Every in-process retry of the sink runs through it: a chunk
+   * ({@link #applyChunk}), one row ({@link #commitOne}) and the two catalog reads
+   * ({@link #readTargetTypes}, {@link #readSourceKeyIndex}).
+   */
+  private <T> T retried(OccRetry.SqlWork<T> work) throws SQLException {
+    return OccRetry.withRetry(
+        work, this::beforeRetry, config.maxRetries(), config.retryBackoffMs());
+  }
+
+  /**
+   * {@link OccRetry}'s step between attempts at every call site ({@link #retried}): count the
+   * retry by its SQLSTATE (logged once per offset commit, {@link #logRetrySummary}), then
    * {@link #rollbackBeforeRetry}. Package-private for tests.
    */
   void beforeRetry(SQLException retried) {
