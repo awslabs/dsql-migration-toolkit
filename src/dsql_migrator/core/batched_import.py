@@ -1967,70 +1967,57 @@ class BatchedImporter:
                 work.key_columns,
             )
 
-            def _counted_skip(pool_):
-                nonlocal attempts
-                attempts += 1
+            def _attempt(pool_):
+                return self._execute_skip_existing(pool_, work, optimistic_insert)
+
+            # The skip path's rows that already existed are "skipped", not "conflicts".
+            debug_format = (
+                "import batch chunk=%s table=%s pk_range=[%s..%s] attempted=%d "
+                "inserted=%d skipped=%d on_conflict=%s occ_retries=%d"
+            )
+        else:
+            # Fetched once for the batch: every attempt sends these same bytes.
+            statement = self._inserts.statement(
+                work.table_name, work.columns, attempted, work.on_conflict, work.key_columns
+            )
+            params = _flatten_params(work.rows, work.columns)
+
+            def _attempt(pool_):
                 try:
-                    return self._execute_skip_existing(pool_, work, optimistic_insert)
-                except Exception as exc:  # noqa: BLE001 - counted, then re-raised
-                    _count_failure(exc)
+                    return self._execute_insert(
+                        pool_, statement, params, attempted,
+                        on_conflict=work.on_conflict,
+                    )
+                except Exception as exc:  # noqa: BLE001 - inspect sqlstate
+                    # A NONE-mode plain INSERT (clean load into an empty target) can only hit a
+                    # unique violation (23505) on a RETRY after the batch already committed but
+                    # the commit ack was lost to a transient connection drop or to Aurora DSQL's
+                    # XX000 at commit. Recover idempotently via SELECT-existing + insert-missing
+                    # instead of letting the 23505 reach _load_batch, which would binary-split
+                    # and FALSELY quarantine rows that are actually present (phantom data-loss
+                    # report). DO_NOTHING / DO_UPDATE carry an ON CONFLICT clause, so a 23505
+                    # is not expected there and is left to surface. A failed recovery is
+                    # counted like any other failed attempt (_counted).
+                    if (
+                        work.on_conflict is OnConflictMode.NONE
+                        and work.key_columns
+                        and getattr(exc, "sqlstate", None) == "23505"
+                    ):
+                        self.load_stats.record_unique_recovery()
+                        return self._select_filter_insert(pool_, work)
                     raise
 
-            retried = with_occ_retry(
-                max_attempts=self._occ_max_attempts,
-                base_delay=self._occ_base_delay,
-                sleep=self._sleep,
-                jitter=self._jitter,
-                retryable=_is_retryable_load_error,
-            )(_counted_skip)
-            try:
-                inserted, conflicts = retried(pool)
-            finally:
-                self.load_stats.record_statement(attempts)
-            if _LOGGER.isEnabledFor(logging.DEBUG):
-                first_pk, last_pk = _batch_pk_range(work)
-                _LOGGER.debug(
-                    "import batch chunk=%s table=%s pk_range=[%s..%s] attempted=%d "
-                    "inserted=%d skipped=%d on_conflict=%s occ_retries=%d",
-                    work.chunk_id, work.table_name, first_pk, last_pk, attempted,
-                    inserted, conflicts, work.on_conflict.value, max(0, attempts - 1),
-                )
-            return inserted, conflicts
+            debug_format = (
+                "import batch chunk=%s table=%s pk_range=[%s..%s] attempted=%d "
+                "inserted=%d conflicts=%d on_conflict=%s occ_retries=%d"
+            )
 
-        # Fetched once for the batch: every attempt sends these same bytes.
-        statement = self._inserts.statement(
-            work.table_name, work.columns, attempted, work.on_conflict, work.key_columns
-        )
-        params = _flatten_params(work.rows, work.columns)
-
-        def _counted_execute(pool_, statement_, params_, attempted_):
+        def _counted(pool_):
             nonlocal attempts
             attempts += 1
             try:
-                return self._execute_insert(
-                    pool_, statement_, params_, attempted_,
-                    on_conflict=work.on_conflict,
-                )
-            except Exception as exc:  # noqa: BLE001 - inspect sqlstate
-                # A NONE-mode plain INSERT (clean load into an empty target) can only hit a
-                # unique violation (23505) on a RETRY after the batch already committed but the
-                # commit ack was lost to a transient connection drop or to Aurora DSQL's XX000
-                # at commit. Recover idempotently via SELECT-existing + insert-missing instead
-                # of letting the 23505 reach _load_batch, which would binary-split and FALSELY
-                # quarantine rows that are actually present (phantom data-loss report).
-                # DO_NOTHING / DO_UPDATE carry an ON CONFLICT clause, so a 23505 is not
-                # expected there and is left to surface.
-                if (
-                    work.on_conflict is OnConflictMode.NONE
-                    and work.key_columns
-                    and getattr(exc, "sqlstate", None) == "23505"
-                ):
-                    self.load_stats.record_unique_recovery()
-                    try:
-                        return self._select_filter_insert(pool_, work)
-                    except Exception as recovery_exc:  # noqa: BLE001 - counted, re-raised
-                        _count_failure(recovery_exc)
-                        raise
+                return _attempt(pool_)
+            except Exception as exc:  # noqa: BLE001 - counted, then re-raised
                 _count_failure(exc)
                 raise
 
@@ -2040,9 +2027,9 @@ class BatchedImporter:
             sleep=self._sleep,
             jitter=self._jitter,
             retryable=_is_retryable_load_error,
-        )(_counted_execute)
+        )(_counted)
         try:
-            inserted, conflicts = retried(pool, statement, params, attempted)
+            inserted, conflicts = retried(pool)
         finally:
             self.load_stats.record_statement(attempts)
 
@@ -2052,8 +2039,7 @@ class BatchedImporter:
         if _LOGGER.isEnabledFor(logging.DEBUG):
             first_pk, last_pk = _batch_pk_range(work)
             _LOGGER.debug(
-                "import batch chunk=%s table=%s pk_range=[%s..%s] attempted=%d "
-                "inserted=%d conflicts=%d on_conflict=%s occ_retries=%d",
+                debug_format,
                 work.chunk_id, work.table_name, first_pk, last_pk, attempted,
                 inserted, conflicts, work.on_conflict.value, max(0, attempts - 1),
             )
