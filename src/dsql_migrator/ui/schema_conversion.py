@@ -79,11 +79,10 @@ from dsql_migrator.core.converter import (
     pg_view_ddl,
     rename_index_script,
     rename_index_statements,
-    sql_without_comments,
-    terminated_sql_statement,
     validate_composite_leading_column,
     without_composite_placeholder,
 )
+from dsql_migrator.core.sql_text import sql_without_comments, terminated_sql_statement
 from dsql_migrator.core.assessor import kind_label
 from dsql_migrator.core.source_dialect import dialect_for
 from dsql_migrator.core.source_time_zone import SourceZone, resolve_source_zone

@@ -416,7 +416,7 @@ def _qualified_default_calls(default: str, functions: "Sequence[tuple[str, str]]
     ``schema.function`` -- how pg_get_expr prints one that is not on the search path,
     which is what Schema Conversion tells apart from a built-in. ``functions`` holds
     ``(quoted schema.name, quoted name)``; a call inside a string literal is left alone."""
-    from dsql_migrator.core.converter import _mask_sql_literals
+    from dsql_migrator.core.sql_text import _mask_sql_literals
 
     out = default
     for qualified, name in functions:

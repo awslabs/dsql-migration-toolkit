@@ -239,7 +239,7 @@ def _applied_foreign_keys(
             + list(getattr(conversion, "preserved_foreign_keys", None) or ())
         )
     }
-    from dsql_migrator.core.converter import _mask_sql_literals
+    from dsql_migrator.core.sql_text import _mask_sql_literals
 
     known = set(known_tables or ())
     found: list[tuple[str, str, list[str], list[str], bool]] = []
@@ -501,7 +501,7 @@ def _applied_nnd_indexes(
     """``(index, columns)`` of each applied ``CREATE UNIQUE INDEX ... NULLS NOT DISTINCT``
     (G170): the statement decides, so an edit that drops the clause is honoured. Cached by
     the statements, as :func:`_unique_members` is."""
-    from dsql_migrator.core.converter import _mask_sql_literals
+    from dsql_migrator.core.sql_text import _mask_sql_literals
 
     found = []
     for index_ddl in index_ddls:
@@ -609,7 +609,8 @@ def views_referencing(
     """
     if not view_ddls or not tables:
         return []
-    from dsql_migrator.core.converter import _dependency_order, _mask_sql_literals, _scan_sql_names
+    from dsql_migrator.core.converter import _dependency_order
+    from dsql_migrator.core.sql_text import _mask_sql_literals, _scan_sql_names
 
     # Each body's reads, once, and a relation -> views index (a regex per (view, name)
     # pair made a reload over thousands of views stall for minutes). A view reads what

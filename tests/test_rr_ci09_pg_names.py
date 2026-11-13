@@ -214,6 +214,7 @@ def test_pg_names_is_standard_library_only() -> None:
 _COPY_MODULES = (
     "models.py", "converter.py", "query_converter.py", "assessor.py", "cdc.py",
     "schema_applier.py", "target_introspector.py",
+    "sql_text.py",  # the converter's SQL text scan, split out of it (CONV-4)
 )
 
 

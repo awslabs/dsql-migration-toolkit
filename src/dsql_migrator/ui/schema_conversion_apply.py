@@ -30,10 +30,10 @@ from dsql_migrator.core.converter import (
     is_name_collision_placeholder,
     parse_target_primary_key,
     rename_index_statements,
-    sql_without_comments,
     unkeyable_columns,
     views_in_dependency_order,
 )
+from dsql_migrator.core.sql_text import sql_without_comments
 from dsql_migrator.core.models import (
     AssessmentReport,
     Classification,
@@ -564,7 +564,7 @@ _FOREIGN_KEY_ROLE = "FOREIGN KEY"
 def _stored_parts(raw_name: str) -> "tuple[str, ...]":
     """A written name's parts as PostgreSQL stores them: quoted as written, unquoted folded,
     each cut to 63 bytes."""
-    from dsql_migrator.core.converter import _chain_parts
+    from dsql_migrator.core.sql_text import _chain_parts
     from dsql_migrator.core.target_introspector import pg_stored_name
 
     return tuple(pg_stored_name(part) for part in _chain_parts(raw_name)[0])
@@ -598,7 +598,8 @@ def _match_read_alike(pattern: "re.Pattern[str]", clean: str) -> "Optional[re.Ma
     lower()s every letter, so a bare ``shop.ordersÉ`` is PostgreSQL's "ordersÉ" and the
     applier's "ordersé", which a REPLACE then dropped -- while ``shop.café`` or
     ``shop.order_주문`` is one name to both."""
-    from dsql_migrator.core.converter import _SQL_PART_RE, fold_identifier
+    from dsql_migrator.core.converter import fold_identifier
+    from dsql_migrator.core.sql_text import _SQL_PART_RE
 
     match = pattern.match(clean)
     if match is None or any(
@@ -915,7 +916,7 @@ def merge_object_ddl(
         else:
             at = len(merged)
         merged.insert(at, statement)
-    from dsql_migrator.core.converter import terminated_sql_statement
+    from dsql_migrator.core.sql_text import terminated_sql_statement
 
     script = "\n\n".join(
         # A comment-only piece (a note at the end of an edit) stays as written.
@@ -1174,7 +1175,7 @@ def _first_create_table(target_ddl: str) -> str:
     The stored DDL is the whole script (CREATE TABLE + CREATE INDEX ...), but the
     single-statement parsers here read one statement -- isolate the CREATE TABLE.
     """
-    from dsql_migrator.core.converter import sql_without_comments
+    from dsql_migrator.core.sql_text import sql_without_comments
 
     return next(
         (
@@ -1224,7 +1225,7 @@ def _column_list_elements(create_table_ddl: str) -> "list[str]":
     definitions and table constraints), comments dropped and whitespace collapsed -- the
     list's '(' found outside quoted names, strings and comments, and no comma inside
     parentheses, a string literal, a quoted identifier or a comment splitting it."""
-    from dsql_migrator.core.converter import _sql_skip
+    from dsql_migrator.core.sql_text import _sql_skip
 
     text = create_table_ddl or ""
     elements: list[str] = []
@@ -1810,7 +1811,7 @@ def split_sql_statements(text: str) -> list[str]:
     A single edited target-DDL script is split here so each statement is applied
     as one DDL in its own transaction (Property 2) by the apply path.
     """
-    from dsql_migrator.core.converter import sql_statement_spans
+    from dsql_migrator.core.sql_text import sql_statement_spans
 
     return [
         text[start:end].strip()
@@ -1905,7 +1906,7 @@ def _statement_level(statement: str) -> "tuple[str, list[int]]":
     """``statement`` as read at its own level, every offset kept: a string or dollar literal
     one value (``0``), a comment blank, what is inside brackets blank; and where each line at
     that level starts."""
-    from dsql_migrator.core.converter import _SQL_SPECIAL_RE, _sql_skip
+    from dsql_migrator.core.sql_text import _SQL_SPECIAL_RE, _sql_skip
 
     out: list[str] = []
     starts: list[int] = []
@@ -2062,7 +2063,7 @@ def _join_sql_statements(statements: Sequence[str]) -> str:
     Mirrors ``render_target_ddl``'s formatting so a split-then-join round-trips a
     rendered target script unchanged (modulo whitespace).
     """
-    from dsql_migrator.core.converter import terminated_sql_statement
+    from dsql_migrator.core.sql_text import terminated_sql_statement
 
     return "\n\n".join(terminated_sql_statement(s) for s in statements if s.strip())
 
@@ -2099,7 +2100,7 @@ def join_target_ddl_fk_sections(non_fk: str, fk: str) -> str:
     a full script and the deferred FKs still reach the post-load pass. The inverse
     of :func:`split_target_ddl_fk_sections`; an empty part is dropped.
     """
-    from dsql_migrator.core.converter import terminated_sql_script
+    from dsql_migrator.core.sql_text import terminated_sql_script
 
     parts = [part.strip() for part in (non_fk, fk) if part.strip()]
     if len(parts) == 2:
