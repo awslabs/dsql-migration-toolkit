@@ -261,8 +261,10 @@ def test_a_source_the_tool_cannot_read_is_warned_about_not_refused(lang: str) ->
     source = _CDC_UI.read_text(encoding="utf-8")
     assert source.count("PG_CHECKS_NOT_RUN_ACTION,") == 2  # the dialog's line and the worker's
     assert '"went ahead without them"' in source  # the worker's line: the Start goes ahead
+    # The blocks and the route rule moved to core/cdc_pg_routes.py (cdccore-10), which
+    # core/cdc_pg_slot.py re-exports; this pin follows the code.
     assert "return _INHERITANCE_UNREADABLE_BLOCK" in (
-        ROOT / "src/dsql_migrator/core/cdc_pg_slot.py"
+        ROOT / "src/dsql_migrator/core/cdc_pg_routes.py"
     ).read_text(encoding="utf-8")
 
     section = _section_43(lang)
