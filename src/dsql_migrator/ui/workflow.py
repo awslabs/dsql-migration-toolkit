@@ -29,6 +29,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
+from dsql_migrator.core.dsql_metadata import parse_dsql_cluster_id
 from dsql_migrator.core.models import (
     MigrationContext,
     SourceType,
@@ -502,19 +503,6 @@ def _aws_region_from_host(host: Optional[str]) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _dsql_cluster_name(endpoint: Optional[str]) -> Optional[str]:
-    """Derive the DSQL cluster name (id) from its endpoint.
-
-    A DSQL endpoint looks like ``<cluster-id>.dsql.<region>.on.aws``; the cluster
-    id is the label before ``.dsql.`` (or the first label otherwise). Returns
-    ``None`` for an empty endpoint.
-    """
-    if not endpoint:
-        return None
-    head, marker, _rest = endpoint.partition(".dsql.")
-    return head if marker else endpoint.split(".", 1)[0]
-
-
 # Official AWS Architecture Icons (64/Databases), inlined for offline-safe
 # rendering (no external URL / static route). Both are the trademarked AWS icons
 # from the AWS Architecture Icons asset package: the Databases-category squid
@@ -763,10 +751,10 @@ def build_migration_diagram(
         # cluster id parsed from the endpoint.
         cluster_name = (
             getattr(state, "target_cluster_name", None)
-            or _dsql_cluster_name(endpoint)
+            or parse_dsql_cluster_id(endpoint)
         )
         target_subtitle = cluster_name or "Aurora DSQL"
-        cluster_id = _dsql_cluster_name(endpoint)
+        cluster_id = parse_dsql_cluster_id(endpoint)
         target_details = tuple(
             pair
             for pair in (

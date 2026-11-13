@@ -61,3 +61,14 @@ def test_fetch_dsql_cluster_name_none_on_error() -> None:
 
     assert fetch_dsql_cluster_name(_Boom(), "abc.dsql.us-east-1.on.aws") is None
     assert fetch_dsql_cluster_name(_FakeDsql({}), "") is None
+
+
+def test_the_screens_read_the_cluster_id_through_parse_dsql_cluster_id() -> None:
+    """X10: the journey diagram and the Validation scope card derive the cluster id with
+    this one parser, not with copies of their own."""
+    from dsql_migrator.ui import validation, workflow
+
+    assert workflow.parse_dsql_cluster_id is parse_dsql_cluster_id
+    assert validation.parse_dsql_cluster_id is parse_dsql_cluster_id
+    assert not hasattr(workflow, "_dsql_cluster_name")
+    assert not hasattr(validation, "_dsql_cluster_id")

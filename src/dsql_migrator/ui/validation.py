@@ -62,6 +62,7 @@ from dsql_migrator.core.activity_log import (
     log_activity,
 )
 from dsql_migrator.core.assessment_strategist import AssessmentStrategist
+from dsql_migrator.core.dsql_metadata import parse_dsql_cluster_id
 from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
 from dsql_migrator.core.models import (
     AiAssistConfig,
@@ -1773,7 +1774,11 @@ def build_validation_scope(
         source_detail = "not connected"
 
     if target_config is not None:
-        cluster = target_cluster_name or _dsql_cluster_id(target_config.cluster_endpoint)
+        cluster = (
+            target_cluster_name
+            or parse_dsql_cluster_id(target_config.cluster_endpoint)
+            or "Aurora DSQL"
+        )
         target_label = f"Target · {cluster}"
         target_detail = f"Aurora DSQL · {target_config.region}"
     else:
@@ -1794,14 +1799,6 @@ def build_validation_scope(
         is_filtered=is_filtered,
         scope_count=scope_count,
     )
-
-
-def _dsql_cluster_id(endpoint: str) -> str:
-    """Derive a short DSQL cluster id from its endpoint (label before ``.dsql.``)."""
-    if not endpoint:
-        return "Aurora DSQL"
-    head, marker, _rest = endpoint.partition(".dsql.")
-    return head if marker else endpoint.split(".", 1)[0]
 
 
 def _cdc_in_use(session: object) -> bool:
