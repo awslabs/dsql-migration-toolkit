@@ -509,6 +509,10 @@ Resources:
                   - Sid: GetSourceTarball
                     Effect: Allow
                     Action: s3:GetObject
+                    Condition:
+                      StringEquals:
+                        s3:ResourceAccount:
+                          Ref: AWS::AccountId
                     Resource:
                       Fn::Sub:
                         - arn:${AWS::Partition}:s3:::${SourceObject}
@@ -662,13 +666,26 @@ Resources:
               # prefix). CreateBucket makes it self-provisioning; ListBucket backs
               # snapshot pruning; the object-level grant on /* covers both prefixes
               # (incl. head_object via s3:GetObject). Scoped to that bucket only.
-              - Sid: ManagePluginBucket
+              # Every grant on the derived bucket name carries s3:ResourceAccount = this
+              # account, so S3 refuses this role on a bucket by that name another account
+              # owns, even for a request that would not assert the owner itself
+              # (the app's requests also send ExpectedBucketOwner). CreateBucket has its own
+              # statement without it: creating a name another account owns fails with
+              # BucketAlreadyExists, so the condition would add nothing there.
+              - Sid: CreatePluginBucket
                 Effect: Allow
-                Action:
-                  - s3:CreateBucket
-                  - s3:ListBucket
+                Action: s3:CreateBucket
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
+              - Sid: ManagePluginBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount:
+                      Ref: AWS::AccountId
               # PutObject/GetObject: upload plugins + read/write session snapshots.
               # DeleteObject: remove a session on "Start over" and prune old ones.
               - Sid: UploadPlugins
@@ -679,6 +696,10 @@ Resources:
                   - s3:DeleteObject
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount:
+                      Ref: AWS::AccountId
               # The privileged cdc-stack CloudFormation/MSK/IAM operations are NOT
               # granted to this (long-running) host role. Instead the app assumes
               # the dedicated CdcDeployRole only for the duration of a deploy. The
@@ -868,6 +889,10 @@ Resources:
                   - s3:GetObject
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/cdc-plugins/*
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount:
+                      Ref: AWS::AccountId
               # MSK Serverless cluster (CFN AWS::MSK::ServerlessCluster) +
               # GetBootstrapBrokers (called directly by the deployer at Start).
               - Sid: MskServerlessCluster
@@ -1246,6 +1271,10 @@ Resources:
                 Action: s3:GetObject
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:s3:::mysql-dsql-migrator-plugins-${AWS::AccountId}-${AWS::Region}/*
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount:
+                      Ref: AWS::AccountId
 
   # Host security group. NO ingress: SSM Session Manager and its port-forward run
   # entirely over the SSM agent's OUTBOUND channel (the agent dials out to the SSM

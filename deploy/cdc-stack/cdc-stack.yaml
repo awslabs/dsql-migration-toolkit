@@ -1336,6 +1336,12 @@ Resources:
                 Action: s3:GetObject
                 Resource:
                   Fn::Sub: ${PluginBucketArn}/*
+                # Only this account's bucket (defense in depth: the app checks the owner
+                # before it uploads anything this role reads).
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount:
+                      Ref: AWS::AccountId
         - PolicyName: connector-logs
           PolicyDocument:
             Version: "2012-10-17"
