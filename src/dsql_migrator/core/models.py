@@ -2484,6 +2484,20 @@ class DriftReport(BaseModel):
     current_binlog: Optional[str] = None
 
 
+def drift_is_determinable(drift: "DriftReport") -> bool:
+    """Whether ``drift.drifted`` means anything: a coordinate was actually compared.
+
+    Follows the ``basis`` the core used, so a GTID-less source compared by binlog position is
+    determinable. A report from before ``basis`` existed falls back to its GTID pair. The one
+    rule the text report (core.validator) and the Validation panel (ui.validation.format_drift)
+    word drift by.
+    """
+    basis = getattr(drift, "basis", "") or ""
+    return bool(basis) if basis else (
+        drift.watermark_gtid is not None and drift.current_gtid is not None
+    )
+
+
 class ValidationReport(BaseModel):
     """Result of validating migrated data against the source (Requirement 6.4).
 
@@ -2621,5 +2635,6 @@ __all__ = [
     "UncheckedForeignKey",
     "ForeignKeyValidationJob",
     "DriftReport",
+    "drift_is_determinable",
     "ValidationReport",
 ]

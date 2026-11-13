@@ -114,6 +114,7 @@ from dsql_migrator.core.models import (
     ValidationReport,
     Watermark,
     TableValidationResult,
+    drift_is_determinable,
 )
 from dsql_migrator.core.target_connection import (
     TRANSACTION_AGE_LIMIT_SQLSTATE,
@@ -3532,19 +3533,16 @@ def _render_drift_lines(drift: Optional[DriftReport]) -> list[str]:
     confirm a pre-cut-over write freeze held. That is the state of EVERY PostgreSQL-source
     run (the MySQL GTID/binlog probes are deliberately skipped there: they would break
     the shared snapshot), so the strongest claim in the section was also the one with no
-    evidence behind it. Determinability is derived from ``basis`` exactly as the UI's
-    ``format_drift`` does, and the GTID rows are dropped when they carry nothing.
+    evidence behind it. Determinability is :func:`~dsql_migrator.core.models.
+    drift_is_determinable`, the rule the UI's ``format_drift`` uses, and the GTID rows are
+    dropped when they carry nothing.
     """
     if drift is None:
         return [
             "Drift since snapshot: not available "
             "(validation ran without a watermark)."
         ]
-    basis = getattr(drift, "basis", "") or ""
-    determinable = bool(basis) if basis else (
-        drift.watermark_gtid is not None and drift.current_gtid is not None
-    )
-    if not determinable:
+    if not drift_is_determinable(drift):
         return [
             "Drift since snapshot:",
             "- Drifted: could not be determined (no comparable source coordinate)",

@@ -79,6 +79,7 @@ from dsql_migrator.core.models import (
     ValidationMode,
     ValidationReport,
     Watermark,
+    drift_is_determinable,
 )
 from dsql_migrator.core.table_selection import TableSelectionError, TableSelector
 from dsql_migrator.core.validator import (
@@ -2036,9 +2037,7 @@ def format_drift(report: ValidationReport, *, postgres_source: bool = False) -> 
     # Determinability follows the BASIS the core actually used, so a GTID-less source
     # that was compared by binlog position is (correctly) determinable. Older reports
     # predate `basis`; fall back to the GTID pair so they still render as before.
-    determinable = bool(basis) if basis else (
-        drift.watermark_gtid is not None and drift.current_gtid is not None
-    )
+    determinable = drift_is_determinable(drift)
     if not determinable and postgres_source:
         summary = (
             "Source changes since the snapshot are not determined on a PostgreSQL "
