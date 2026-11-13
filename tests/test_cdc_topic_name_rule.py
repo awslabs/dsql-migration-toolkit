@@ -18,6 +18,9 @@ Covers:
 - a '.' inside a table name alone gets nothing (it streams on sink plugin v57);
 - not an AI candidate, registered for both engines;
 - it names exactly the tables Data Migration refuses on a v57 stack (the real builders);
+- with Evaluation's DOTTED_SCHEMA_NAME tables (a run's catalog read, and a refresh that
+  carries it): such a table gets no CDC advice and is no other table's '.'/'_' twin, as
+  Data Migration given those tables judges it;
 - the Evaluation screen and the text and HTML exports render it as they render FK_PRESERVED.
 """
 
@@ -26,11 +29,14 @@ from __future__ import annotations
 import pytest
 
 from dsql_migrator.core.assessor import (
+    DOTTED_SCHEMA_RULE_ID,
     CdcTopicNameRule,
     CompatibilityAssessor,
     default_rules,
+    dotted_schema_findings,
     render_html_report,
     render_text_report,
+    with_object_findings,
 )
 from dsql_migrator.core.cdc import topic_name_refusal, topic_name_refused_tables
 from dsql_migrator.core.models import (
@@ -38,11 +44,17 @@ from dsql_migrator.core.models import (
     ColumnDef,
     ConversionNoteKind,
     EffortLevel,
+    SourceConnectionConfig,
     SourceInventory,
     SourceType,
     TableDef,
+    TargetConnectionConfig,
+    TargetInventory,
 )
+from dsql_migrator.ui.data_migration._models import cdc_rule_tables
+from dsql_migrator.ui.evaluation import EvaluationInputs, run_evaluation, with_refreshed_catalogs
 from dsql_migrator.ui.schema_conversion_apply import ai_candidate_object_names
+from tests.test_dotted_schema_names import _Browser, _Introspector
 from tests.test_g128_deploy_review import _start
 from tests.test_ui_evaluation import _ItemUi
 
@@ -252,6 +264,122 @@ def test_it_names_exactly_the_tables_data_migration_refuses_on_a_v57_stack(engin
     # And a capture of the tables with no finding is one Data Migration accepts.
     clean = [name for name in names if name not in _flagged(report)]
     assert topic_name_refusal(_start(engine, clean).filled, sink_plugin="v57") is None
+
+
+# ---------------------------------------------------------------------------
+# 2b. With Evaluation's DOTTED_SCHEMA_NAME tables, judged as Data Migration judges them
+# ---------------------------------------------------------------------------
+
+
+def _run(names, dotted, engine="mysql"):
+    """Evaluation's real run over the tables ``names``, its catalog read having found the
+    databases (MySQL) or schemas (PostgreSQL) ``dotted``: a '.' in their name."""
+    inventory = SourceInventory(tables=[_table(n) for n in names])
+    return run_evaluation(
+        EvaluationInputs(
+            source_config=SourceConnectionConfig(
+                host="db", database=None, source_type=_ENGINES[engine]
+            ),
+            source_password=None,
+            target_config=TargetConnectionConfig(
+                cluster_endpoint="c.dsql.example", region="us-east-1"
+            ),
+        ),
+        introspector_factory=lambda _p: _Introspector(inventory, list(dotted)),
+        target_browser_factory=lambda _p: _Browser(),
+    )
+
+
+def _refreshed(result):
+    """The same report after a refresh or a restore: re-graded from the inventory alone,
+    with the run's DOTTED_SCHEMA_NAME findings carried over."""
+    return with_refreshed_catalogs(
+        result, inventory=result.inventory, target_inventory=TargetInventory(),
+        target_endpoint=None,
+    ).assessment
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_a_table_of_a_dotted_database_is_no_twin_and_gets_no_cdc_advice(engine) -> None:
+    # MySQL database `shop.v2` (PostgreSQL schema "public.v2") holds users, and shop_v2
+    # holds users too: their topics differ only in a '.' against a '_'. But shop.v2.users
+    # cannot be migrated at all (DOTTED_SCHEMA_NAME), and Data Migration, given that
+    # finding, refuses it on its own and streams shop_v2.users.
+    db = "shop" if engine == "mysql" else "public"
+    dotted_table, twin, plain = f"{db}.v2.users", f"{db}_v2.users", f"{db}.orders"
+    names = [dotted_table, twin, plain]
+    result = _run(names, [f"{db}.v2"], engine)
+    for report in (result.assessment, _refreshed(result)):
+        item = _item(report, dotted_table)
+        assert item.classification is Classification.UNSUPPORTED
+        # FAILS WITHOUT THE FIX: it also carried CDC_TOPIC_NAME's "copy the other in a Full
+        # load only migration", for a table that cannot be migrated at all.
+        assert [c.rule_id for c in item.concerns] == [DOTTED_SCHEMA_RULE_ID]
+        # FAILS WITHOUT THE FIX: its twin read "CDC can stream only one of shop.v2.users and
+        # shop_v2.users", which Data Migration contradicts.
+        assert _item(report, twin).rule_id == "COMPATIBLE"
+        assert _item(report, twin).classification is Classification.AUTO
+        assert _flagged(report) == set()
+        # Data Migration, given these DOTTED_SCHEMA_NAME tables (as its render reads them),
+        # refuses exactly the tables Evaluation names...
+        dotted_tables = cdc_rule_tables(report, DOTTED_SCHEMA_RULE_ID)
+        assert dotted_tables == [dotted_table]
+        refused = topic_name_refused_tables(
+            _start(engine, names).filled, sink_plugin="v57", dotted_schema_tables=dotted_tables
+        )
+        assert set(refused) == _flagged(report) | set(dotted_tables) == {dotted_table}
+        # ... and streams the twin.
+        assert topic_name_refusal(
+            _start(engine, [twin, plain]).filled,
+            sink_plugin="v57",
+            dotted_schema_tables=dotted_tables,
+        ) is None
+
+
+def test_a_group_of_three_with_a_dotted_database_member_is_a_pair_of_the_other_two() -> None:
+    # a.b.c is table c of database `a.b`; a.b_c and a_b.c still collide with each other.
+    result = _run(["a.b.c", "a.b_c", "a_b.c"], ["a.b"])
+    for report in (result.assessment, _refreshed(result)):
+        assert [c.rule_id for c in _item(report, "a.b.c").concerns] == [DOTTED_SCHEMA_RULE_ID]
+        for name in ("a.b_c", "a_b.c"):
+            (concern,) = _topic_concerns(report, name)
+            # FAILS WITHOUT THE FIX: "CDC can stream only one of a.b.c, a.b_c and a_b.c",
+            # and "copy the others ... rename all but one".
+            assert concern.risk == _collision("a.b_c and a_b.c")
+            assert concern.recommendation == _PAIR_FIX
+            assert _item(report, name).classification is Classification.AUTO
+        dotted_tables = cdc_rule_tables(report, DOTTED_SCHEMA_RULE_ID)
+        refused = topic_name_refused_tables(
+            _start("mysql", ["a.b.c", "a.b_c", "a_b.c"]).filled,
+            sink_plugin="v57",
+            dotted_schema_tables=dotted_tables,
+        )
+        assert set(refused) == _flagged(report) | set(dotted_tables)
+
+
+def test_a_name_kafka_refuses_in_a_dotted_database_gets_only_dotted_schema_name() -> None:
+    # FAILS WITHOUT THE FIX: "leave it out of the CDC pipeline: copy it in a Full load only
+    # migration", for a table that cannot be migrated at all.
+    result = _run(["my.db.a b", "shop.a b"], ["my.db"])
+    report = result.assessment
+    assert [c.rule_id for c in _item(report, "my.db.a b").concerns] == [DOTTED_SCHEMA_RULE_ID]
+    # A name Kafka refuses elsewhere keeps its advice.
+    (concern,) = _topic_concerns(report, "shop.a b")
+    assert concern.risk == _illegal("shop.a<U+0020>b")
+
+
+def test_the_advice_is_set_right_once_and_never_added_by_it() -> None:
+    names = ["app.v2.users", "app_v2.users", "shop.orders.v2", "shop.orders_v2"]
+    inventory = SourceInventory(tables=[_table(n) for n in names])
+    findings = dotted_schema_findings(inventory, ["app.v2"])
+    once = with_object_findings(_assess(names), findings)
+    # Re-applying changes nothing, and a pair no dotted database is in keeps its advice.
+    assert with_object_findings(once, findings) == once
+    # FAILS WITHOUT THE FIX: app.v2.users and app_v2.users were flagged as well.
+    assert _flagged(once) == {"shop.orders.v2", "shop.orders_v2"}
+    # A report from an assessor without the rule never gains the advice from it.
+    bare = CompatibilityAssessor(source_type=SourceType.MYSQL, rules=[]).assess(inventory)
+    assert _flagged(with_object_findings(bare, findings)) == set()
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Optional, Sequence
 
 from dsql_migrator.core.dsql_limits import DSQL_NUMERIC_MAX_PRECISION
 from dsql_migrator.core.models import (
@@ -733,6 +733,74 @@ class CascadeForeignKeyRule(Rule):
         return findings
 
 
+CDC_TOPIC_NAME_RULE_ID = "CDC_TOPIC_NAME"
+
+
+def cdc_topic_name_findings(names: "Iterable[str]") -> list[Finding]:
+    """The ``CDC_TOPIC_NAME`` advice for the tables ``names`` (qualified, in report order):
+    one finding on each table whose Kafka topic holds a character Kafka refuses, and on
+    each member of a group whose topics differ only in a '.' against a '_' (judged by
+    :func:`~dsql_migrator.core.cdc.topic_name_problems`). :class:`CdcTopicNameRule` reads
+    them over the inventory's tables; :func:`with_object_findings` reads them again
+    without the tables DOTTED_SCHEMA_NAME marks. Pure."""
+    from dsql_migrator.core.cdc import (
+        CDC_DEFAULT_TOPIC_PREFIX,
+        _shown_name,
+        topic_name_problems,
+    )
+
+    names = list(dict.fromkeys(names))
+    illegal, groups = topic_name_problems(names)
+    group_of = {name: group for group in groups for name in group}
+    refused = set(illegal)
+    findings: list[Finding] = []
+    for name in names:
+        if name in refused:
+            risk = (
+                f"CDC cannot stream {_shown_name(name)}: its Kafka topic is named after "
+                "its database or schema and its table, and Kafka allows only ASCII "
+                "letters, digits, '.', '_' and '-'. A Full load only migration is not "
+                "affected."
+            )
+            recommendation = (
+                "With Full load + CDC or CDC only, leave it out of the CDC pipeline: "
+                "copy it in a Full load only migration once its writes stop, or rename "
+                "it at the source."
+            )
+        elif name in group_of:
+            *first, last = sorted(group_of[name])
+            pair = len(first) == 1
+            risk = (
+                f"CDC can stream only one of {', '.join(first)} and {last}: each "
+                f"table's Kafka topic is named {CDC_DEFAULT_TOPIC_PREFIX}.<database or "
+                "schema>.<table>, and Kafka does not allow two topics whose names differ "
+                "only in a '.' against a '_'. A Full load only migration is not affected."
+            )
+            recommendation = (
+                "With Full load + CDC or CDC only, capture only one of them: copy "
+                + (
+                    "the other in a Full load only migration once its writes stop, or "
+                    "rename one at the source."
+                    if pair
+                    else "the others in a Full load only migration once their writes "
+                    "stop, or rename all but one at the source."
+                )
+            )
+        else:
+            continue
+        findings.append(
+            Finding(
+                object=ObjectKey(KIND_TABLE, name),
+                rule_id=CDC_TOPIC_NAME_RULE_ID,
+                classification=Classification.MANUAL,
+                risk=risk,
+                recommendation=recommendation,
+                note_kind=ConversionNoteKind.RECOMMENDATION,
+            )
+        )
+    return findings
+
+
 class CdcTopicNameRule(Rule):
     """Advise on tables CDC cannot stream because of their Kafka topic's name.
 
@@ -746,70 +814,19 @@ class CdcTopicNameRule(Rule):
     (:func:`~dsql_migrator.core.cdc.topic_name_problems`), so such a name gets nothing on
     its own. A Full load only migration is not affected, so this is ADVICE, filed as a
     ``RECOMMENDATION`` like FK_PRESERVED: the table stays AUTO, is not an AI candidate, and
-    adds no effort. A '.' inside a database or schema name is DOTTED_SCHEMA_NAME, which the
-    catalog read decides (:func:`dotted_schema_findings`); this rule reads the inventory
-    alone and does not see it.
+    adds no effort (:func:`cdc_topic_name_findings`).
+
+    A '.' inside a database or schema name is DOTTED_SCHEMA_NAME, which the catalog read
+    decides (:func:`dotted_schema_findings`), so this rule, reading the inventory alone,
+    still counts such a table. :func:`with_object_findings` sets that right when it adds
+    the DOTTED_SCHEMA_NAME findings, as Data Migration judges them: such a table cannot be
+    migrated at all, so it gets no CDC advice and is no other table's twin.
     """
 
-    rule_id = "CDC_TOPIC_NAME"
+    rule_id = CDC_TOPIC_NAME_RULE_ID
 
     def evaluate(self, inventory: SourceInventory) -> list[Finding]:
-        from dsql_migrator.core.cdc import (
-            CDC_DEFAULT_TOPIC_PREFIX,
-            _shown_name,
-            topic_name_problems,
-        )
-
-        illegal, groups = topic_name_problems(table.name for table in inventory.tables)
-        group_of = {name: group for group in groups for name in group}
-        refused = set(illegal)
-        findings: list[Finding] = []
-        for table in inventory.tables:
-            name = table.name
-            if name in refused:
-                risk = (
-                    f"CDC cannot stream {_shown_name(name)}: its Kafka topic is named after "
-                    "its database or schema and its table, and Kafka allows only ASCII "
-                    "letters, digits, '.', '_' and '-'. A Full load only migration is not "
-                    "affected."
-                )
-                recommendation = (
-                    "With Full load + CDC or CDC only, leave it out of the CDC pipeline: "
-                    "copy it in a Full load only migration once its writes stop, or rename "
-                    "it at the source."
-                )
-            elif name in group_of:
-                *first, last = sorted(group_of[name])
-                pair = len(first) == 1
-                risk = (
-                    f"CDC can stream only one of {', '.join(first)} and {last}: each "
-                    f"table's Kafka topic is named {CDC_DEFAULT_TOPIC_PREFIX}.<database or "
-                    "schema>.<table>, and Kafka does not allow two topics whose names differ "
-                    "only in a '.' against a '_'. A Full load only migration is not affected."
-                )
-                recommendation = (
-                    "With Full load + CDC or CDC only, capture only one of them: copy "
-                    + (
-                        "the other in a Full load only migration once its writes stop, or "
-                        "rename one at the source."
-                        if pair
-                        else "the others in a Full load only migration once their writes "
-                        "stop, or rename all but one at the source."
-                    )
-                )
-            else:
-                continue
-            findings.append(
-                Finding(
-                    object=ObjectKey(KIND_TABLE, name),
-                    rule_id=self.rule_id,
-                    classification=Classification.MANUAL,
-                    risk=risk,
-                    recommendation=recommendation,
-                    note_kind=ConversionNoteKind.RECOMMENDATION,
-                )
-            )
-        return findings
+        return cdc_topic_name_findings(table.name for table in inventory.tables)
 
 
 class TriggerRule(Rule):
@@ -2800,7 +2817,12 @@ def with_object_findings(
     finding read outside the inventory (row-level security on a table) grades the TABLE,
     instead of becoming a second, unrelated row for it. A finding replaces an existing
     concern of the same rule (re-applying is idempotent); one about an object the report
-    does not hold is dropped, since there is no object to grade. Pure.
+    does not hold is dropped, since there is no object to grade.
+
+    The CDC_TOPIC_NAME advice is then read again without the tables DOTTED_SCHEMA_NAME
+    marks (:func:`_topic_name_advice_without_dotted_schemas`), so a run's catalog read and a
+    refresh that carries it over (:func:`carry_probe_results`) both judge a '.'/'_' twin as
+    Data Migration does. Pure.
     """
     added: dict[tuple[str, str], list[Finding]] = defaultdict(list)
     for finding in findings:
@@ -2816,7 +2838,56 @@ def with_object_findings(
         replaced = {finding.rule_id for finding in extra}
         own = [f for f in _findings_of(item) if f.rule_id not in replaced]
         items.append(_aggregate(ObjectKey(item.kind.lower(), item.object_name), own + extra))
-    return AssessmentReport.from_items(items)
+    return AssessmentReport.from_items(_topic_name_advice_without_dotted_schemas(items))
+
+
+def _topic_name_advice_without_dotted_schemas(
+    items: "Sequence[AssessmentItem]",
+) -> list[AssessmentItem]:
+    """``items`` with the CDC_TOPIC_NAME advice read again over the tables that carry it,
+    leaving out those DOTTED_SCHEMA_NAME marks.
+
+    :class:`CdcTopicNameRule` reads the inventory alone, so a table of a database or
+    schema whose name holds a '.' (``app.v2.users``) still counted: it got the advice to
+    copy it in a Full load only migration, which it cannot be (it cannot be migrated at
+    all), and its '.'/'_' twin (``app_v2.users``) was told CDC could stream only one of the
+    two. Data Migration, given Evaluation's DOTTED_SCHEMA_NAME tables, refuses the dotted
+    one on its own and streams the twin
+    (:func:`~dsql_migrator.core.cdc.topic_name_refused_tables`). So such a table loses the
+    advice, and every group it was in is judged without it: a pair's other member loses
+    the advice, a larger group is reworded. Every member of a group carries the advice, so
+    the tables that do are all the names the groups can come from; the advice is never
+    added to a table that did not have it (a caller-supplied assessor without the rule
+    gets none). Idempotent, and unchanged when no table carries both. Pure."""
+
+    def tables_with(rule_id: str) -> list[str]:
+        # Any of the item's findings, not only the one governing it (as _findings_of reads
+        # them: an item built without concerns has only its headline).
+        return [
+            item.object_name
+            for item in items
+            if item.kind == KIND_TABLE.upper()
+            and (item.rule_id == rule_id or any(c.rule_id == rule_id for c in item.concerns))
+        ]
+
+    dotted = set(tables_with(DOTTED_SCHEMA_RULE_ID))
+    advised = tables_with(CDC_TOPIC_NAME_RULE_ID)
+    if dotted.isdisjoint(advised):
+        return list(items)
+    fresh = {
+        finding.object.name: finding
+        for finding in cdc_topic_name_findings(n for n in advised if n not in dotted)
+    }
+    regrade = set(advised)
+    regraded: list[AssessmentItem] = []
+    for item in items:
+        if item.kind != KIND_TABLE.upper() or item.object_name not in regrade:
+            regraded.append(item)
+            continue
+        own = [f for f in _findings_of(item) if f.rule_id != CDC_TOPIC_NAME_RULE_ID]
+        advice = [fresh[item.object_name]] if item.object_name in fresh else []
+        regraded.append(_aggregate(ObjectKey(KIND_TABLE, item.object_name), own + advice))
+    return regraded
 
 
 def carry_probe_results(
@@ -5082,6 +5153,8 @@ __all__ = [
     "TooManyColumnsRule",
     "NameCollisionRule",
     "CdcTopicNameRule",
+    "CDC_TOPIC_NAME_RULE_ID",
+    "cdc_topic_name_findings",
     "IdentifierLengthRule",
     "OversizedLobRule",
     "DecimalPrecisionRule",

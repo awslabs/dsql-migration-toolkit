@@ -640,6 +640,12 @@ def test_match_metric_tables_never_lends_a_qualified_name_another_tables_value()
     assert _match_metric_tables(["shop.orders.v2"], ["x.v2"]) == {}
     # FAILS WITHOUT THE FIX: the same for any qualified name -- a.orders read b.orders.
     assert _match_metric_tables(["a.orders"], ["b.orders"]) == {}
+    # FAILS WITHOUT THE FIX (the qualified-name guard, `if "." in name: continue`): this is
+    # the one case only that guard covers. Table `a.orders` of database x publishes
+    # x.a.orders, whose table part after its first '.' is a.orders; table orders of
+    # database a has not published yet, so its qualified name a.orders must not take
+    # that value as a bare match and show the other table's lag and applied ops.
+    assert _match_metric_tables(["a.orders"], ["x.a.orders"]) == {}
     # A qualified name that is published maps to itself, a '.' in its table included.
     assert _match_metric_tables(
         ["shop.orders.v2", "shop.orders"], ["shop.orders", "shop.orders.v2", "x.v2"]
