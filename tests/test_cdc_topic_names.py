@@ -14,18 +14,24 @@ CDC names each captured table's Kafka topic ``dsqlcdc.<db>.<table>`` (MySQL) or
   issue): a rollback on the Lambda path, about 2 minutes of retries blaming the network on the
   External one. And a comma, or whitespace ending a PostgreSQL table name, was trimmed into a
   legal name, so Start succeeded and the table was never captured (read from the code);
-- a '.' inside the database, schema or table name: Kafka takes it, but the sink splits a
-  qualified name on every '.', so every change to such a table failed, and takes a tombstone's
-  table from the topic's last two segments, so a delete on public."public.orders" removed the
-  same-keyed row of public.orders (read from the sink's code);
+- a '.' inside the database, schema or table name: Kafka takes it, but a sink plugin older than
+  v57 splits a qualified name on every '.', so every change to such a table failed, and takes a
+  tombstone's table from the topic's last two segments, so a delete on public."public.orders"
+  removed the same-keyed row of public.orders (read from the sink's code). From v57 the sink
+  reads a qualified name at its first '.' and skips every tombstone, and TableIncludeList
+  carries the exact escaped entry (shop\\.orders\\.v2), so a '.' inside a TABLE name streams
+  there; on an older or unidentified plugin it stays refused, naming the plugin and Delete +
+  Deploy. A table of a database or schema whose name holds a '.' (Evaluation's
+  DOTTED_SCHEMA_NAME) and a name with an empty part before its first '.' stay refused on any
+  plugin;
 - two names that differ only in a '.' against a '_' (app.v2_users, app_v2.users): Kafka refuses
   the second topic, which both seeders pre-create, so Start CDC failed after the deploy.
 
-A character that does not show is written as its code point. A refused name with two or more
-'.' may be a table of a database or schema whose name holds a '.', which no step supports
-(DOTTED_SCHEMA_NAME), so the refusal says so before its remedy, and the load-then-untick route
-before a Full load + CDC load excepts such a table. Doubles only: no AWS, no source, no Aurora
-DSQL.
+A character that does not show is written as its code point. A refused name that may be a table
+of a database or schema whose name holds a '.', which no step supports (DOTTED_SCHEMA_NAME) --
+one of Evaluation's DOTTED_SCHEMA_NAME tables when they are known, else any with two or more '.'
+-- gets a sentence saying so before the remedy, and the load-then-untick route before a Full
+load + CDC load excepts such a table. Doubles only: no AWS, no source, no Aurora DSQL.
 """
 
 from __future__ import annotations
@@ -46,10 +52,19 @@ from dsql_migrator.core.cdc import (
     CDC_DEFAULT_TOPIC_PREFIX,
     CDC_TOPIC_NAME_DOTTED_SCHEMA,
     CDC_TOPIC_NAME_REMEDY,
+    DOTTED_TABLE_MIN_PLUGIN_VERSION,
+    DebeziumSourceConfig,
+    SinkConnectorConfig,
     cdc_expected_connector_names,
     cdc_stack_name_is_valid,
+    cdc_table_list_params,
+    plugin_reads_dotted_tables,
+    plugin_supports_sink_keys,
+    table_include_entry,
+    topic_name_problems,
     topic_name_refusal,
     topic_name_refused_tables,
+    unescape_include_entry,
 )
 from dsql_migrator.core.cdc_deployer import CdcDeployError, run_cdc_start
 from dsql_migrator.core.models import ChunkState, MigrationJob, SourceType, StepStatus, Watermark
@@ -105,10 +120,37 @@ _FACT = (
     "topic name."
 )
 _ILLEGAL_FACT = _FACT.removeprefix("CDC cannot stream shop.a<U+0020>b")  # ": each table's ..."
-_DOTTED_FACT = (
-    ": the CDC sink reads every '.' in a table's qualified name as the one between its database "
-    "or schema and its table, so with a '.' inside either name, each change to that table fails "
-    "or lands in another table."
+
+
+def _old_plugin_fact(version=None):
+    """What a table whose name holds a '.' gets on a stack whose sink plugin, ``version``,
+    predates v57 (``None``: one this version cannot identify), after its names."""
+    deployed = (
+        f"it was deployed with CDC sink plugin {version}, which reads" if version else
+        "it was deployed with a CDC sink plugin this version cannot identify, which may read"
+    )
+    return (
+        f" on this CDC infrastructure: {deployed} every '.' in a table's qualified name as the "
+        "one between its database or schema and its table, so each change to such a table would "
+        "fail or land in another table. CDC infrastructure deployed with this version (sink "
+        "plugin v57 or later) streams it: Delete CDC infrastructure and deploy it again (on "
+        "MySQL, CDC then starts again from the Full Load's start point or your Manual start "
+        "point; on PostgreSQL the teardown also drops the replication slot, and the Delete "
+        "confirmation says what Start CDC then needs)."
+    )
+
+
+# ... with no plugin given, as every caller that passes none judges it (an unknown plugin is
+# judged as the oldest).
+_OLD_PLUGIN_FACT = _old_plugin_fact()
+_EMPTY_PART_FACT = (
+    ": the part of its name before or after its first '.' is empty, so CDC cannot tell its "
+    "database or schema from its table."
+)
+_DOTTED_SCHEMA_FACT = (
+    ": Evaluation found a database or schema whose name holds a '.' that each of these names "
+    "begins with (DOTTED_SCHEMA_NAME), so CDC cannot tell its changes apart from those of "
+    "another table read under the same name."
 )
 _COLLISION_FACT = (
     ": Kafka does not allow two topics whose names differ only in a '.' against a '_', so CDC "
@@ -238,17 +280,62 @@ def test_a_character_that_does_not_show_is_written_as_its_code_point() -> None:
         assert topic_name_refused_tables(_lists([name])) == [name], hex(code)
 
 
-_DOTTED = ["shop.a.b", "my.db.t", "public.public.orders", "shop.t.", ".shop.t", "shop..t"]
+# A '.' inside a table name: refused on a sink plugin older than v57 (or one this version
+# cannot identify), streamed from v57 on.
+_DOTTED = ["shop.a.b", "my.db.t", "public.public.orders", "shop.t.", "shop..t"]
+# The part before the first '.' is empty: refused on every plugin.
+_EMPTY_PART = [".shop.t", "..t", ".a.b.c"]
 
 
+@pytest.mark.parametrize("plugin", [None, "v56", "v1", "x", "", "V57"])
 @pytest.mark.parametrize("name", _DOTTED)
-def test_a_dot_inside_a_name_is_refused(name) -> None:
-    # FAILS WITHOUT THE FIX: Kafka takes such a topic, but the sink splits a qualified name on
-    # every '.', so every change to the table failed, and a tombstone of public."public.orders"
-    # deleted from public.orders.
-    assert topic_name_refused_tables(_lists(["shop.orders", name, "shop.items"])) == [name]
-    assert topic_name_refusal(_lists([name])) == (
-        f"CDC cannot stream {name}{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+def test_a_dot_inside_a_name_is_refused_on_an_older_or_unknown_sink_plugin(name, plugin) -> None:
+    # FAILS WITHOUT THE FIX: the refusal took no sink_plugin and named neither the deployed
+    # plugin nor Delete + Deploy. Such a sink splits a qualified name on every '.', so every
+    # change to the table failed, and a tombstone of public."public.orders" deleted from
+    # public.orders. The text names the deployed plugin when it is a version, and Delete +
+    # Deploy with each engine's cost.
+    known = plugin if plugin in ("v56", "v1") else None
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name, "shop.items"]), sink_plugin=plugin) == [name]
+    assert topic_name_refusal(_lists([name]), sink_plugin=plugin) == (
+        f"CDC cannot stream {name}{_old_plugin_fact(known)} {_DOTTED_SCHEMA} {_REMEDY}")
+    # No plugin given is an unknown one.
+    if plugin is None:
+        assert topic_name_refusal(_lists([name])) == topic_name_refusal(
+            _lists([name]), sink_plugin=None)
+
+
+@pytest.mark.parametrize("plugin", ["v57", "v58", " v57 ", "v100"])
+@pytest.mark.parametrize("name", _DOTTED)
+def test_a_dot_inside_a_table_name_streams_on_sink_plugin_v57_or_later(name, plugin) -> None:
+    # FAILS WITHOUT THE FIX: every such name was refused on every stack (there was no
+    # sink_plugin). The v57 sink reads a qualified name at its first '.' and skips every
+    # tombstone, so it streams there.
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name, "shop.items"]), sink_plugin=plugin) == []
+    assert topic_name_refusal(_lists(["shop.orders", name]), sink_plugin=plugin) is None
+    # Evaluation found no database or schema whose name holds a '.': the same.
+    assert topic_name_refusal(
+        _lists([name]), sink_plugin=plugin, dotted_schema_tables=frozenset()) is None
+
+
+@pytest.mark.parametrize("plugin", [None, "v56", "v57", "v58"])
+@pytest.mark.parametrize("name", _EMPTY_PART)
+def test_a_name_with_an_empty_part_before_its_first_dot_is_refused_on_every_plugin(
+    name, plugin
+) -> None:
+    # FAILS WITHOUT THE FIX: the refusal said the sink reads every '.', which v57 no longer
+    # does; such a name holds no database or schema the sink can read (the catalog read never
+    # produces one).
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name]), sink_plugin=plugin) == [name]
+    assert topic_name_refusal(_lists([name]), sink_plugin=plugin) == (
+        f"CDC cannot stream {name}{_EMPTY_PART_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # Evaluation found no database or schema whose name holds a '.': no such sentence.
+    assert topic_name_refusal(
+        _lists([name]), sink_plugin=plugin, dotted_schema_tables=()) == (
+        f"CDC cannot stream {name}{_EMPTY_PART_FACT} {_REMEDY}")
 
 
 def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
@@ -256,16 +343,22 @@ def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
     assert topic_name_refused_tables([("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t")]) == []
     assert topic_name_refused_tables(
         [("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t.x")]) == ["shop.t.x"]
+    assert topic_name_refused_tables(
+        [("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t.x")], sink_plugin="v57") == []
     # A topic under another prefix than the one sent is judged on its characters only.
     assert topic_name_refused_tables(
         [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc.shop.a")]) == []
+    assert topic_name_refused_tables(
+        [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc..shop.a")]) == []
     # ...and Kafka compares whole topics, so it is not alike a name that only resembles it.
     assert topic_name_refused_tables(
         [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc.shop.a,other.dsqlcdc_shop.a")]) == []
-    # All of them in one sentence: sorted, five named and the rest counted.
-    assert topic_name_refusal(_lists(_DOTTED)) == (
-        "CDC cannot stream .shop.t, my.db.t, public.public.orders, shop..t, shop.a.b and 1 more"
-        f"{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # All of them in one sentence each: sorted, five named and the rest counted; the empty
+    # part's first, as it holds on every plugin.
+    assert topic_name_refusal(_lists([*_DOTTED, "shop.x.y", *_EMPTY_PART])) == (
+        f"CDC cannot stream ..t, .a.b.c, .shop.t{_EMPTY_PART_FACT} "
+        "CDC cannot stream my.db.t, public.public.orders, shop..t, shop.a.b, shop.t. and 1 more"
+        f"{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
 
 
 def test_names_whose_topics_differ_only_in_a_dot_against_an_underscore_are_refused() -> None:
@@ -311,14 +404,22 @@ def test_names_kafka_tells_apart_are_not_refused() -> None:
 
 
 def test_a_refused_name_is_never_a_collision_partner() -> None:
-    # A dotted name is refused for its '.', and its look-alike streams.
+    # On an older sink plugin a dotted name is refused for its '.', and its look-alike streams.
     assert topic_name_refused_tables(_lists(["shop.a.b", "shop.a_b"])) == ["shop.a.b"]
     assert topic_name_refusal(_lists(["shop.a.b", "shop.a_b"])) == (
-        f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     # Two dotted names alike once '.' is '_' are named as dotted only; two illegal ones, as
     # illegal only.
     assert topic_name_refusal(_lists(["shop.a.b_c", "shop.a_b.c"])) == (
-        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # A table of a database or schema whose name holds a '.' is refused for that on every
+    # plugin, and its look-alike streams.
+    for plugin in (None, "v56", "v57"):
+        assert topic_name_refused_tables(
+            _lists(["my.db.t", "my_db.t"]), sink_plugin=plugin,
+            dotted_schema_tables={"my.db.t"}) == ["my.db.t"], plugin
+    # So is a name with an empty part before its first '.'.
+    assert topic_name_refused_tables(_lists([".a.b", "_a_b"]), sink_plugin="v57") == [".a.b"]
     assert topic_name_refusal(_lists(["a.b c_d", "a_b c.d"])) == (
         "CDC cannot stream a.b<U+0020>c_d, a_b<U+0020>c.d: each table's Kafka topic is named "
         "after its database or schema and its table, and Kafka allows only ASCII letters, "
@@ -351,7 +452,7 @@ def test_the_stacks_own_topics_cannot_collide_with_a_table_topic() -> None:
 
 def test_every_kind_in_one_capture_is_one_message() -> None:
     names = ["shop.orders", "app_v2.users", "shop.a b", "shop.a.b", "app.v2_users"]
-    dotted = f"CDC cannot stream shop.a.b{_DOTTED_FACT}"
+    dotted = f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT}"
     collision = f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them."
     facts = f"{_FACT} {dotted} {collision} {_DOTTED_SCHEMA}"
     refusal = topic_name_refusal(_lists(names))
@@ -371,6 +472,29 @@ def test_every_kind_in_one_capture_is_one_message() -> None:
     assert _deploy_block_notice(
         _deploy_ready(names, FLC), _Jobs({}), _inventory(names), None
     ) == (CDC_TOPIC_NAME_HEADER, f"{facts} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}")
+
+
+def test_every_kind_on_one_stack_is_one_message_in_its_order() -> None:
+    # Illegal, then the names no plugin streams (a database or schema whose name holds a '.',
+    # an empty part), then the older plugin's, then the collisions; the dotted-schema sentence
+    # once (a refused name is one of Evaluation's DOTTED_SCHEMA_NAME tables), the remedy last.
+    names = ["shop.orders", "app_v2.users", "shop.a b", "my.db.t", ".x.t", "shop.a.b",
+             "app.v2_users"]
+    kw = dict(sink_plugin="v56", dotted_schema_tables={"my.db.t"})
+    refusal = topic_name_refusal(_lists(names), **kw)
+    assert refusal == (
+        f"{_FACT} CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} "
+        f"CDC cannot stream .x.t{_EMPTY_PART_FACT} "
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} "
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert refusal.endswith(CDC_TOPIC_NAME_REMEDY) and refusal.count(_REMEDY) == 1
+    assert topic_name_refused_tables(_lists(names), **kw) == names[1:]
+    # On v57 only the '.' inside the table name streams.
+    kw["sink_plugin"] = "v57"
+    assert topic_name_refused_tables(_lists(names), **kw) == [
+        "app_v2.users", "shop.a b", "my.db.t", ".x.t", "app.v2_users"]
+    assert "shop.a.b" not in topic_name_refusal(_lists(names), **kw)
 
 
 def test_the_prefix_is_read_from_the_parameters_and_sinktopics_order_is_kept() -> None:
@@ -417,7 +541,7 @@ def test_a_name_that_may_be_of_a_dotted_schema_is_not_sent_to_full_load_only() -
     # the facts and before the remedy; a name with one '.' never does.
     assert CDC_TOPIC_NAME_DOTTED_SCHEMA == _DOTTED_SCHEMA
     assert topic_name_refusal(_lists(["my.db.orders"])) == (
-        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream my.db.orders{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     # A name Kafka refuses, too (database "my.d b").
     assert topic_name_refusal(_lists(["my.d b.orders"])) == (
         f"CDC cannot stream my.d<U+0020>b.orders{_ILLEGAL_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
@@ -431,10 +555,177 @@ def test_a_name_that_may_be_of_a_dotted_schema_is_not_sent_to_full_load_only() -
         ["my.db.orders", "my.d b.orders", "shop.a.b", "x.y z.w", "app.v2_users", "app_v2.users"]))
     assert refusal == (
         f"CDC cannot stream my.d<U+0020>b.orders, x.y<U+0020>z.w{_ILLEGAL_FACT} "
-        f"CDC cannot stream my.db.orders, shop.a.b{_DOTTED_FACT} "
+        f"CDC cannot stream my.db.orders, shop.a.b{_OLD_PLUGIN_FACT} "
         f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
         f"{_DOTTED_SCHEMA} {_REMEDY}")
     assert refusal.count(_DOTTED_SCHEMA) == 1
+    # Where a '.' inside a table name streams (v57), a colliding pair holding one gets it too:
+    # without Evaluation's tables, shop.orders.v2 may be table v2 of database shop.orders.
+    assert topic_name_refusal(_lists(["shop.orders.v2", "shop.orders_v2"]), sink_plugin="v57") == (
+        f"CDC cannot stream shop.orders.v2 together with shop.orders_v2{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert topic_name_refused_tables(
+        _lists(["shop.orders_v2", "shop.items", "shop.orders.v2"]), sink_plugin="v57") == [
+        "shop.orders_v2", "shop.orders.v2"]
+
+
+@pytest.mark.parametrize("plugin", [None, "v56", "v57"])
+def test_evaluations_dotted_schema_tables_are_refused_with_their_own_fact(plugin) -> None:
+    # FAILS WITHOUT THE FIX: there was no dotted_schema_tables (TypeError). On MySQL, table t of
+    # database my.db and table db.t of database my have the same table id, which the escaped
+    # include entry captures both of, so a table Evaluation reported DOTTED_SCHEMA_NAME on is
+    # refused on every plugin, followed by the sentence that no step supports it.
+    assert topic_name_refusal(
+        _lists(["shop.orders", "my.db.t"]), sink_plugin=plugin, dotted_schema_tables={"my.db.t"}
+    ) == f"CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", "my.db.t"]), sink_plugin=plugin, dotted_schema_tables=["my.db.t"]
+    ) == ["my.db.t"]
+    # Sorted, five named and the rest counted, in one sentence.
+    seven = [f"my.db.t{c}" for c in "gfedcba"]
+    assert topic_name_refusal(
+        _lists(seven), sink_plugin=plugin, dotted_schema_tables=seven
+    ) == ("CDC cannot stream my.db.ta, my.db.tb, my.db.tc, my.db.td, my.db.te and 2 more"
+          f"{_DOTTED_SCHEMA_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # A name Kafka refuses that is one of them: its own fact, and the sentence.
+    assert topic_name_refusal(
+        _lists(["my.d b.t"]), sink_plugin=plugin, dotted_schema_tables={"my.d b.t"}
+    ) == f"CDC cannot stream my.d<U+0020>b.t{_ILLEGAL_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+
+
+def test_known_dotted_schema_tables_say_the_sentence_only_for_one_of_them() -> None:
+    # FAILS WITHOUT THE FIX: every refused name with two or more '.' got the dotted-schema
+    # sentence, also when Evaluation had found no database or schema whose name holds a '.'.
+    for known in (frozenset(), {"other.x.y"}, ()):
+        assert topic_name_refusal(
+            _lists(["shop.a.b"]), sink_plugin="v56", dotted_schema_tables=known
+        ) == f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} {_REMEDY}", known
+        assert topic_name_refusal(
+            _lists(["my.d b.orders"]), dotted_schema_tables=known
+        ) == f"CDC cannot stream my.d<U+0020>b.orders{_ILLEGAL_FACT} {_REMEDY}", known
+        assert topic_name_refusal(
+            _lists(["shop.orders.v2", "shop.orders_v2"]), sink_plugin="v57",
+            dotted_schema_tables=known,
+        ) == (f"CDC cannot stream shop.orders.v2 together with shop.orders_v2{_COLLISION_FACT} "
+              f"them. {_REMEDY}"), known
+    # Unknown (None, the default): today's rule, any refused name with two or more '.'.
+    assert topic_name_refusal(_lists(["shop.a.b"]), sink_plugin="v56") == (
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} {_DOTTED_SCHEMA} {_REMEDY}")
+    # One of them among other refused names: the sentence once, after every fact.
+    refusal = topic_name_refusal(
+        _lists(["shop.a.b", "my.db.t", "app.v2_users", "app_v2.users"]), sink_plugin="v56",
+        dotted_schema_tables={"my.db.t"})
+    assert refusal == (
+        f"CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} "
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} "
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert refusal.count(_DOTTED_SCHEMA) == 1
+
+
+# ---------------------------------------------------------------------------
+# 1b. The include entry, the sink plugin gate and Evaluation's view of the same rule
+# ---------------------------------------------------------------------------
+
+
+def _sent(names, message_key_columns=None):
+    return dict(cdc_table_list_params(
+        DebeziumSourceConfig(name="s", table_include_list=names,
+                             message_key_columns=message_key_columns or {}),
+        SinkConnectorConfig(name="k", topics=names, dlq_topic="dsql-sink-dlq"),
+    ))
+
+
+def test_plain_names_send_byte_identical_lists() -> None:
+    # Guard (passes before and after): for every name CDC streamed before, TableIncludeList,
+    # SinkTopics and MessageKeyColumns are 0.1.588's bytes, so a deployed stack's Start sees
+    # no configuration change. Spelled out from 0.1.588's output, not built with the helpers.
+    sent = _sent(_ACCEPTED, {"Shop.Order_Items-2": ["tenant_id", "id"],
+                             "shop.orders": ["region", "id"]})
+    assert sent["TableIncludeList"] == "shop.orders,Shop.Order_Items-2,db2024.t0123456789"
+    assert sent["SinkTopics"] == (
+        "dsqlcdc.shop.orders,dsqlcdc.Shop.Order_Items-2,dsqlcdc.db2024.t0123456789")
+    assert sent["MessageKeyColumns"] == (
+        "Shop\\.Order_Items-2:tenant_id,id;shop\\.orders:region,id")
+    # Every name Kafka allows with one '.' (or none) is its own entry, as written: each
+    # character Kafka allows but '.', at each end of either part and inside it.
+    for ch in sorted(_KAFKA - {"."}):
+        for name in (f"shop.t{ch}", f"{ch}shop.t", f"shop.{ch}t", f"s{ch}p.{ch}", f"t{ch}"):
+            assert table_include_entry(name) == name, name
+            assert unescape_include_entry(name) == name, name
+
+
+@pytest.mark.parametrize("name, entry", [
+    ("shop.orders.v2", "shop\\.orders\\.v2"),
+    ("app.app.orders", "app\\.app\\.orders"),
+    ("shop.t.", "shop\\.t\\."),
+    ("shop..t", "shop\\.\\.t"),
+    ("Shop.Order.Items-2_x", "Shop\\.Order\\.Items-2_x"),
+])
+def test_a_dot_inside_a_table_name_is_escaped_in_table_include_list(name, entry) -> None:
+    # FAILS WITHOUT THE FIX: TableIncludeList carried shop.orders.v2 as written, a regex whose
+    # '.' matches any character, so shop.orders_v2, shopXorders.v2 and shop_orders.v2 were
+    # captured too. SinkTopics keeps the topic as Debezium names it.
+    sent = _sent(["shop.orders", name])
+    assert sent["TableIncludeList"] == f"shop.orders,{entry}"
+    assert sent["SinkTopics"] == f"dsqlcdc.shop.orders,dsqlcdc.{name}"
+    assert table_include_entry(name) == entry
+    # The readback of a deployed TableIncludeList gives the name back.
+    assert unescape_include_entry(entry) == name
+    assert [unescape_include_entry(e) for e in sent["TableIncludeList"].split(",")] == [
+        "shop.orders", name]
+
+
+def test_every_name_cdc_streams_reads_back_from_its_entry() -> None:
+    # A name CDC streams holds only ASCII letters, digits, '.', '_' and '-', so its entry holds
+    # no other escape and reads back exactly.
+    alphabet = sorted(_KAFKA)
+    for i, a in enumerate(alphabet):
+        b = alphabet[(i * 7 + 3) % len(alphabet)]
+        for name in (f"s{a}.t{b}", f"s.{a}.{b}", f"{a}{b}.x.{a}", f"d.{b}{a}.{a}"):
+            if topic_name_refused_tables(_lists([name]), sink_plugin="v57"):
+                continue
+            assert unescape_include_entry(table_include_entry(name)) == name, name
+
+
+def test_the_sink_plugin_gate() -> None:
+    # FAILS WITHOUT THE FIX: no such gate.
+    assert DOTTED_TABLE_MIN_PLUGIN_VERSION == "v57"
+    for plugin in ("v56", "v1", "v0", None, "", "x", "V57", "v57a", "57", "v 57"):
+        assert plugin_reads_dotted_tables(plugin) is False, plugin
+    for plugin in ("v57", "v58", "v100", " v57 "):
+        assert plugin_reads_dotted_tables(plugin) is True, plugin
+    # The sink-key gate it was factored out of is unchanged.
+    for plugin in ("v50", None, "", "x"):
+        assert plugin_supports_sink_keys(plugin) is False, plugin
+    for plugin in ("v51", "v57", " v51 "):
+        assert plugin_supports_sink_keys(plugin) is True, plugin
+
+
+def test_the_new_parameters_are_keyword_only_and_unknown_by_default() -> None:
+    # None means unknown, judged as today's refusal: a caller that passes neither fails safe.
+    for fn in (topic_name_refusal, topic_name_refused_tables):
+        params = inspect.signature(fn).parameters
+        for name in ("sink_plugin", "dotted_schema_tables"):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (fn, name)
+            assert params[name].default is None, (fn, name)
+
+
+def test_evaluation_judges_names_as_a_v57_stack_does() -> None:
+    # topic_name_problems: the names Kafka refuses, and the '.'/'_' groups, in input order, a
+    # '.' inside a table name no problem on its own and joining the groups.
+    names = ["shop.orders", "shop.orders.v2", "shop.a b", "shop.orders_v2", "app_v2.users",
+             "app.v2_users", "shop.a b", "shop.x.y"]
+    assert topic_name_problems(names) == (
+        ["shop.a b"], [["shop.orders.v2", "shop.orders_v2"], ["app_v2.users", "app.v2_users"]])
+    assert topic_name_problems(["shop.orders", "shop.a.b"]) == ([], [])
+    assert topic_name_problems([]) == ([], [])
+    # The prefix is the topic's: a '.' inside it is not one inside a name.
+    assert topic_name_problems(["a.b_c", "a_b.c"], prefix="p.q") == ([], [["a.b_c", "a_b.c"]])
+    # The same tables topic_name_refusal names on a v57 stack, illegal ones and groups alike.
+    refused = topic_name_refused_tables(_lists(names), sink_plugin="v57")
+    illegal, groups = topic_name_problems(names)
+    assert set(refused) == {*illegal, *(n for g in groups for n in g)}
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +1071,7 @@ def test_the_card_and_the_early_deploy_except_a_dotted_database_or_schema(monkey
 
     names = ["shop.orders", "my.db.orders"]
     inv = _inventory(names)
-    facts = f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA}"
+    facts = f"CDC cannot stream my.db.orders{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA}"
     assert pre_load_topic_name_warning(_state(names), _Jobs({}), None, inv) == (
         CDC_TOPIC_NAME_HEADER,
         f"{facts} Deploy CDC infrastructure and Start CDC refuse a capture holding such a "
@@ -882,7 +1173,7 @@ def test_start_and_retry_except_a_dotted_database_or_schema(monkeypatch, retry) 
     jobs = _Jobs({"job-1": _loaded(names, _counts(names))})
     hits, submitted = _start_click(monkeypatch, _loaded_state(names), jobs, names, retry=retry)
     assert [h["body"] for h in hits] == [
-        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY} {_OPEN}"]
+        f"CDC cannot stream my.db.orders{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY} {_OPEN}"]
     assert submitted == []
 
 
@@ -944,7 +1235,7 @@ def test_a_pipeline_that_streamed_with_a_dot_in_a_name_is_refused_at_its_next_st
     state.set_cdc_has_committed_offset(True)
     state.set_cdc_deployed_watermark(("mysql-bin.000042", "120"))
     hits, submitted = _start_click(monkeypatch, state, jobs, names)
-    refusal = f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+    refusal = f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
     assert [h["body"] for h in hits] == [
         f"{refusal} The table picker is locked. {_FULL_LOAD_LOCK}"]
     assert submitted == []

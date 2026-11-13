@@ -1699,10 +1699,12 @@ CDC_TOPIC_NAME_REMEDY = (
     "and Validation skip it) and copy it in a Full load only migration once its writes stop, "
     "or rename it at the source before migrating it."
 )
-# Said after the facts when a refused name holds two or more '.' after <TopicPrefix>.: it may
-# name a table of a database or schema whose name holds a '.', which no step supports
-# (Evaluation's DOTTED_SCHEMA_NAME), so the remedy's Full load only copy does not hold for it.
-# A name with one '.' never does; the names alone cannot tell the two kinds apart.
+# Said after the facts, once, when a refused name may name a table of a database or schema
+# whose name holds a '.', which no step supports (Evaluation's DOTTED_SCHEMA_NAME), so the
+# remedy's Full load only copy does not hold for it (:func:`topic_name_refusal`): with
+# Evaluation's DOTTED_SCHEMA_NAME tables known, only when a refused name is one of them;
+# without them, when a refused name holds two or more '.' after <TopicPrefix>. -- a name with
+# one '.' never does, and the names alone cannot tell the two kinds apart.
 CDC_TOPIC_NAME_DOTTED_SCHEMA = (
     "A '.' inside a database or schema name is not supported at any step, so a table of such "
     "a database or schema cannot be copied in a Full load only migration either (Evaluation "
@@ -1767,6 +1769,32 @@ def _cdc_entry(parts: "Sequence[str]") -> str:
     if _cdc_is_plain(parts):
         return ".".join(parts)
     return _cdc_escape_edges("\\.".join(_cdc_escape_part(p) for p in parts))
+
+
+def table_include_entry(name: str) -> str:
+    """The ``table.include.list`` entry (TableIncludeList) that captures exactly table
+    ``name`` (``<db>.<table>`` MySQL, ``<schema>.<table>`` PostgreSQL). Pure.
+
+    Debezium reads each entry as a regex matched against the whole unquoted table id, so a
+    '.' inside the table name matched any character: ``shop.orders.v2`` also captured
+    ``shop.orders_v2``, ``shopXorders.v2`` and ``shop_orders.v2``. The name is read at its
+    first '.' (the one every step reads as the one between the database or schema and the
+    table) and written by :func:`_cdc_entry`: a name with one '.' whose parts hold no regex
+    character -- every name Kafka allows in a topic with one '.' -- stays as written,
+    byte-identical to earlier versions, and any other has its separator and its own
+    characters escaped (``shop\\.orders\\.v2``). The cdc-stack template prefixes ``(?-i)``
+    on a stack first started by 0.1.581 or later (ExactTableIncludeList).
+    """
+    db, sep, table = name.partition(".")
+    return _cdc_entry([db, table] if sep else [name])
+
+
+def unescape_include_entry(entry: str) -> str:
+    """The table name a deployed TableIncludeList ``entry`` captures, its ``\\.`` read back as
+    '.' (:func:`table_include_entry`). A name CDC streams holds only ASCII letters, digits,
+    '.', '_' and '-' (:func:`topic_name_refusal`), so its entry holds no other escape; a plain
+    entry is returned as it is. Pure."""
+    return entry.replace("\\.", ".")
 
 
 _ASCII_LOWER = str.maketrans(
@@ -2129,8 +2157,24 @@ def apply_column_exclude_chooser(
 # The sink plugin version that reads ``target.key.columns`` (SinkKeyColumns): the oldest
 # deployed plugin Start CDC keys re-keyed tables on the source primary key for (G15).
 SINK_KEYS_MIN_PLUGIN_VERSION = "v51"
+# The sink plugin version that reads a table name holding a '.' (``shop.orders.v2``): it
+# splits a qualified name at its first '.', dead-letters a change whose database or schema
+# name holds one, and skips every Debezium tombstone, the only records whose table an older
+# sink read from the topic name. The oldest deployed plugin Start CDC streams such a table
+# on (:func:`plugin_reads_dotted_tables`).
+DOTTED_TABLE_MIN_PLUGIN_VERSION = "v57"
 
 _PLUGIN_VERSION_RE = re.compile(r"v(\d+)")
+
+
+def _plugin_at_least(plugin_version: object, minimum: str) -> bool:
+    """Is ``plugin_version`` (a stack's ``PluginVersion``) ``v<N>`` with N at least
+    ``minimum``'s (also ``v<N>``)? ``None``, ``""`` and any other shape are ``False``: a plugin
+    this version cannot identify is judged as the oldest. Pure."""
+    if plugin_version is None:
+        return False
+    match = _PLUGIN_VERSION_RE.fullmatch(str(plugin_version).strip())
+    return bool(match) and int(match.group(1)) >= int(minimum[1:])
 
 
 def plugin_supports_sink_keys(plugin_version: object) -> bool:
@@ -2140,10 +2184,21 @@ def plugin_supports_sink_keys(plugin_version: object) -> bool:
     other shape are ``False``: an unknown plugin keeps today's composite-key routing, which
     every plugin applies correctly. Pure.
     """
-    if plugin_version is None:
-        return False
-    match = _PLUGIN_VERSION_RE.fullmatch(str(plugin_version).strip())
-    return bool(match) and int(match.group(1)) >= int(SINK_KEYS_MIN_PLUGIN_VERSION[1:])
+    return _plugin_at_least(plugin_version, SINK_KEYS_MIN_PLUGIN_VERSION)
+
+
+def plugin_reads_dotted_tables(plugin_version: object) -> bool:
+    """Does a stack whose ``PluginVersion`` parameter is ``plugin_version`` stream a table
+    whose name holds a '.'?
+
+    ``v<N>`` with N at least :data:`DOTTED_TABLE_MIN_PLUGIN_VERSION`'s. ``None``, ``""`` and
+    any other shape are ``False``: an older sink split a qualified name at every '.', so each
+    change to such a table failed, and read a tombstone's table from the topic's last two
+    segments, so a delete on ``public."public.orders"`` removed the same-keyed row of
+    ``public.orders``. A plugin this version cannot identify is refused such a table
+    (:func:`topic_name_refusal`). Pure.
+    """
+    return _plugin_at_least(plugin_version, DOTTED_TABLE_MIN_PLUGIN_VERSION)
 
 
 def plugin_version_is_older(deployed: object, bundled: object) -> bool:
@@ -2382,44 +2437,107 @@ def _sink_topics(filled: "Iterable[tuple[str, object]]") -> "tuple[str, list[str
     return lead, topics
 
 
-def _topic_name_kinds(
-    filled: "Iterable[tuple[str, object]]",
-) -> "tuple[list[str], list[str], list[list[str]]]":
-    """``(illegal, dotted, groups)``: the captured tables CDC cannot stream, by why, each named
-    once without the topic prefix and in SinkTopics order. Pure.
+def _has_empty_part(name: str) -> bool:
+    """Is the part of ``name`` before or after its first '.' empty (``.shop.t``)? Pure."""
+    db, _, table = name.partition(".")
+    return not db or not table
+
+
+def _classify_topics(
+    lead: str,
+    topics: "Iterable[str]",
+    *,
+    dotted_ok: bool,
+    dotted_schema: "frozenset[str]",
+) -> "tuple[list[str], list[str], list[str], list[list[str]]]":
+    """``(illegal, refused_dotted, dotted_schema_hits, groups)``: the tables of ``topics``
+    CDC cannot stream, by why, each named once without ``lead`` (``<TopicPrefix>.``) and in
+    the order of ``topics``. Pure.
 
     - illegal: the topic holds a character Kafka refuses (:data:`_KAFKA_TOPIC_CHARS`; a set
       test, not a regex -- ``$`` would let a trailing newline through; a trailing space is
       refused, never stripped).
-    - dotted: a legal topic with more than one '.' after ``<TopicPrefix>.`` -- a '.' inside the
-      database, schema or table name (one inside TopicPrefix does not count). A topic under
-      another prefix is judged on its characters only.
-    - groups: among the other names, those whose topics are equal once '.' and '_' are the
-      same character (Kafka's Topic.hasCollision: case counts, '-' does not). Only groups of
-      two or more; a dotted or illegal name is never in one.
+    - A legal topic with two or more '.' after ``lead`` holds a '.' inside the database,
+      schema or table name (one inside TopicPrefix does not count; a topic under another
+      prefix is judged on its characters only). Such a name goes to
+      - dotted_schema_hits when it is one of ``dotted_schema`` (the tables Evaluation reported
+        DOTTED_SCHEMA_NAME on), on any sink plugin;
+      - refused_dotted when the part before or after its first '.' is empty (``.shop.t``,
+        which the catalog read never produces), on any sink plugin, and every other one
+        without ``dotted_ok`` (a sink plugin older than
+        :data:`DOTTED_TABLE_MIN_PLUGIN_VERSION`, or one this version cannot identify);
+      - otherwise (``dotted_ok``, a '.' inside the table name) it is judged with the others.
+    - groups: among the names not refused above, those whose topics are equal once '.' and
+      '_' are the same character (Kafka's Topic.hasCollision: case counts, '-' does not).
+      Only groups of two or more; a name refused above is never in one.
     """
-    lead, topics = _sink_topics(filled)
     illegal: list[str] = []
-    dotted: list[str] = []
+    refused_dotted: list[str] = []
+    dotted_schema_hits: list[str] = []
     unified: dict[str, list[str]] = {}
     for topic in dict.fromkeys(topics):
         name = topic.removeprefix(lead)
         if not set(topic) <= _KAFKA_TOPIC_CHARS:
             illegal.append(name)
-        elif topic.startswith(lead) and name.count(".") > 1:
-            dotted.append(name)
-        else:
-            unified.setdefault(topic.replace(".", "_"), []).append(name)
-    return illegal, dotted, [group for group in unified.values() if len(group) > 1]
+            continue
+        if topic.startswith(lead) and name.count(".") > 1:
+            if name in dotted_schema:
+                dotted_schema_hits.append(name)
+                continue
+            if _has_empty_part(name) or not dotted_ok:
+                refused_dotted.append(name)
+                continue
+        unified.setdefault(topic.replace(".", "_"), []).append(name)
+    groups = [group for group in unified.values() if len(group) > 1]
+    return illegal, refused_dotted, dotted_schema_hits, groups
 
 
-def topic_name_refused_tables(filled: "Iterable[tuple[str, object]]") -> list[str]:
-    """The captured tables CDC cannot stream (:func:`topic_name_refusal`), each once, in
-    SinkTopics order, named as written (without the topic prefix). Pure."""
-    filled = list(filled)  # read twice below: an iterator would leave the second read empty
-    illegal, dotted, groups = _topic_name_kinds(filled)
-    refused = {*illegal, *dotted, *(name for group in groups for name in group)}
+def _classify_filled(
+    filled: "Iterable[tuple[str, object]]",
+    sink_plugin: object,
+    dotted_schema_tables: "Optional[Iterable[str]]",
+) -> "tuple[str, list[str], tuple[list[str], list[str], list[str], list[list[str]]]]":
+    """``(lead, SinkTopics topics, _classify_topics(...))`` for these cdc-stack parameters on
+    a stack whose sink plugin is ``sink_plugin``. Pure."""
     lead, topics = _sink_topics(filled)
+    return lead, topics, _classify_topics(
+        lead,
+        topics,
+        dotted_ok=plugin_reads_dotted_tables(sink_plugin),
+        dotted_schema=frozenset(dotted_schema_tables or ()),
+    )
+
+
+def topic_name_problems(
+    names: "Iterable[str]", prefix: str = CDC_DEFAULT_TOPIC_PREFIX
+) -> "tuple[list[str], list[list[str]]]":
+    """``(illegal, groups)`` for Evaluation: the tables of ``names`` (``<db>.<table>`` or
+    ``<schema>.<table>``) whose Kafka topic ``<prefix>.<name>`` holds a character Kafka
+    refuses, and the groups of two or more whose topics differ only in a '.' against a '_',
+    each name once, in the order of ``names``. Judged as :func:`topic_name_refusal` judges
+    them on CDC infrastructure whose sink plugin streams a table whose name holds a '.'
+    (:data:`DOTTED_TABLE_MIN_PLUGIN_VERSION`): such a name is no problem on its own, and one
+    inside a database or schema name is Evaluation's own DOTTED_SCHEMA_NAME. Pure."""
+    lead = f"{prefix}."
+    illegal, _dotted, _hits, groups = _classify_topics(
+        lead, [f"{lead}{name}" for name in names], dotted_ok=True, dotted_schema=frozenset()
+    )
+    return illegal, groups
+
+
+def topic_name_refused_tables(
+    filled: "Iterable[tuple[str, object]]",
+    *,
+    sink_plugin: object = None,
+    dotted_schema_tables: "Optional[Iterable[str]]" = None,
+) -> list[str]:
+    """The captured tables CDC cannot stream (:func:`topic_name_refusal`, with the same
+    ``sink_plugin`` and ``dotted_schema_tables``), each once, in SinkTopics order, named as
+    written (without the topic prefix). Pure."""
+    lead, topics, (illegal, dotted, hits, groups) = _classify_filled(
+        filled, sink_plugin, dotted_schema_tables
+    )
+    refused = {*illegal, *dotted, *hits, *(name for group in groups for name in group)}
     names = dict.fromkeys(topic.removeprefix(lead) for topic in topics)
     return [name for name in names if name in refused]
 
@@ -2430,12 +2548,45 @@ def _together(group: "Sequence[str]") -> str:
     return f"{first} together with {others}"
 
 
-def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]":
+def _old_plugin_fact(names: "Sequence[str]", sink_plugin: object) -> str:
+    """The fact :func:`topic_name_refusal` states for a table whose name holds a '.' on a
+    stack whose sink plugin (``sink_plugin``) predates :data:`DOTTED_TABLE_MIN_PLUGIN_VERSION`
+    or cannot be identified. Pure."""
+    version = str(sink_plugin).strip() if sink_plugin is not None else ""
+    if _PLUGIN_VERSION_RE.fullmatch(version):
+        deployed = f"it was deployed with CDC sink plugin {version}, which reads"
+    else:
+        deployed = (
+            "it was deployed with a CDC sink plugin this version cannot identify, which may read"
+        )
+    return (
+        f"CDC cannot stream {_bounded_names(names)} on this CDC infrastructure: {deployed} "
+        "every '.' in a table's qualified name as the one between its database or schema and "
+        "its table, so each change to such a table would fail or land in another table. CDC "
+        "infrastructure deployed with this version (sink plugin "
+        f"{DOTTED_TABLE_MIN_PLUGIN_VERSION} or later) streams it: Delete CDC infrastructure "
+        "and deploy it again (on MySQL, CDC then starts again from the Full Load's start point "
+        "or your Manual start point; on PostgreSQL the teardown also drops the replication "
+        "slot, and the Delete confirmation says what Start CDC then needs)."
+    )
+
+
+def topic_name_refusal(
+    filled: "Iterable[tuple[str, object]]",
+    *,
+    sink_plugin: object = None,
+    dotted_schema_tables: "Optional[Iterable[str]]" = None,
+) -> "Optional[str]":
     """Why CDC cannot stream these captured tables, or ``None``. Pure.
 
     Each captured table's Kafka topic is ``<TopicPrefix>.<db>.<table>`` (MySQL) or
-    ``<TopicPrefix>.<schema>.<table>`` (PostgreSQL). Three kinds of name fail
-    (:func:`_topic_name_kinds`), and this refuses them first, the facts in that order:
+    ``<TopicPrefix>.<schema>.<table>`` (PostgreSQL), as written in SinkTopics. ``sink_plugin``
+    is the PluginVersion of the stack the capture is judged for (Deploy CDC infrastructure:
+    the bundled one; Start CDC and Retry CDC: the deployed one); ``None``, or any value this
+    version cannot identify, is judged as the oldest. ``dotted_schema_tables`` are the tables
+    Evaluation reported DOTTED_SCHEMA_NAME on; ``None`` when no Evaluation report is known.
+    These names fail (:func:`_classify_topics`), and this refuses them first, the facts in
+    this order:
 
     - a character Kafka refuses in a topic name (it allows only ASCII letters, digits, '.',
       '_' and '-'). Both topic pre-create paths catch only an existing topic, so such a name
@@ -2444,27 +2595,53 @@ def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]
       comma, or whitespace ending a table name, was trimmed into a legal name, so Start
       succeeded and the table was never captured (read from the code, not seen live). A
       character that does not show is written as its code point (:func:`_shown_name`).
-    - a '.' inside the database, schema or table name. Kafka takes it, but the sink splits a
-      qualified name on every '.' (DsqlDialect.quoteQualified), so every change to the table
-      failed, and takes a tombstone's table from the topic's last two segments
-      (DebeziumEvents.tableFromTopic), so a delete on public."public.orders" removed the
-      same-keyed row of public.orders (read from the sink's code, not tested live).
+    - a table of a database or schema whose name holds a '.' (one of
+      ``dotted_schema_tables``), on any sink plugin. No step supports such a name, and its
+      changes cannot be told from those of the table its name reads as at its first '.': on
+      MySQL, table ``t`` of database ``my.db`` and table ``db.t`` of database ``my`` have the
+      same table id, which the include entry captures both of (the capture is not limited to
+      the selected databases), and the sink dead-letters a change whose database or schema
+      name holds a '.'.
+    - a name whose part before or after its first '.' is empty (``.shop.t``, which the catalog
+      read never produces), on any sink plugin: the sink cannot read a database or schema and
+      a table from it.
+    - a '.' inside a table name on a sink plugin older than
+      :data:`DOTTED_TABLE_MIN_PLUGIN_VERSION` (:func:`plugin_reads_dotted_tables`). Kafka takes
+      the topic, but that sink splits a qualified name on every '.'
+      (DsqlDialect.quoteQualified), so every change to the table failed, and takes a
+      tombstone's table from the topic's last two segments (DebeziumEvents.tableFromTopic), so
+      a delete on public."public.orders" removed the same-keyed row of public.orders (read
+      from the sink's code, not tested live). From that version on, the sink reads a qualified
+      name at its first '.', dead-letters a change that names no source table, and skips every
+      tombstone (the op=d before it is the delete), and TableIncludeList carries the exact
+      escaped entry (:func:`table_include_entry`), so such a table streams. The text names the
+      deployed plugin and Delete CDC infrastructure and deploy it again, with what that costs
+      on each engine.
     - two names whose topics differ only in a '.' against a '_': Kafka refuses the second
       topic (INVALID_TOPIC_EXCEPTION), and both seeders pre-create every SinkTopics entry, so
-      Start CDC failed after the infrastructure was deployed.
+      Start CDC failed after the infrastructure was deployed. Where a '.' inside a table name
+      streams, such a name is one of them (``shop.orders.v2`` with ``shop.orders_v2``).
 
     No check against the stack's own topics is needed: dsql-sink-dlq and
     ``<stack>-debezium-source-offsets`` hold neither '.' nor '_' (a stack name is letters,
     digits and hyphens), ``<TopicPrefix>.schema-history`` unifies to a name with one '_' after
     the prefix, the heartbeat and MSK Connect internal topics start with "__", and a table
-    topic unifies to ``<TopicPrefix>_<db>_<table>``, with at least two. The remedy
-    (:data:`CDC_TOPIC_NAME_REMEDY`) ends the text.
+    topic unifies to ``<TopicPrefix>_<db>_<table>``, with at least two.
 
-    A refused name with two or more '.' may belong to a database or schema whose name holds a
-    '.', which no step supports (Full load only included), so
-    :data:`CDC_TOPIC_NAME_DOTTED_SCHEMA` follows the facts once, before the remedy.
+    :data:`CDC_TOPIC_NAME_DOTTED_SCHEMA` follows the facts once when a refused name may belong
+    to a database or schema whose name holds a '.', which no step supports (Full load only
+    included): with ``dotted_schema_tables`` known, when a refused name is one of them;
+    without them, when a refused name holds two or more '.' (the names alone cannot tell
+    ``my.db.t``, database ``my.db``, from ``shop.a.b``). The remedy
+    (:data:`CDC_TOPIC_NAME_REMEDY`) ends the text, last: the Data Migration step strips it
+    with ``removesuffix`` before its own routes.
     """
-    illegal, dotted, groups = _topic_name_kinds(filled)
+    dotted_schema = frozenset(dotted_schema_tables or ())
+    _lead, _topics, (illegal, dotted, hits, groups) = _classify_filled(
+        filled, sink_plugin, dotted_schema
+    )
+    empty = [name for name in dotted if _has_empty_part(name)]
+    older = [name for name in dotted if not _has_empty_part(name)]
     facts: list[str] = []
     if illegal:
         facts.append(
@@ -2472,13 +2649,20 @@ def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]
             "table's Kafka topic is named after its database or schema and its table, and Kafka "
             "allows only ASCII letters, digits, '.', '_' and '-' in a topic name."
         )
-    if dotted:
+    if hits:
         facts.append(
-            f"CDC cannot stream {_bounded_names(dotted)}: the CDC sink reads every '.' in a "
-            "table's qualified name as the one between its database or schema and its table, "
-            "so with a '.' inside either name, each change to that table fails or lands in "
-            "another table."
+            f"CDC cannot stream {_bounded_names(hits)}: Evaluation found a database or schema "
+            "whose name holds a '.' that each of these names begins with (DOTTED_SCHEMA_NAME), "
+            "so CDC cannot tell its changes apart from those of another table read under the "
+            "same name."
         )
+    if empty:
+        facts.append(
+            f"CDC cannot stream {_bounded_names(empty)}: the part of its name before or after "
+            "its first '.' is empty, so CDC cannot tell its database or schema from its table."
+        )
+    if older:
+        facts.append(_old_plugin_fact(older, sink_plugin))
     if groups:
         texts = sorted(_together(group) for group in groups)
         more = len(texts) - 5
@@ -2488,10 +2672,15 @@ def topic_name_refusal(filled: "Iterable[tuple[str, object]]") -> "Optional[str]
             "only in a '.' against a '_', so CDC can stream only one of "
             f"{'them' if len(groups) == 1 else 'each'}."
         )
-    if dotted or any(name.count(".") > 1 for name in illegal):
-        facts.append(CDC_TOPIC_NAME_DOTTED_SCHEMA)
     if not facts:
         return None
+    refused = [*illegal, *dotted, *hits, *(name for group in groups for name in group)]
+    if dotted_schema_tables is None:
+        may_be_dotted_schema = any(name.count(".") > 1 for name in refused)
+    else:
+        may_be_dotted_schema = any(name in dotted_schema for name in refused)
+    if may_be_dotted_schema:
+        facts.append(CDC_TOPIC_NAME_DOTTED_SCHEMA)
     return " ".join(facts) + " " + CDC_TOPIC_NAME_REMEDY
 
 
@@ -2630,7 +2819,9 @@ def cdc_table_list_params(
 ) -> list[tuple[str, str]]:
     """The cdc-stack's table/topic parameters, in the order both builders send them. Pure.
 
-    ``TableIncludeList`` (the captured tables), ``TopicPrefix``, ``SinkTopics`` (one
+    ``TableIncludeList`` (the captured tables, each as its exact entry,
+    :func:`table_include_entry`: a name with a '.' inside its table name is escaped, and
+    every other name Kafka allows stays byte-identical), ``TopicPrefix``, ``SinkTopics`` (one
     ``<topic_prefix>.<db>.<table>`` topic per sink table -- the one transformation the
     cdc-stack template leaves to the caller), ``DlqTopicName``, ``ColumnExcludeList`` and
     ``MessageKeyColumns``. :func:`build_cdc_stack_params` and :func:`build_cdc_infra_params`
@@ -2639,7 +2830,8 @@ def cdc_table_list_params(
     what is sent.
     """
     return [
-        ("TableIncludeList", ",".join(source_config.table_include_list)),
+        ("TableIncludeList",
+         ",".join(table_include_entry(t) for t in source_config.table_include_list)),
         ("TopicPrefix", topic_prefix),
         ("SinkTopics", ",".join(f"{topic_prefix}.{t}" for t in sink_config.topics)),
         ("DlqTopicName", sink_config.dlq_topic),
