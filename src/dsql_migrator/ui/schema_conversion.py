@@ -2759,11 +2759,9 @@ def build_schema_conversion_screen(
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
-                    REFRESH_REBASE_ATTEMPTS,
                     _default_introspector_factory,
-                    refresh_rebase,
+                    rebase_refresh,
                     session_source_label,
-                    set_result_if_unchanged,
                     with_refreshed_catalogs,
                 )
 
@@ -2798,32 +2796,28 @@ def build_schema_conversion_screen(
                     )
                     return
                 vanished = list(getattr(introspector, "last_vanished", None) or [])
-                base: Optional[object] = old_result
-                applied = False
-                for _attempt in range(REFRESH_REBASE_ATTEMPTS):
-                    # The assessment and the name conflicts are recomputed from the re-read
-                    # inventory -- graded by the engine it was just read with -- off the
-                    # event loop (it scales with the schema); every other field is copied.
-                    refreshed = await _run.io_bound(
+                # The assessment and the name conflicts are recomputed from the re-read
+                # inventory -- graded by the engine it was just read with -- off the event
+                # loop (it scales with the schema); every other field is copied. Applied
+                # only over the result it was computed from: an Evaluation that finished
+                # while this ran is newer, and must not be overwritten. A target re-browse
+                # that landed meanwhile (Generate's, the post-Apply one) is no reason to
+                # throw this read away: it is applied over that.
+                applied = await rebase_refresh(
+                    eval_state,
+                    old_result,
+                    "inventory",
+                    lambda base: _run.io_bound(
                         with_refreshed_catalogs,
                         base,
                         inventory=new_inventory,
-                        target_inventory=base.target_inventory,  # type: ignore[union-attr]
-                        target_endpoint=base.target_endpoint,  # type: ignore[union-attr]
+                        target_inventory=base.target_inventory,
+                        target_endpoint=base.target_endpoint,
                         source_type=source_conn.source_type,
                         vanished=vanished,
                         source_label=source_label,
-                    )
-                    # Applied only over the result it was computed from: an Evaluation that
-                    # finished while this ran is newer, and must not be overwritten. A
-                    # target re-browse that landed meanwhile (Generate's, the post-Apply
-                    # one) is no reason to throw this read away: it is applied over that.
-                    if set_result_if_unchanged(eval_state, base, refreshed):
-                        applied = True
-                        break
-                    base = refresh_rebase(eval_state, old_result, "inventory")
-                    if base is None:
-                        break
+                    ),
+                )
                 if not applied:
                     from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
 
@@ -2847,10 +2841,8 @@ def build_schema_conversion_screen(
                 from nicegui import run as _run
 
                 from dsql_migrator.ui.evaluation import (
-                    REFRESH_REBASE_ATTEMPTS,
                     _default_target_browser_factory,
-                    refresh_rebase,
-                    set_result_if_unchanged,
+                    rebase_refresh,
                     with_refreshed_catalogs,
                 )
 
@@ -2878,28 +2870,25 @@ def build_schema_conversion_screen(
                 # Start over, when there is nothing to speak of).
                 stepped_aside: Optional[str] = None
                 if old_result is not None:
-                    base: Optional[object] = old_result
-                    stepped_aside = ""
-                    for _attempt in range(REFRESH_REBASE_ATTEMPTS):
-                        refreshed = await _run.io_bound(
+                    # Never over a newer Evaluation that finished while this ran; over a
+                    # source refresh that landed meanwhile, applied on top of it (so
+                    # Generate's diffs never fall back to the older target catalog).
+                    applied = await rebase_refresh(
+                        eval_state,
+                        old_result,
+                        "target_inventory",
+                        lambda base: _run.io_bound(
                             with_refreshed_catalogs,
                             base,
-                            inventory=base.inventory,  # type: ignore[union-attr]
+                            inventory=base.inventory,
                             target_inventory=new_target,
                             # Re-stamp: this catalog was just read from the CURRENT
                             # cluster, so without it the pair would stay flagged stale
                             # forever and the refresh would fix nothing.
                             target_endpoint=target_conn.cluster_endpoint,
-                        )
-                        # Never over a newer Evaluation that finished while this ran; over
-                        # a source refresh that landed meanwhile, applied on top of it (so
-                        # Generate's diffs never fall back to the older target catalog).
-                        if set_result_if_unchanged(eval_state, base, refreshed):
-                            stepped_aside = None
-                            break
-                        base = refresh_rebase(eval_state, old_result, "target_inventory")
-                        if base is None:
-                            break
+                        ),
+                    )
+                    stepped_aside = None if applied else ""
                     if stepped_aside is not None:
                         from dsql_migrator.ui.evaluation import refresh_stepped_aside_text
 

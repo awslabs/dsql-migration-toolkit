@@ -142,6 +142,93 @@ def test_a_refresh_still_steps_aside_for_a_newer_evaluation() -> None:
     assert refresh_rebase(state, old, "inventory") is None
 
 
+class _RebaseState:
+    """The two members rebase_refresh's protocol reads: ``result`` and ``set_result``."""
+
+    def __init__(self, result) -> None:
+        self.result = result
+
+    def set_result(self, result) -> None:
+        self.result = result
+
+
+def _rebase(state, old, half, landings):
+    """Run rebase_refresh with a recompute that records each base it was given and, before
+    returning, lets the next of ``landings`` (a callable on the state, or None) land."""
+    from dsql_migrator.ui.evaluation import rebase_refresh
+
+    bases: list = []
+    pending = list(landings)
+
+    async def recompute(base):
+        bases.append(base)
+        land = pending.pop(0) if pending else None
+        if land is not None:
+            land(state)
+        return SimpleNamespace(rebased_from=base)
+
+    applied = asyncio.run(rebase_refresh(state, old, half, recompute))
+    return applied, bases
+
+
+def test_rebase_refresh_applies_over_the_result_it_read_from() -> None:
+    """AS-11: the attempt loop both Schema Conversion refreshers ran inline is one helper."""
+    old = SimpleNamespace(inventory=object(), target_inventory=object())
+    state = _RebaseState(old)
+    applied, bases = _rebase(state, old, "inventory", [None])
+    assert applied is True and bases == [old]
+    assert state.result.rebased_from is old
+
+
+def test_rebase_refresh_reapplies_over_the_other_halfs_refresh() -> None:
+    old = SimpleNamespace(inventory=object(), target_inventory=object())
+    target_refreshed = SimpleNamespace(inventory=old.inventory, target_inventory=object())
+    state = _RebaseState(old)
+
+    def target_refresh_lands(st) -> None:
+        st.result = target_refreshed
+
+    applied, bases = _rebase(state, old, "inventory", [target_refresh_lands, None])
+    assert applied is True and bases == [old, target_refreshed]
+    assert state.result.rebased_from is target_refreshed
+
+
+def test_rebase_refresh_steps_aside_for_a_newer_evaluation_or_the_same_half() -> None:
+    old = SimpleNamespace(inventory=object(), target_inventory=object())
+    rerun = SimpleNamespace(inventory=object(), target_inventory=object())
+    state = _RebaseState(old)
+
+    def rerun_lands(st) -> None:
+        st.result = rerun
+
+    applied, bases = _rebase(state, old, "inventory", [rerun_lands])
+    assert applied is False and bases == [old] and state.result is rerun
+    # A refresh of the same half that landed meanwhile: this read steps aside too.
+    state = _RebaseState(old)
+    same_half = SimpleNamespace(inventory=old.inventory, target_inventory=object())
+
+    def same_half_lands(st) -> None:
+        st.result = same_half
+
+    applied, bases = _rebase(state, old, "target_inventory", [same_half_lands])
+    assert applied is False and bases == [old] and state.result is same_half
+
+
+def test_rebase_refresh_gives_up_after_its_attempts() -> None:
+    from dsql_migrator.ui.evaluation import REFRESH_REBASE_ATTEMPTS
+
+    old = SimpleNamespace(inventory=object(), target_inventory=object())
+    state = _RebaseState(old)
+
+    def another_target_refresh_lands(st) -> None:
+        st.result = SimpleNamespace(inventory=old.inventory, target_inventory=object())
+
+    landings = [another_target_refresh_lands] * REFRESH_REBASE_ATTEMPTS
+    applied, bases = _rebase(state, old, "inventory", landings)
+    assert applied is False and len(bases) == REFRESH_REBASE_ATTEMPTS == 3
+    assert not hasattr(state.result, "rebased_from")
+
+
 # A Full load + CDC run's watermark: the slot provisioned at the load's LSN (gapless, the
 # start only streams: snapshot.mode=never).
 _GAPLESS = SimpleNamespace(binlog_file=None, binlog_position=None, gtid_executed=None,

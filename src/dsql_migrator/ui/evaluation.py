@@ -37,7 +37,7 @@ import itertools
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from dsql_migrator.config import SecretValue
 from dsql_migrator.core.assessment_strategist import (
@@ -1176,6 +1176,33 @@ def refresh_rebase(
 # A refresh re-applied over the other half's refresh at most this many times (each one
 # re-grades the schema): a third landing meanwhile steps aside as before.
 REFRESH_REBASE_ATTEMPTS = 3
+
+
+async def rebase_refresh(
+    eval_state: "EvaluationState",
+    old_result: "EvaluationResult",
+    half: str,
+    recompute: "Callable[[EvaluationResult], Awaitable[EvaluationResult]]",
+) -> bool:
+    """Apply a refresh that re-read one ``half`` of the catalogs; whether it was applied.
+
+    ``recompute(base)`` builds the refreshed result over ``base`` -- first ``old_result``,
+    the result taken BEFORE the catalog read -- and it is stored only while ``base`` is
+    still the current result (:func:`set_result_if_unchanged`). When a refresh of the OTHER
+    half replaced it meanwhile, it is recomputed over that one (:func:`refresh_rebase`), at
+    most :data:`REFRESH_REBASE_ATTEMPTS` times in all. A newer Evaluation, a Start over, a
+    restore or a refresh of the same half makes it step aside (``False``); what to tell the
+    operator then is the caller's (:func:`refresh_stepped_aside_text`).
+    """
+    base: "Optional[EvaluationResult]" = old_result
+    for _attempt in range(REFRESH_REBASE_ATTEMPTS):
+        refreshed = await recompute(base)  # type: ignore[arg-type]
+        if set_result_if_unchanged(eval_state, base, refreshed):
+            return True
+        base = refresh_rebase(eval_state, old_result, half)
+        if base is None:
+            return False
+    return False
 
 
 # The address of a describe_source() label -- its host, and its database when there is one:
