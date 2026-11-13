@@ -1596,6 +1596,7 @@ def run_cdc_infra_deploy(
     """
     from dsql_migrator.core.models import SourceType
     from dsql_migrator.core.s3_provision import (
+        PLUGIN_VERSION,
         S3ProvisionError,
         build_s3_client,
         build_sts_client,
@@ -1611,8 +1612,11 @@ def run_cdc_infra_deploy(
         _list_refusal = list_parameter_size_refusal(params.filled)
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
-        # ...and a captured table whose name CDC cannot stream (topic_name_refusal).
-        _topic_refusal = topic_name_refusal(params.filled)
+        # ...and a captured table whose name CDC cannot stream (topic_name_refusal), judged
+        # for the bundled sink plugin: the one this deploy uploads and records as the new
+        # stack's PluginVersion (_patch_plugin_params), so a '.' inside a table name is
+        # judged by the sink that will read it.
+        _topic_refusal = topic_name_refusal(params.filled, sink_plugin=PLUGIN_VERSION)
         if _topic_refusal:
             raise CdcDeployError(_topic_refusal)
         # 0a. ensure plugin bucket + 0b. upload plugins (background — ~32-43 MiB,
@@ -2133,9 +2137,13 @@ def run_cdc_start(
         if _list_refusal:
             raise CdcDeployError(_list_refusal)
         # A captured table whose name CDC cannot stream would fail the topic pre-create, never
-        # be captured (trimmed into a legal name) or fail in the sink (a '.' inside a name):
-        # refused here too.
-        _topic_refusal = topic_name_refusal(params.filled)
+        # be captured (trimmed into a legal name) or fail in the sink (a '.' inside a table
+        # name on a sink plugin older than DOTTED_TABLE_MIN_PLUGIN_VERSION): refused here too.
+        # Judged for the DEPLOYED sink plugin, read from THIS describe (_plugin above; a
+        # Start carries PluginVersion forward, only Deploy infra changes it), so neither a
+        # Retry CDC nor a UI that judged an earlier read can start such a table on a sink
+        # that would misread it. A stack with no PluginVersion is judged as the oldest.
+        _topic_refusal = topic_name_refusal(params.filled, sink_plugin=_plugin)
         if _topic_refusal:
             raise CdcDeployError(_topic_refusal)
         # Backstop for the chooser: a KEPT 0.1.561 ColumnExcludeList may still exclude a

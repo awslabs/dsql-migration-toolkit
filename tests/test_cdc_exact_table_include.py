@@ -144,6 +144,48 @@ def test_exact_capture_admits_only_the_selected_tables_and_the_default_is_unchan
     assert bare == "(?-i)" and _captures(bare, _TABLES) == []
 
 
+# A table whose name holds a '.' (MySQL shop.`orders.v2`, PostgreSQL shop."orders.v2"), and the
+# unselected tables whose ids an unescaped entry would also match: a '.' or a '_' against a
+# '.', letter case, and the selected plain table.
+_DOTTED_TWINS = [
+    "shop.orders.v2", "shop.orders_v2", "shopXorders.v2", "shop_orders.v2", "shop.ordersXv2",
+    "SHOP.orders.v2", "shop.orders",
+]
+
+
+@pytest.mark.parametrize("name", _SOURCES)
+def test_exact_capture_admits_only_a_selected_table_whose_name_holds_a_dot(name) -> None:
+    # FAILS WITHOUT THE FIX: Start CDC sent shop.orders.v2 as written, and Debezium reads each
+    # entry as a regex matched against the whole table id, so its '.' also captured
+    # shop.orders_v2, shopXorders.v2, shop_orders.v2 and shop.ordersXv2 -- into topics the sink
+    # never reads. The entry is what the parameter builders send (cdc_table_list_params),
+    # resolved through the template's expression as CloudFormation does.
+    from dsql_migrator.core.cdc import (
+        DebeziumSourceConfig,
+        SinkConnectorConfig,
+        cdc_table_list_params,
+    )
+
+    tables = ["shop.orders.v2", "shop.orders"]
+    sent = dict(cdc_table_list_params(
+        DebeziumSourceConfig(name="s", table_include_list=tables),
+        SinkConnectorConfig(name="k", topics=tables, dlq_topic="d"),
+    ))
+    doc = _template()
+    expression = doc["Resources"][name]["Properties"]["ConnectorConfiguration"][
+        "table.include.list"
+    ]
+    # TableIncludeList is a CommaDelimitedList: CloudFormation splits it on its commas.
+    selected = {"TableIncludeList": sent["TableIncludeList"].split(",")}
+    exact = _resolve(expression, doc, {**selected, "ExactTableIncludeList": "true"})
+    assert exact == "(?-i)shop\\.orders\\.v2,(?-i)shop.orders"
+    assert _captures(exact, _DOTTED_TWINS) == ["shop.orders.v2", "shop.orders"]
+    # A stack first started before ExactTableIncludeList: the '.' is exact too, letter case
+    # is not (as for any name there).
+    legacy = _resolve(expression, doc, {**selected, "ExactTableIncludeList": "false"})
+    assert _captures(legacy, _DOTTED_TWINS) == ["shop.orders.v2", "SHOP.orders.v2", "shop.orders"]
+
+
 # ---------------------------------------------------------------------------
 # 2. Start CDC sends it only to a stack whose parameters show no Start yet
 # ---------------------------------------------------------------------------

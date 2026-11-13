@@ -188,32 +188,16 @@ class DebeziumEventsTest {
   }
 
   @Test
-  void tombstoneBecomesDeleteWithQualifiedTableFromTopic() {
-    // No value (tombstone) -> resolve schema-qualified target from the topic:
-    // <prefix>.<db>.<table> = dsqlcdc.app.users -> app.users (schema preserved).
-    ChangeEvent event = DebeziumEvents.parse(record(key(7L), null, "dsqlcdc.app.users"));
-    assertTrue(event.isDelete());
-    assertEquals("app.users", event.table());
-    assertEquals(List.of(7L), event.pkValues());
-    // Flagged as a tombstone: it APPLIES like any delete, but Debezium sends an op=d
-    // envelope AND a tombstone for one source DELETE, so counting both reported
-    // DeletesApplied=2 for a single deleted row. The flag is what lets the metric skip it
-    // without changing the apply.
-    assertTrue(event.isTombstone());
-  }
-
-  @Test
-  void anOpDeleteIsNotATombstone() {
-    // The negative control for the flag: without it, excluding tombstones from the metric
-    // would also exclude real deletes and DeletesApplied would report 0 instead of 2.
-    Struct env =
-        new Struct(ENVELOPE)
-            .put("op", "d")
-            .put("before", row(5L, "Bob"))
-            .put("source", source("users"));
-    ChangeEvent event = DebeziumEvents.parse(record(key(5L), env, "dsqlcdc.app.users"));
-    assertTrue(event.isDelete());
-    assertFalse(event.isTombstone());
+  void aTombstoneIsNeverParsedIntoADelete() {
+    // FAILS WITHOUT THE FIX (plugin v57): a tombstone (no value) became a delete of the table
+    // read from its topic's last two segments -- dsqlcdc.app.app.orders gave app.orders, ANOTHER
+    // table. DsqlSinkTask.put skips every tombstone before parsing (the op=d before it is the
+    // delete); parse refuses one, defensively, instead of guessing its table.
+    for (String topic : new String[] {"dsqlcdc.app.users", "dsqlcdc.app.app.orders"}) {
+      DataException thrown =
+          assertThrows(DataException.class, () -> DebeziumEvents.parse(record(key(7L), null, topic)));
+      assertTrue(thrown.getMessage().startsWith("Cannot apply a tombstone"), thrown.getMessage());
+    }
   }
 
   @Test
@@ -240,6 +224,143 @@ class DebeziumEventsTest {
     Struct env = new Struct(pgEnvelope).put("op", "c").put("after", row(1L, "tick")).put("source", src);
     ChangeEvent event = DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.inventory.heartbeat"));
     assertEquals("cdc_monitor.heartbeat", event.table());
+  }
+
+  // --- A table name holding a '.' (plugin v57) ----------------------------------------------------
+
+  // A source block that may carry db, schema and table (each optional, so any can be absent).
+  private static final Schema NAMED_SOURCE =
+      SchemaBuilder.struct()
+          .name("Source")
+          .field("db", Schema.OPTIONAL_STRING_SCHEMA)
+          .field("schema", Schema.OPTIONAL_STRING_SCHEMA)
+          .field("table", Schema.OPTIONAL_STRING_SCHEMA)
+          .optional()
+          .build();
+
+  private static final Schema NAMED_ENVELOPE =
+      SchemaBuilder.struct()
+          .name("Envelope")
+          .field("op", Schema.STRING_SCHEMA)
+          .field("before", ROW)
+          .field("after", ROW)
+          .field("source", NAMED_SOURCE)
+          .build();
+
+  /** An event of {@code op} for row 2 with a source block of db / schema / table. */
+  private static SinkRecord named(String op, String db, String schema, String table, String topic) {
+    Struct src = new Struct(NAMED_SOURCE).put("db", db).put("schema", schema).put("table", table);
+    Struct env = new Struct(NAMED_ENVELOPE).put("op", op).put("source", src);
+    if ("d".equals(op)) {
+      env.put("before", row(2L, "a"));
+    } else {
+      env.put("after", row(2L, "a"));
+    }
+    return record(key(2L), env, topic);
+  }
+
+  @Test
+  void aMysqlTableNameHoldingADotIsWrittenToThatTable() {
+    // FAILS WITHOUT THE FIX (plugin v57): MySQL `shop`.`orders.v2` was written as
+    // "shop"."orders"."v2", which every write rejected.
+    ChangeEvent event =
+        DebeziumEvents.parse(named("c", "shop", null, "orders.v2", "dsqlcdc.shop.orders.v2"));
+    assertEquals("shop.orders.v2", event.table());
+    assertEquals(
+        "INSERT INTO \"shop\".\"orders.v2\" (\"id\", \"name\") VALUES (?, ?) ON CONFLICT (\"id\")"
+            + " DO UPDATE SET \"name\" = EXCLUDED.\"name\"",
+        DsqlSinkTask.renderSql(event));
+  }
+
+  @Test
+  void aPostgresTableNamedLikeAnotherQualifiedNameIsWrittenToItself() {
+    // app."app.orders" next to app.orders: its delete is "app"."app.orders", never app.orders.
+    // FAILS WITHOUT THE FIX (plugin v57): it was DELETE FROM "app"."app"."orders".
+    ChangeEvent event =
+        DebeziumEvents.parse(named("d", "testdb", "app", "app.orders", "dsqlcdc.app.app.orders"));
+    assertEquals("app.app.orders", event.table());
+    assertEquals(
+        "DELETE FROM \"app\".\"app.orders\" WHERE \"id\" = ?", DsqlSinkTask.renderSql(event));
+  }
+
+  @Test
+  void aChangeWhoseDatabaseOrSchemaNameHoldsADotIsRefused() {
+    // FAILS WITHOUT THE FIX (plugin v57): db my.db gave my.db.t, read back as schema my and
+    // table db.t -- a different table. The tool does not support a '.' in a database or schema
+    // name (Evaluation: DOTTED_SCHEMA_NAME), so the sink dead-letters the change.
+    DataException mysql =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(named("c", "my.db", null, "t", "dsqlcdc.my.db.t")));
+    assertEquals(
+        "Cannot apply a change to table my.db.t: its database or schema name, my.db, holds a '.',"
+            + " which the tool does not support (Evaluation reports it Unsupported,"
+            + " DOTTED_SCHEMA_NAME), so the change is dead-lettered rather than written to a"
+            + " table read from a split name.",
+        mysql.getMessage());
+    DataException pg =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(named("u", "testdb", "a.b", "t", "dsqlcdc.a.b.t")));
+    assertTrue(pg.getMessage().contains("its database or schema name, a.b, holds a '.'"),
+        pg.getMessage());
+    // Only the namespace actually used is checked: a PostgreSQL source names its schema, so a
+    // '.' in its DATABASE name is fine.
+    ChangeEvent applied =
+        DebeziumEvents.parse(named("c", "my.app", "app", "t", "dsqlcdc.app.t"));
+    assertEquals("app.t", applied.table());
+    // No namespace at all and a '.' in the table name: which part is the table is unknown.
+    DataException bare =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(named("c", null, null, "orders.v2", "dsqlcdc.orders.v2")));
+    assertTrue(bare.getMessage().startsWith("Cannot apply a change to table orders.v2: the change"
+        + " event names no database or schema"), bare.getMessage());
+  }
+
+  @Test
+  void aChangeWithNoSourceTableIsRefusedNotReadFromItsTopic() {
+    // FAILS WITHOUT THE FIX (plugin v57): the table fell back to the topic's last two segments,
+    // which for dsqlcdc.app.app.orders named app.orders -- another table.
+    String expected =
+        "Cannot resolve the target table: the change event has no source.table, and the sink"
+            + " does not guess a table from its topic.";
+    for (String table : new String[] {null, ""}) {
+      DataException thrown =
+          assertThrows(
+              DataException.class,
+              () -> DebeziumEvents.parse(named("c", "app", "app", table, "dsqlcdc.app.app.orders")));
+      assertEquals(expected, thrown.getMessage());
+    }
+    // No source block at all.
+    Schema noSource =
+        SchemaBuilder.struct().name("Envelope").field("op", Schema.STRING_SCHEMA)
+            .field("after", ROW).build();
+    Struct env = new Struct(noSource).put("op", "c").put("after", row(1L, "a"));
+    DataException thrown =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(key(1L), env, "dsqlcdc.app.users")));
+    assertEquals(expected, thrown.getMessage());
+  }
+
+  @Test
+  void theNullKeyRemedyQuotesTheTableAsTheStatementDoes() {
+    // FAILS WITHOUT THE FIX (plugin v57): the remedy read ALTER TABLE app.users.v2 ..., which
+    // PostgreSQL parses as database app, schema users, table v2.
+    Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
+    Struct src =
+        new Struct(NAMED_SOURCE).put("db", "testdb").put("schema", "app").put("table", "users.v2");
+    Struct env =
+        new Struct(NAMED_ENVELOPE).put("op", "d").put("before", row(510L, "Bob")).put("source", src);
+    DataException thrown =
+        assertThrows(
+            DataException.class,
+            () -> DebeziumEvents.parse(record(k, env, "dsqlcdc.app.users.v2")));
+    assertTrue(
+        thrown.getMessage().endsWith(
+            "run ALTER TABLE \"app\".\"users.v2\" REPLICA IDENTITY FULL."),
+        thrown.getMessage());
   }
 
   // --- PostgreSQL TOAST unavailable-value placeholder omission (Phase D) -------
@@ -537,15 +658,6 @@ class DebeziumEventsTest {
   }
 
   @Test
-  void aTombstoneWithANullKeyComponentIsAlsoRejected() {
-    // Debezium sends a tombstone alongside the op=d envelope for one source DELETE, and it
-    // applies like any delete -- so the same null key would be the same silent no-op.
-    Struct k = new Struct(COMPOSITE_KEY).put("user_id", null).put("id", 510L);
-    assertThrows(
-        DataException.class, () -> DebeziumEvents.parse(record(k, null, "dsqlcdc.app.orders")));
-  }
-
-  @Test
   void aRequiredRekeyColumnHoldingDebeziumsPlaceholderIsNotDetectedBySink() {
     // CHARACTERIZATION (G2), pinning what the sink CANNOT see on a record keyed on the
     // COMPOSITE key -- infrastructure deployed before sink plugin v51, or an in-flight record
@@ -577,10 +689,6 @@ class DebeziumEventsTest {
     assertTrue(event.isDelete());
     assertEquals(List.of("user_id", "id"), event.pkColumns());
     assertEquals(List.of(0L, 510L), event.pkValues());
-    // ...and its tombstone the same way.
-    ChangeEvent tombstone = DebeziumEvents.parse(record(k, null, "dsqlcdc.app.orders"));
-    assertTrue(tombstone.isTombstone());
-    assertEquals(List.of(0L, 510L), tombstone.pkValues());
   }
 
   @Test
@@ -824,7 +932,6 @@ class DebeziumEventsTest {
     Struct del =
         new Struct(ENVELOPE).put("op", "d").put("before", row(1L, "Alice")).put("source", source("users"));
     assertTrue(DebeziumEvents.parse(record(key(1L), del, "dsqlcdc.app.users")).isDelete());
-    assertTrue(DebeziumEvents.parse(record(key(1L), null, "dsqlcdc.app.users")).isTombstone());
   }
 
   // --- Source-keyed re-keyed tables (G15) -----------------------------------------------
@@ -1028,7 +1135,6 @@ class DebeziumEventsTest {
     // carries the source key the task switches to once the unique index on it is valid.
     ChangeEvent event = DebeziumEvents.parse(leadRecord("d", leadRow(7L, 2L, null), null), REKEYED);
     assertTrue(event.isDelete());
-    assertFalse(event.isTombstone());
     assertEquals(List.of("lead", "id"), event.pkColumns());
     assertEquals(List.of(7L, 2L), event.pkValues());
     assertEquals(List.of("id"), event.sourceKeyColumns());
@@ -1153,31 +1259,6 @@ class DebeziumEventsTest {
   }
 
   @Test
-  void sourceKeyedTombstoneIsRecognisedAndALegacyKeyedOneIsNot() {
-    SinkRecord sourceKeyed = record(new Struct(SRC_KEY).put("id", 2L), null, "dsqlcdc.app.orders");
-    assertTrue(DebeziumEvents.isSourceKeyedTombstone(sourceKeyed, REKEYED));
-    Schema compositeKey =
-        SchemaBuilder.struct()
-            .name("Key")
-            .field("lead", Schema.INT64_SCHEMA)
-            .field("id", Schema.INT64_SCHEMA)
-            .build();
-    SinkRecord legacy =
-        record(new Struct(compositeKey).put("lead", 5L).put("id", 2L), null, "dsqlcdc.app.orders");
-    assertFalse(DebeziumEvents.isSourceKeyedTombstone(legacy, REKEYED));
-    // ...which still parses as today's tombstone delete.
-    assertTrue(DebeziumEvents.parse(legacy, REKEYED).isTombstone());
-    // Not a tombstone, an unlisted table, an empty map: never.
-    assertFalse(
-        DebeziumEvents.isSourceKeyedTombstone(
-            leadRecord("d", leadRow(5L, 2L, "a"), null), REKEYED));
-    assertFalse(
-        DebeziumEvents.isSourceKeyedTombstone(
-            record(new Struct(SRC_KEY).put("id", 2L), null, "dsqlcdc.app.items"), REKEYED));
-    assertFalse(DebeziumEvents.isSourceKeyedTombstone(sourceKeyed, java.util.Map.of()));
-  }
-
-  @Test
   void aKeyThatIsNotAStrictSubsetIsNotSourceKeyed() {
     // The whole composite key in either order (an older pipeline's record), and a key with a
     // column outside the composite, all parse as today: keyed by the record key.
@@ -1263,8 +1344,7 @@ class DebeziumEventsTest {
             record(key(1L), new Struct(ENVELOPE).put("op", "u").put("before", row(1L, "a"))
                 .put("after", row(1L, "b")).put("source", source("Orders")), "dsqlcdc.app.Orders"),
             record(key(1L), new Struct(ENVELOPE).put("op", "d").put("before", row(1L, "b"))
-                .put("source", source("Orders")), "dsqlcdc.app.Orders"),
-            record(key(1L), null, "dsqlcdc.app.Orders"))) {
+                .put("source", source("Orders")), "dsqlcdc.app.Orders"))) {
       ChangeEvent plain = DebeziumEvents.parse(rec);
       ChangeEvent listed = DebeziumEvents.parse(rec, REKEYED);
       assertEquals(plain.pkColumns(), listed.pkColumns());
@@ -1272,7 +1352,6 @@ class DebeziumEventsTest {
       assertEquals(DsqlSinkTask.renderSql(plain), DsqlSinkTask.renderSql(listed));
       assertFalse(listed.hasSourceKey());
       assertFalse(listed.isMove());
-      assertFalse(DebeziumEvents.isSourceKeyedTombstone(rec, REKEYED));
     }
   }
 }

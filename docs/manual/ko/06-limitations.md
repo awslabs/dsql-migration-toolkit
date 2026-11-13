@@ -112,18 +112,25 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
 - **CDC는 이름이 쓸 수 있는 Kafka 토픽 이름이 되는 테이블만 스트리밍함.** CDC는 캡처하는 테이블마다
   그 데이터베이스(MySQL)나 스키마(PostgreSQL)와 테이블 이름으로 Kafka 토픽 이름을 짓는데, Kafka는
   토픽 이름에 ASCII 영문자, 숫자, `.`, `_`, `-`만 허용합니다. 데이터베이스, 스키마 또는 테이블
-  이름에 그 밖의 문자(`$`, 공백, `%`, `:`, 쉼표, 한글 같은 비 ASCII 문자)나 이름 안의 `.`이 들어간
-  테이블(CDC 싱크는 모든 `.`을 데이터베이스나 스키마와 테이블 사이의 `.`으로 읽음)과,
-  `app.v2_users`와 `app_v2.users`처럼 이름이 `.`과 `_`만 다른 두 테이블(Kafka는 이름이 그렇게만 다른
-  두 토픽을 허용하지 않으므로 둘 중 하나만 캡처하세요)은 캡처할 수 없습니다: Deploy CDC
-  infrastructure, Start CDC, Retry CDC는 무엇이든 업로드하거나 만들기 전에 그런 테이블을
-  거부하고(*Table names CDC cannot stream*, 테이블을 명시하며, 공백이나 폭 없는 공백처럼 보이지 않는
-  문자는 코드 포인트로 표기: `<U+0020>`, `<U+200B>`), Full load + CDC에서는 Full Load 단계가 적재
-  전에 경고하지만 적재를 막지는 않습니다. 데이터베이스나 스키마 이름 안의 `.`은 어느 단계에서도
-  지원되지 않습니다: 도구는 정규화된 이름의 첫 `.`을 구분자로 보므로, Schema Conversion과 Full
-  Load가 그런 이름을 엉뚱한 곳에서 나누고, Evaluation은 그런 데이터베이스나 스키마의 테이블과 뷰를
-  각각 **Unsupported**(`DOTTED_SCHEMA_NAME`)로 보고합니다. 소스에서 그 데이터베이스나 스키마의
-  이름을 바꾸거나, 그 테이블과 뷰를 마이그레이션에서
+  이름에 그 밖의 문자(`$`, 공백, `%`, `:`, 쉼표, 한글 같은 비 ASCII 문자)가 들어간 테이블과,
+  `app.v2_users`와 `app_v2.users`, 또는 `shop.orders.v2`와 `shop.orders_v2`처럼 이름이 `.`과
+  `_`만 다른 두 테이블(Kafka는 이름이 그렇게만 다른 두 토픽을 허용하지 않으므로 둘 중 하나만
+  캡처하세요)은 캡처할 수 없습니다. Evaluation은 그런 테이블을 알려 줍니다(`CDC_TOPIC_NAME`,
+  조언만). Deploy CDC infrastructure, Start CDC, Retry CDC는 무엇이든 업로드하거나 만들기 전에 그런
+  테이블을 거부하고(*Table names CDC cannot stream*, 테이블을 명시하며, 공백이나 폭 없는 공백처럼
+  보이지 않는 문자는 코드 포인트로 표기: `<U+0020>`, `<U+200B>`), Full load + CDC에서는 Full Load
+  단계가 적재 전에 경고하지만 적재를 막지는 않습니다. MySQL `shop`.`orders.v2`나 PostgreSQL
+  `app."orders.v2"`처럼 테이블 이름 안에 `.`이 있는 테이블은 버전 0.1.589 이상이 배포한 CDC
+  인프라에서는 문제가 없습니다. 그 이전 버전이 배포한 CDC 인프라는 그런 테이블을 스트리밍할 수
+  없으므로, 거기서는 **Delete CDC infrastructure** 후 다시 배포할 때까지 Start CDC와 Retry CDC가
+  그 테이블을 거부합니다(그 대가는 [13장](13-excluding-tables-and-columns.md#집합이-잠기는-이유)의
+  "삭제 후 다시 CDC 시작" 참고). 데이터베이스나 스키마 이름 안의 `.`은 어느 단계에서도 지원되지
+  않습니다: 도구는 정규화된 이름의 첫 `.`을 구분자로 보므로, Schema Conversion과 Full Load가 그런
+  이름을 엉뚱한 곳에서 나누고, Evaluation은 그런 데이터베이스나 스키마의 테이블과 뷰를 각각
+  **Unsupported**(`DOTTED_SCHEMA_NAME`)로 보고합니다. 그러면 CDC는 다른 데이터베이스나 스키마의
+  테이블이라도 정규화된 이름이 그 테이블 중 하나와 같으면 거부합니다(데이터베이스 `shop`의 테이블
+  `orders.v2`와 데이터베이스 `shop.orders`의 테이블 `v2`는 둘 다 `shop.orders.v2`). 소스에서 그
+  데이터베이스나 스키마의 이름을 바꾸거나, 그 테이블과 뷰를 마이그레이션에서
   빼세요([§2.4](02-evaluation-and-schema-conversion.md#24-evaluation-항목-참조)). 그 밖의 그런
   테이블은, Full load + CDC에서는 적재한 뒤 CDC를 시작하기 전에 선택을
   해제하세요([13장](13-excluding-tables-and-columns.md)의 "Full Load 후 테이블 집합 바꾸기 (Full
@@ -134,8 +141,9 @@ finding), 어떻게 대처할지는 [§2.4](02-evaluation-and-schema-conversion.
   있습니다(아래 "용량과 비용" 참고). 이전 Start CDC가 클러스터에 남긴 토픽도 충돌합니다(예: Start
   over 전에 쓰던 테이블 집합의 토픽): 그러면 Start CDC는 커넥터를 만들기 전에 실패합니다 — External
   경로(PostgreSQL 소스, 또는 EC2 호스트의 MySQL)에서는 그 토픽을 명시하며 즉시 실패하고, Lambda
-  경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백됩니다. 그 토픽이 없는 클러스터를
-  얻으려면 Delete CDC infrastructure 후 다시 배포하세요.
+  경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백되며, 버전 0.1.589 이상이 배포한
+  CDC 인프라에서는 그 활동 로그가 토픽을 명시합니다. 그 토픽이 없는 클러스터를 얻으려면 Delete CDC
+  infrastructure 후 다시 배포하세요.
 
 - **버전 0.1.580 이하가 처음 시작한 CDC 스택은 선택한 테이블과 이름이 대소문자만 다른 테이블도
   캡처함.** 그런 스택은 선택한 이름을 대소문자를 구분하지 않고 맞추므로, `shop.users`를 선택하면

@@ -88,6 +88,7 @@ from dsql_migrator.core.activity_log import (
     ActivityStatus,
     log_activity,
 )
+from dsql_migrator.core.assessor import DOTTED_SCHEMA_RULE_ID
 from dsql_migrator.core.cdc import (
     CDC_PARAMETER_BYTE_LIMIT,
     CdcPipelineOrchestrator,
@@ -291,6 +292,7 @@ from dsql_migrator.ui.data_migration._models import (
     connector_health_rows,
     CdcHandlingFact,
     cdc_cascade_gap_tables,
+    cdc_rule_tables,
     cdc_handling_facts,
     cdc_prerequisite_block_header,
     cdc_prerequisite_block_reason,
@@ -1052,6 +1054,13 @@ def build_data_migration_screen(
         # The live source of what every exclusion gate judges (selection, applied DDL,
         # target columns) -- registered before anything below reads it.
         migration_state.set_exclusion_inputs_resolver(_exclusion_resolver)
+        # ...and the tables Evaluation reported DOTTED_SCHEMA_NAME on (a '.' inside their
+        # database or schema name), which every CDC topic-name check refuses on any sink
+        # plugin (_cdc_ui._topic_name_context). None without an Evaluation report.
+        _report = _assessment()
+        migration_state.set_cdc_dotted_schema_tables(
+            None if _report is None else cdc_rule_tables(_report, DOTTED_SCHEMA_RULE_ID)
+        )
 
         # Composite-PK CDC re-key: when a table's applied Schema Conversion gave it
         # a composite target key, Debezium keys its change record on those same
@@ -4063,17 +4072,25 @@ def pre_load_topic_name_warning(
     infrastructure and Start CDC holds judge the real capture.
     """
     return _pre_load_cdc_warning(
-        cdc_pre_load_topic_name_warning, migration_state, job_manager, session, inventory
+        cdc_pre_load_topic_name_warning, migration_state, job_manager, session, inventory,
+        topic_names=True,
     )
 
 
-def _pre_load_cdc_warning(warning, migration_state, job_manager, session, inventory):
+def _pre_load_cdc_warning(
+    warning, migration_state, job_manager, session, inventory, *, topic_names: bool = False
+):
     """The one gate of the Full Load card's CDC warnings (:func:`pre_load_table_list_warning`,
     :func:`pre_load_topic_name_warning`), so they cannot drift apart: Full load + CDC, no
     load yet, a selection, and CDC never started for this migration. Then ``warning`` (a
     ``_models`` pre-load warning) over the load's selection, ``planned`` when a cdc-stack
     already owns the partition plan (deployed, or deploying), with the table picker's lock
-    and whether the load may read a table in parts. Else ``None``."""
+    and whether the load may read a table in parts. Else ``None``.
+
+    ``topic_names`` (the topic-name warning) also judges the names for the stack the next
+    CDC operation judges them for (``_cdc_ui._topic_name_context``): a deployed stack's
+    sink plugin, which Start CDC keeps; else the one this version bundles -- no stack yet,
+    one being deleted, or the one this session's deploy is creating, which records it."""
     if (
         migration_state.migration_type is not MigrationType.FULL_LOAD_AND_CDC
         or getattr(migration_state, "job_id", None) is not None
@@ -4084,16 +4101,22 @@ def _pre_load_cdc_warning(warning, migration_state, job_manager, session, invent
         return None
     scope = exclusion_scope(migration_state)
     wanted = None if scope is None else set(scope)
-    planned = cdc_infra_prep_state(migration_state, job_manager) in (
-        "ready",
-        "deploying",
-    ) and not cdc_stack_being_deleted(migration_state, job_manager)
+    prep = cdc_infra_prep_state(migration_state, job_manager)
+    planned = prep in ("ready", "deploying") and not cdc_stack_being_deleted(
+        migration_state, job_manager
+    )
+    context = (
+        _topic_name_context(migration_state, deploy=not (planned and prep == "ready"))
+        if topic_names
+        else {}
+    )
     return warning(
         [t.name for t in inventory.tables if wanted is None or t.name in wanted],
         planned=planned,
         table_lock=table_set_lock_reason(migration_state, job_manager, session),
         # G137: a table the load reads in parts is carved out of the untick route.
         split=mysql_reads_may_split(session_source_type(session)),
+        **context,
     )
 
 
@@ -5322,6 +5345,7 @@ __all__ = [
     "cdc_activity_summary",
     "CdcHandlingFact",
     "cdc_cascade_gap_tables",
+    "cdc_rule_tables",
     "cdc_handling_facts",
     "cdc_prerequisite_block_header",
     "cdc_prerequisite_block_reason",
@@ -5360,6 +5384,7 @@ from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     _render_cdc_attach_row,
     cdc_infra_prep_state,
     _render_cdc_least_privilege_note,
+    _topic_name_context,
     START_TOOLTIP_NARROWING,
     WILL_STREAM_NONE,
     WILL_STREAM_NONE_LOCKED_LIST,

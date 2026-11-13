@@ -515,6 +515,13 @@ class DataMigrationState:
         # version bundles (core.s3_provision.PLUGIN_VERSION). None: no stack, or not read.
         # Transient/session-only.
         self.cdc_deployed_plugin_version: Optional[str] = None
+        # The tables Evaluation (Step 1) reported DOTTED_SCHEMA_NAME on: tables of a database
+        # or schema whose name holds a '.', which CDC refuses on every sink plugin
+        # (core.cdc.topic_name_refusal's ``dotted_schema_tables``). Set from the Evaluation
+        # report on every Data Migration render; None: no report (unknown). An Evaluation
+        # fact, not a stack's, so a stack change keeps it (only Start over resets it).
+        # Transient/session-only.
+        self.cdc_dotted_schema_tables: Optional[frozenset[str]] = None
         # The binlog (file, pos) the stack's LAST Start offered the offset seeder, from the
         # same phase probe (Stop carries Watermark* forward). None: no stack / no seed.
         self.cdc_deployed_watermark: Optional[tuple[str, str]] = None
@@ -2213,6 +2220,14 @@ class DataMigrationState:
         text = str(value or "").strip()
         with self._lock:
             self.cdc_deployed_plugin_version = text or None
+
+    def set_cdc_dotted_schema_tables(self, tables: "Optional[Iterable[str]]") -> None:
+        """Record the tables Evaluation reported DOTTED_SCHEMA_NAME on (``None``: no
+        Evaluation report, unknown; an empty set is a real, empty answer)."""
+        with self._lock:
+            self.cdc_dotted_schema_tables = (
+                None if tables is None else frozenset(str(t) for t in tables)
+            )
 
     def note_cdc_offered_seed(self, seed) -> None:
         """Record a seed a Start offers the seeder, keeping the LATEST one (binlog order)."""

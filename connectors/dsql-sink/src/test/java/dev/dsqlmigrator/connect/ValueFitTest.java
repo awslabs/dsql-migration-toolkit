@@ -243,7 +243,12 @@ class ValueFitTest {
   @Test
   void catalogKey() {
     assertArrayEquals(new String[] {"shop", "orders"}, ValueFit.catalogKey("shop.orders"));
-    for (String bad : new String[] {"orders", "a.b.c", "", ".x", "x.", null}) {
+    // Split at the FIRST '.', as DsqlDialect.quoteQualified writes the name. FAILS WITHOUT THE
+    // FIX (plugin v57): a table name holding a '.' read null, so its values went unguarded (a
+    // fraction for an integer column rounded silently) and its source-key index was never read.
+    assertArrayEquals(new String[] {"a", "b.c"}, ValueFit.catalogKey("a.b.c"));
+    assertArrayEquals(new String[] {"shop", "orders.v2"}, ValueFit.catalogKey("shop.orders.v2"));
+    for (String bad : new String[] {"orders", "", ".x", "x.", "a.", ".b", null}) {
       assertNull(ValueFit.catalogKey(bad), String.valueOf(bad));
     }
   }

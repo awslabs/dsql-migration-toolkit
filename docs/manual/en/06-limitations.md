@@ -118,20 +118,29 @@ it.
   captured table's Kafka topic after its database (MySQL) or schema (PostgreSQL) and its
   table, and Kafka allows only ASCII letters, digits, `.`, `_` and `-` in a topic name. CDC
   cannot capture a table whose database, schema or table name holds any other character
-  (`$`, a space, `%`, `:`, a comma, a non-ASCII letter) or a `.` inside the name (the CDC
-  sink reads every `.` as the one between the database or schema and the table), nor two
-  tables whose names differ only in a `.` against a `_`, such as `app.v2_users` and
-  `app_v2.users` (Kafka does not allow two topics whose names differ only that way;
-  capture one of them). Deploy CDC infrastructure, Start CDC and Retry CDC refuse such a
-  table before anything is uploaded or created (*Table names CDC cannot stream*, naming
-  the tables, with a character that does not show, such as a space or a zero-width space,
-  written as its code point: `<U+0020>`, `<U+200B>`), and with Full load + CDC the Full
-  Load step warns before the load but is not held. A `.` inside a database or schema name
-  is not supported at any step: the tool takes the first `.` of a qualified name for the
-  separator, so Schema Conversion and the Full Load split such a name in the wrong place,
-  and Evaluation reports each table and view of such a database or schema as
-  **Unsupported** (`DOTTED_SCHEMA_NAME`). Rename that database or schema at the source, or
-  leave its tables and views out of the migration
+  (`$`, a space, `%`, `:`, a comma, a non-ASCII letter), nor two tables whose names differ
+  only in a `.` against a `_`, such as `app.v2_users` and `app_v2.users`, or
+  `shop.orders.v2` and `shop.orders_v2` (Kafka does not allow two topics whose names
+  differ only that way; capture one of them). Evaluation lists such tables
+  (`CDC_TOPIC_NAME`, advice only). Deploy CDC infrastructure, Start CDC and Retry CDC
+  refuse such a table before anything is uploaded or created (*Table names CDC cannot
+  stream*, naming the tables, with a character that does not show, such as a space or a
+  zero-width space, written as its code point: `<U+0020>`, `<U+200B>`), and with Full
+  load + CDC the Full Load step warns before the load but is not held. A `.` inside a
+  table name, such as MySQL `shop`.`orders.v2` or PostgreSQL `app."orders.v2"`, is no
+  problem on CDC infrastructure deployed by version 0.1.589 or later. CDC infrastructure
+  deployed by an earlier version cannot stream such a table: there Start CDC and Retry CDC
+  refuse it until you **Delete CDC infrastructure** and deploy it again (for what that
+  costs, see "Starting CDC again after a delete" in
+  [Chapter 13](13-excluding-tables-and-columns.md#why-the-set-locks)). A `.` inside a
+  database or schema name is not supported at any step: the tool takes the first `.` of a
+  qualified name for the separator, so Schema Conversion and the Full Load split such a
+  name in the wrong place, and Evaluation reports each table and view of such a database
+  or schema as **Unsupported** (`DOTTED_SCHEMA_NAME`). CDC then also refuses a table of
+  another database or schema whose qualified name is the same as one of theirs (table
+  `orders.v2` of database `shop` and table `v2` of database `shop.orders` are both
+  `shop.orders.v2`). Rename that database or schema at the source, or leave its tables and
+  views out of the migration
   ([§2.4](02-evaluation-and-schema-conversion.md#24-findings-reference)). For any other
   such table, with Full load + CDC, load it, then untick it before CDC starts (see
   "Changing the table set after a Full Load (Full load + CDC)" in
@@ -144,8 +153,9 @@ it.
   too (for example one from a table set used before a Start over): Start CDC then fails
   before creating any connector — at once, naming the topic, on the External path (a
   PostgreSQL source, or MySQL on the EC2 host), or as a rolled-back Start on the Lambda
-  path (MySQL on ECS Fargate or run locally). Delete CDC infrastructure and deploy it
-  again to get a cluster without that topic.
+  path (MySQL on ECS Fargate or run locally), whose activity log names the topic on CDC
+  infrastructure deployed by version 0.1.589 or later. Delete CDC infrastructure and
+  deploy it again to get a cluster without that topic.
 
 - **A CDC stack first started by version 0.1.580 or earlier also captures each table whose
   name differs from a selected one only in letter case.** It matches each selected name

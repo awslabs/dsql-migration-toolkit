@@ -667,8 +667,9 @@ def test_the_sink_readme_and_the_plugin_history_describe_the_g25_hold() -> None:
     )
     history = " ".join(source.replace("#", " ").split())
     # Rebuilt in place (v53 reached no stack then); v54 later moved past the released v53,
-    # v55 (A7) past the released v54, and v56 (T1) past the released v55.
-    assert 'PLUGIN_VERSION = "v56"' in source
+    # v55 (A7) past the released v54, v56 (T1) past the released v55, and v57 (dotted table
+    # names) past the released v56.
+    assert 'PLUGIN_VERSION = "v57"' in source
     assert "v53, rebuilt in place (G25" in history
     assert "lastTransientNanos" in history and "recordLag" in history
 

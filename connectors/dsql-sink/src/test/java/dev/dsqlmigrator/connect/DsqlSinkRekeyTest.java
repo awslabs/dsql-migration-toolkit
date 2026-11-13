@@ -9,7 +9,8 @@
  * {id}, so every change to one row stays on one partition, in order. The sink writes it by
  * the composite key: an UPDATE of `lead` is ONE record and becomes delete-old + insert-new in
  * one transaction; a delete is keyed on the exact composite key of its before-image, or on the
- * source key once the unique index on it is valid; its tombstone is skipped.
+ * source key once the unique index on it is valid; its tombstone is skipped (as every table's
+ * is, since plugin v57).
  *
  * The harness is a stateful JDBC double of that one table -- PK (lead, id), UNIQUE (id) -- that
  * records every statement with its binds, applies DELETE and INSERT ... ON CONFLICT the way
@@ -1216,7 +1217,9 @@ class DsqlSinkRekeyTest {
   @Test
   void aLegacyKeyedRecordOfAListedTableAppliesAsToday() throws Exception {
     // A record still keyed on the composite key (an older pipeline's in-flight record) parses
-    // exactly as before: same SQL, same binds, no index read, and its tombstone is applied.
+    // exactly as before: same SQL, same binds, no index read. Its tombstone is skipped, as any
+    // table's is since plugin v57 (it was applied as a second delete by the same key before):
+    // two statements, not three.
     List<SinkRecord> put =
         List.of(
             record(ORDERS, compositeKey(5, 2), "c", null, row(5, 2, "a")),
@@ -1237,7 +1240,6 @@ class DsqlSinkRekeyTest {
         List.of(
             "INSERT INTO \"app\".\"orders\" (\"lead\", \"id\", \"v\") VALUES (?, ?, ?) "
                 + "ON CONFLICT (\"lead\", \"id\") DO UPDATE SET \"v\" = EXCLUDED.\"v\"",
-            DELETE_EXACT,
             DELETE_EXACT),
         listed.executed.stream().map(Executed::sql).toList());
     assertEquals(0, withConfig.indexLoads);
@@ -1264,7 +1266,8 @@ class DsqlSinkRekeyTest {
     assertEquals(absent.calls, none.calls);
     assertEquals(absent.executed, other.executed);
     assertEquals(absent.calls, other.calls);
-    // The create and update dedupe to one upsert, the delete and its tombstone to one delete.
+    // The create and update dedupe to one upsert; the delete applies and its tombstone is
+    // skipped.
     assertEquals(2, other.executed.size());
     assertEquals(0, otherTask.indexLoads);
   }

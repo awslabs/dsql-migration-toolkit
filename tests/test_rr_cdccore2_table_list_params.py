@@ -163,9 +163,18 @@ def test_the_ui_lists_are_byte_identical() -> None:
         ("TableIncludeList", "a.b,c.d"), ("SinkTopics", "dsqlcdc.a.b,dsqlcdc.c.d"),
     ]
     assert _cdc_table_lists([]) == [("TableIncludeList", ""), ("SinkTopics", "")]
-    # A name the topic-name refusal is for still reaches it verbatim.
+    # A name the topic-name refusal is for still reaches it verbatim in SinkTopics, which it
+    # reads. TableIncludeList carries each name's exact entry (core.cdc.table_include_entry):
+    # "s.x,y" escapes its ',' and its separator, which only a refused name holds, so no
+    # deployed value changes.
     assert _cdc_table_lists(["s.a b", "s.x,y"]) == [
-        ("TableIncludeList", "s.a b,s.x,y"), ("SinkTopics", "dsqlcdc.s.a b,dsqlcdc.s.x,y"),
+        ("TableIncludeList", "s.a b,s\\.x\\,y"), ("SinkTopics", "dsqlcdc.s.a b,dsqlcdc.s.x,y"),
+    ]
+    # A '.' inside a table name is escaped in TableIncludeList, and the topic is as Debezium
+    # names it (FAILS WITHOUT THE FIX: "shop.orders.v2" also captured shop.orders_v2).
+    assert _cdc_table_lists(["shop.orders.v2", "shop.items"]) == [
+        ("TableIncludeList", "shop\\.orders\\.v2,shop.items"),
+        ("SinkTopics", "dsqlcdc.shop.orders.v2,dsqlcdc.shop.items"),
     ]
     assert _cdc_deploy_lists(["a.b"], None) == [
         ("TableIncludeList", "a.b"), ("SinkTopics", "dsqlcdc.a.b"),
@@ -207,6 +216,29 @@ def test_the_shared_block_on_its_own() -> None:
         ("TopicPrefix", "dsqlcdc"),
         ("SinkTopics", "dsqlcdc.shop.orders,dsqlcdc.shop.items,dsqlcdc.shop.extra"),
     ]
+
+
+def test_the_shared_block_escapes_a_dot_inside_a_table_name() -> None:
+    # FAILS WITHOUT THE FIX: TableIncludeList sent shop.orders.v2 as written, a Debezium regex
+    # whose '.' matches any character. Both builders send the escaped entry; SinkTopics and the
+    # re-key's MessageKeyColumns (already escaped) are unchanged.
+    from dsql_migrator.core.cdc import cdc_table_list_params
+
+    names = ["shop.orders.v2", "shop.items"]
+    source = DebeziumSourceConfig(
+        name="mysql-source", table_include_list=names,
+        message_key_columns={"shop.orders.v2": ["tenant_id", "id"]},
+    )
+    sink = SinkConnectorConfig(name="mysql-sink", topics=names, dlq_topic="d")
+    block = dict(cdc_table_list_params(source, sink))
+    assert block["TableIncludeList"] == "shop\\.orders\\.v2,shop.items"
+    assert block["SinkTopics"] == "dsqlcdc.shop.orders.v2,dsqlcdc.shop.items"
+    assert block["MessageKeyColumns"] == "shop\\.orders\\.v2:tenant_id,id"
+    for filled in (
+        build_cdc_stack_params(source, sink, target_endpoint="ep").filled,
+        build_cdc_infra_params(source, sink, **_INFRA_KW).filled,
+    ):
+        assert dict(filled)["TableIncludeList"] == block["TableIncludeList"]
 
 
 _BLOCK_KEYS = {key for key, _ in _BLOCK}

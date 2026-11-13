@@ -922,7 +922,47 @@ _LAMBDA_SEEDER_RELPATH = "connectors/plugins/offset-seeder-lambda.zip"
 #   Deploy CDC infrastructure to pick up v56 (Start CDC does not re-register the plugin), which
 #   also drops the stream position (MySQL re-reads from the watermark; the PostgreSQL slot is
 #   recreated).
-PLUGIN_VERSION = "v56"
+# v57 (dotted table names): the sink ZIP's and the seeder Lambda ZIP's CONTENT changed --
+#   * the sink reads a qualified table name at its FIRST '.' (DsqlDialect.quoteQualified,
+#     ValueFit.catalogKey), the rule every other step already uses: MySQL `shop`.`orders.v2` is
+#     written to "shop"."orders.v2". v56 and every earlier sink split it at every '.', so each
+#     write went to "shop"."orders"."v2" and was rejected, and the value-fit guard and the
+#     re-keyed source-key index failed open for such a name; they now read ("shop",
+#     "orders.v2"). A change whose resolved database or schema name holds a '.' (which no step
+#     supports: Evaluation's DOTTED_SCHEMA_NAME), or one with no source.table, is dead-lettered
+#     instead of written to a table read from a split name: resolveTable no longer takes the
+#     topic, so the sink never guesses a table from it. A PostgreSQL change resolves to its
+#     schema, so a '.' inside a PostgreSQL DATABASE name applies normally;
+#   * every Debezium tombstone is skipped (put, and before parsing in the look-ahead and the
+#     held tail, so one never replaces a held change). A tombstone was the only record whose
+#     table came from the topic (its last two segments): the tombstone of PostgreSQL
+#     app."app.orders" (topic dsqlcdc.app.app.orders) ran DELETE FROM "app"."orders", a row of
+#     another table. Nothing is lost: the op=d before it carries the same record key and is the
+#     delete (both source connectors set skipped.operations none), the data topics are never
+#     compacted (only the offsets topic is), and a re-keyed table already skipped its tombstones
+#     (G15). One DELETE per source delete, where a plain table ran a second, idempotent one;
+#     DeletesApplied is unchanged (v41 already left the tombstone uncounted), and no dead letter
+#     reads "d (tombstone)" any more;
+#   * the seeder Lambda names a topic Kafka refused (InvalidTopicError, errno 17: a name Kafka
+#     does not allow, or one that differs from a topic already on the cluster only in a '.'
+#     against a '_') in its FAILED response's Reason, which Start CDC shows in its activity log.
+#     Any other failure keeps the default Reason, the log-stream pointer (Property 7). Only
+#     seeder.py changed inside the ZIP (kafka-python 3.0.10 kept).
+#   No config key, template property or Start CDC change (the template's comments only); the
+#   worker configuration, connector properties, Debezium ZIPs and the sink's version() string
+#   are unchanged (the bump renames only the CustomPlugins and the worker configurations). A
+#   stack on v57 or later (core.cdc.plugin_reads_dotted_tables, DOTTED_TABLE_MIN_PLUGIN_VERSION)
+#   streams a table whose table name holds a '.', and Start CDC writes its TableIncludeList
+#   entry escaped (table_include_entry), so it matches only that table id; on a stack deployed
+#   with v56 or earlier, Start CDC and Retry CDC refuse such a table, naming that plugin. Still
+#   refused on every plugin: a '.'/'_' pair, a Kafka-illegal character, a '.' inside a
+#   database or schema name. Streaming both tables of a '.'/'_' pair is deferred: since v57
+#   reads no table from a topic, it needs only source-side topic naming on new stacks plus an
+#   app-side topic-to-table map. Bumped because the ZIPs changed; a live cdc-stack needs
+#   Delete + Deploy CDC infrastructure to pick up v57 (Start CDC does not re-register the
+#   plugin, and the seeder Lambda's key is set only at Deploy), which also drops the stream
+#   position (MySQL re-reads from the watermark; the PostgreSQL slot is recreated).
+PLUGIN_VERSION = "v57"
 
 
 class S3ProvisionError(RuntimeError):

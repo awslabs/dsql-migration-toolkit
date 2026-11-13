@@ -4225,8 +4225,9 @@ CDC_TABLE_LIST_HEADER = "Too many tables for one CDC pipeline"
 # fit (cdc_partition_map_worst_case): on the Deploy form, and before a Full load + CDC load.
 CDC_TABLE_LIST_WORST_CASE_HEADER = "Possibly too many tables for one CDC pipeline"
 # The notice header of a topic-name refusal (cdc_topic_name_refusal: a name Kafka refuses in
-# a topic name, a '.' inside a name, or two names that differ only in a '.' against a '_'),
-# and of the warning before a Full load + CDC load whose selection holds such a table
+# a topic name, a table of a database or schema whose name holds a '.', a '.' inside a table
+# name on a sink plugin that does not read it, or two names that differ only in a '.' against
+# a '_'), and of the warning before a Full load + CDC load whose selection holds such a table
 # (cdc_pre_load_topic_name_warning).
 CDC_TOPIC_NAME_HEADER = "Table names CDC cannot stream"
 
@@ -4291,27 +4292,52 @@ def cdc_table_list_refusal(
     )
 
 
-def cdc_topic_name_refusal(table_names: "Sequence[str]") -> "Optional[str]":
+def cdc_topic_name_refusal(
+    table_names: "Sequence[str]",
+    *,
+    sink_plugin: object = None,
+    dotted_schema_tables: "Optional[Iterable[str]]" = None,
+) -> "Optional[str]":
     """Why CDC cannot stream some of these tables, or ``None``. Pure.
 
     ``core.cdc.topic_name_refusal`` over SinkTopics exactly as the parameter builders send
-    it for ``table_names`` (Deploy CDC infrastructure and Start CDC alike): a table whose
-    database, schema or table name holds a character Kafka refuses in a topic name, or a '.'
-    (the sink splits a qualified name on every '.'), and two tables whose names differ only
-    in a '.' against a '_' (Kafka refuses the second topic; both are named). Each caller
-    appends :func:`table_picker_remedy` (:func:`topic_name_hold_remedy`; a deploy before a
-    Full load + CDC load, :func:`cdc_pre_load_topic_name_routes`).
+    it for ``table_names`` (Deploy CDC infrastructure and Start CDC alike), judged for the
+    stack whose sink plugin is ``sink_plugin`` (Deploy CDC infrastructure: the one this
+    version bundles; Start CDC and Retry CDC: the deployed one) with Evaluation's
+    DOTTED_SCHEMA_NAME tables ``dotted_schema_tables`` (``None`` for either: unknown, judged
+    as the oldest plugin and without Evaluation's tables): a table whose database, schema or
+    table name holds a character Kafka refuses in a topic name, a table of a database or
+    schema whose name holds a '.', a '.' inside a table name on a sink plugin that does not
+    read it, and two tables whose names differ only in a '.' against a '_' (Kafka refuses the
+    second topic; both are named). Every caller passes both keywords
+    (``_cdc_ui._topic_name_context``). Each caller appends :func:`table_picker_remedy`
+    (:func:`topic_name_hold_remedy`; a deploy before a Full load + CDC load,
+    :func:`cdc_pre_load_topic_name_routes`).
     """
     from dsql_migrator.core.cdc import topic_name_refusal
 
-    return topic_name_refusal(_cdc_table_lists(list(table_names)))
+    return topic_name_refusal(
+        _cdc_table_lists(list(table_names)),
+        sink_plugin=sink_plugin,
+        dotted_schema_tables=dotted_schema_tables,
+    )
 
 
-def cdc_topic_name_refused(table_names: "Sequence[str]") -> "list[str]":
-    """The tables of ``table_names`` :func:`cdc_topic_name_refusal` names, in order. Pure."""
+def cdc_topic_name_refused(
+    table_names: "Sequence[str]",
+    *,
+    sink_plugin: object = None,
+    dotted_schema_tables: "Optional[Iterable[str]]" = None,
+) -> "list[str]":
+    """The tables of ``table_names`` :func:`cdc_topic_name_refusal` names (with the same
+    ``sink_plugin`` and ``dotted_schema_tables``), in order. Pure."""
     from dsql_migrator.core.cdc import topic_name_refused_tables
 
-    return topic_name_refused_tables(_cdc_table_lists(list(table_names)))
+    return topic_name_refused_tables(
+        _cdc_table_lists(list(table_names)),
+        sink_plugin=sink_plugin,
+        dotted_schema_tables=dotted_schema_tables,
+    )
 
 
 def cdc_tables_per_pipeline(table_count: int, list_bytes: int) -> int:
@@ -4495,10 +4521,13 @@ def cdc_pre_load_topic_name_warning(
     planned: bool,
     table_lock: "Optional[str]",
     split: bool = False,
+    sink_plugin: object = None,
+    dotted_schema_tables: "Optional[Iterable[str]]" = None,
 ) -> "Optional[tuple[str, str]]":
     """``(header, body)`` of what Full load + CDC says before its load when ``table_names``
-    (the load's selection) holds a table CDC cannot stream (:func:`cdc_topic_name_refusal`),
-    or ``None``. Pure.
+    (the load's selection) holds a table CDC cannot stream (:func:`cdc_topic_name_refusal`,
+    with the same ``sink_plugin`` and ``dotted_schema_tables``: the sink plugin of the stack
+    the next CDC operation judges the capture for), or ``None``. Pure.
 
     A warning, never a hold, like :func:`cdc_pre_load_table_list_warning`: the load may take
     such a table and, until CDC starts, it is unticked (G16); Deploy CDC infrastructure and
@@ -4510,7 +4539,9 @@ def cdc_pre_load_topic_name_warning(
     """
     from dsql_migrator.core.cdc import CDC_TOPIC_NAME_DOTTED_SCHEMA, CDC_TOPIC_NAME_REMEDY
 
-    refusal = cdc_topic_name_refusal(table_names)
+    refusal = cdc_topic_name_refusal(
+        table_names, sink_plugin=sink_plugin, dotted_schema_tables=dotted_schema_tables
+    )
     if refusal is None:
         return None
     fact = refusal.removesuffix(CDC_TOPIC_NAME_REMEDY).rstrip()
@@ -5349,29 +5380,39 @@ def cdc_cascade_gap_tables(assessment: object, tables=None) -> list[str]:
     choice too: silently orphaned child rows on the target are exactly the kind of
     divergence that is expensive to find later.
 
+    :func:`cdc_rule_tables` for the FK_CASCADE_CDC_GAP rule. Pure.
+    """
+    return cdc_rule_tables(assessment, _FK_CASCADE_CDC_RULE_ID, tables)
+
+
+def cdc_rule_tables(assessment: object, rule_id: str, tables=None) -> list[str]:
+    """The objects an Evaluation finding of rule ``rule_id`` is about (sorted, de-duped):
+    any of an item's findings, not only the one governing it.
+
     Accepts any object exposing ``items`` (the real ``AssessmentReport`` or a test
     double) and degrades to ``[]`` when absent/unreadable, so a decorative surface can
     never break the screen. ``tables`` (the migrated selection) keeps only those: CDC
     captures nothing else; empty or ``None`` keeps every finding. Pure.
     """
     items = getattr(assessment, "items", None) or []
-    names: list[str] = []
+    # A dict, not a list: one membership test per item, so a database of many tables with
+    # the same finding (DOTTED_SCHEMA_NAME) stays linear.
+    names: dict[str, None] = {}
     for item in items:
         # Any of the item's findings, not only the one governing it: a more severe finding
         # on the same table (an UNSUPPORTED key, say) takes the item's headline rule_id,
         # and matching that alone dropped the table from this CDC warning.
-        rule_ids = {getattr(item, "rule_id", None)} | {
-            getattr(concern, "rule_id", None)
+        if getattr(item, "rule_id", None) != rule_id and not any(
+            getattr(concern, "rule_id", None) == rule_id
             for concern in (getattr(item, "concerns", None) or [])
-        }
-        if _FK_CASCADE_CDC_RULE_ID not in rule_ids:
+        ):
             continue
         name = getattr(item, "object_name", None)
-        if name and name not in names:
-            names.append(str(name))
+        if name:
+            names.setdefault(str(name), None)
     if tables:
         keep = set(tables)
-        names = [n for n in names if n in keep]
+        return sorted(n for n in names if n in keep)
     return sorted(names)
 
 

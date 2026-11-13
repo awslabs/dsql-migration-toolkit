@@ -483,12 +483,6 @@ class DsqlSinkTaskTest {
         DsqlSinkTask.opSuffix(
             ChangeEvent.upsert(
                 "app.orders", List.of("id"), List.of(1L), List.of("id"), List.of(1L), 0L)));
-    // A tombstone APPLIES as a delete, so it reports as one -- with a marker, because
-    // Debezium sends it alongside the op=d envelope for a single source DELETE.
-    assertEquals(
-        " | op: d (tombstone)",
-        DsqlSinkTask.opSuffix(
-            ChangeEvent.tombstone("app.orders", List.of("id"), List.of(1L), 0L)));
     // No event (the envelope did not parse) -> no op, never a guess.
     assertEquals("", DsqlSinkTask.opSuffix(null));
   }
@@ -989,6 +983,26 @@ class DsqlSinkTaskTest {
     assertSame(denied.catalogFailure, thrown);
     assertTrue(denied.calls.contains("rollback"), denied.calls.toString());
     assertFalse(denied.calls.contains("commit"), denied.calls.toString());
+  }
+
+  @Test
+  void theColumnTypesOfATableNameHoldingADotAreReadForThatTable() throws Exception {
+    // FAILS WITHOUT THE FIX (plugin v57): the catalog key of shop.orders.v2 was null, so no
+    // column type was read and every value of the table was written unchecked (a fraction for an
+    // integer column rounded, a 2 for a boolean stored as true). The name is split at its first
+    // '.', as the statements write it: schema shop, table orders.v2.
+    FakeJdbc jdbc = new FakeJdbc();
+    jdbc.catalogRows = List.<Object[]>of(new Object[] {"flag", "boolean", null, null});
+    DsqlSinkTask task = new DsqlSinkTask();
+    task.startMetrics(sinkProps());
+    inject(task, jdbc.connection());
+
+    assertEquals(
+        Map.of("flag", ValueFit.TargetType.fromCatalog("boolean", null, null)),
+        task.readTargetTypes("shop.orders.v2"));
+    assertEquals("shop", jdbc.params.get(1));
+    assertEquals("orders.v2", jdbc.params.get(2));
+    assertEquals(1, jdbc.catalogReads);
   }
 
   @Test

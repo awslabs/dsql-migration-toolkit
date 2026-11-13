@@ -2929,6 +2929,14 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # A marker a shaded dependency also holds proves nothing blob-wide, so it is looked for
     # in the class that owns it.
     class_markers = {
+        # v57: a table name may hold a '.' (the sink reads a qualified name at its FIRST '.', so
+        # `shop`.`orders.v2` is "shop"."orders.v2"), and a change whose database or schema name
+        # holds one (Evaluation: DOTTED_SCHEMA_NAME) is dead-lettered instead of being written
+        # to a table read from a split name.
+        "dotted namespace dead-lettered": (
+            "dev/dsqlmigrator/connect/DebeziumEvents.class",
+            b"holds a '.', which the tool does not support",
+        ),
         # v56 (T1): a text or JSON value is sent and Aurora DSQL decides (only a bytea value is
         # refused before writing); a row Aurora DSQL refuses over its 1 MiB per-value limit
         # (54000, which names only the type) is dead-lettered with the column named when
@@ -2973,6 +2981,13 @@ def test_the_committed_sink_zip_contains_the_current_java_sources() -> None:
     # java.sql.Date through the same calendar, whose switch skips 1582-10-05 .. 1582-10-14, so
     # a date in those ten days was written ten days later (G133).
     class_absent = {
+        # v57: no table is read from a topic any more. A Debezium tombstone was applied as a
+        # delete of the topic's last two segments (dsqlcdc.app.app.orders named app.orders,
+        # another table); every tombstone is skipped now, and an event with no source.table is
+        # dead-lettered.
+        "table read from the topic": (
+            "dev/dsqlmigrator/connect/DebeziumEvents.class", b"tableFromTopic"
+        ),
         # v55 (A7): the retired net-rows metric is no longer named in the metrics WARN.
         "net-rows WARN": (
             "dev/dsqlmigrator/connect/DsqlSinkTask.class", b"net-rows / replication-lag"
@@ -3569,7 +3584,8 @@ def test_plugin_v52_history_records_the_g22_rebuild() -> None:
     source = pathlib.Path(__file__).resolve().parents[1] / "src" / "dsql_migrator" / "core"
     text = (source / "s3_provision.py").read_text(encoding="utf-8")
     history = " ".join(text.replace("#", " ").split())
-    assert 'PLUGIN_VERSION = "v56"' in text  # v55 A7, v56 T1 (s3_provision's history lists every bump)
+    # v55 A7, v56 T1, v57 dotted table names (s3_provision's history lists every bump).
+    assert 'PLUGIN_VERSION = "v57"' in text
     assert "rebuilt in place (G22" in history
     assert "XX000" in history
     # G22 also changed paths other than XX000 (a failed error-path rollback drops the

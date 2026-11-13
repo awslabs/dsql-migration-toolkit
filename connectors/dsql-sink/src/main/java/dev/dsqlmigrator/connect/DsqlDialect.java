@@ -15,7 +15,8 @@ import java.util.List;
  * Builds DSQL-compatible DML for PK-keyed idempotent apply.
  *
  * <p>Debezium {@code c/r/u} map to an {@code INSERT ... ON CONFLICT (pk) DO
- * UPDATE} upsert; {@code d}/tombstones map to a {@code DELETE}. DSQL supports
+ * UPDATE} upsert; {@code d} maps to a {@code DELETE} (a tombstone applies nothing: the sink
+ * skips it, see {@code DsqlSinkTask.put}). DSQL supports
  * {@code ON CONFLICT} (verified in design research) and does not use sequences
  * or triggers, so the generated SQL stays within DSQL constraints. Identifiers
  * are always double-quoted (embedded quotes doubled) to avoid keyword/casing
@@ -30,17 +31,20 @@ final class DsqlDialect {
     return "\"" + identifier.replace("\"", "\"\"") + "\"";
   }
 
-  /** Quote a possibly schema-qualified name ({@code schema.table}) part-wise. */
+  /**
+   * Quote a possibly schema-qualified name ({@code schema.table}), split at its FIRST '.': the
+   * part before it is the schema and the rest is the table, so {@code shop.orders.v2} is
+   * {@code "shop"."orders.v2"}. Every other step of the tool reads a qualified name the same
+   * way, and the sink's names hold no '.' in the schema ({@link DebeziumEvents} dead-letters a
+   * change whose database or schema name holds one). A name with no '.', or with one only at
+   * its start or end, is one identifier.
+   */
   static String quoteQualified(String name) {
-    String[] parts = name.split("\\.");
-    StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < parts.length; i++) {
-      if (i > 0) {
-        sb.append('.');
-      }
-      sb.append(quoteIdent(parts[i]));
+    int dot = name.indexOf('.');
+    if (dot > 0 && dot < name.length() - 1) {
+      return quoteIdent(name.substring(0, dot)) + "." + quoteIdent(name.substring(dot + 1));
     }
-    return sb.toString();
+    return quoteIdent(name);
   }
 
   /**

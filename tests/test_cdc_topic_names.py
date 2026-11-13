@@ -14,18 +14,24 @@ CDC names each captured table's Kafka topic ``dsqlcdc.<db>.<table>`` (MySQL) or
   issue): a rollback on the Lambda path, about 2 minutes of retries blaming the network on the
   External one. And a comma, or whitespace ending a PostgreSQL table name, was trimmed into a
   legal name, so Start succeeded and the table was never captured (read from the code);
-- a '.' inside the database, schema or table name: Kafka takes it, but the sink splits a
-  qualified name on every '.', so every change to such a table failed, and takes a tombstone's
-  table from the topic's last two segments, so a delete on public."public.orders" removed the
-  same-keyed row of public.orders (read from the sink's code);
+- a '.' inside the database, schema or table name: Kafka takes it, but a sink plugin older than
+  v57 splits a qualified name on every '.', so every change to such a table failed, and takes a
+  tombstone's table from the topic's last two segments, so a delete on public."public.orders"
+  removed the same-keyed row of public.orders (read from the sink's code). From v57 the sink
+  reads a qualified name at its first '.' and skips every tombstone, and TableIncludeList
+  carries the exact escaped entry (shop\\.orders\\.v2), so a '.' inside a TABLE name streams
+  there; on an older or unidentified plugin it stays refused, naming the plugin and Delete +
+  Deploy. A table of a database or schema whose name holds a '.' (Evaluation's
+  DOTTED_SCHEMA_NAME) and a name with an empty part before its first '.' stay refused on any
+  plugin;
 - two names that differ only in a '.' against a '_' (app.v2_users, app_v2.users): Kafka refuses
   the second topic, which both seeders pre-create, so Start CDC failed after the deploy.
 
-A character that does not show is written as its code point. A refused name with two or more
-'.' may be a table of a database or schema whose name holds a '.', which no step supports
-(DOTTED_SCHEMA_NAME), so the refusal says so before its remedy, and the load-then-untick route
-before a Full load + CDC load excepts such a table. Doubles only: no AWS, no source, no Aurora
-DSQL.
+A character that does not show is written as its code point. A refused name that may be a table
+of a database or schema whose name holds a '.', which no step supports (DOTTED_SCHEMA_NAME) --
+one of Evaluation's DOTTED_SCHEMA_NAME tables when they are known, else any with two or more '.'
+-- gets a sentence saying so before the remedy, and the load-then-untick route before a Full
+load + CDC load excepts such a table. Doubles only: no AWS, no source, no Aurora DSQL.
 """
 
 from __future__ import annotations
@@ -41,15 +47,25 @@ from types import SimpleNamespace
 
 import pytest
 
+from dsql_migrator.core import s3_provision
 from dsql_migrator.core.cdc import (
     CDC_DEFAULT_DLQ_TOPIC,
     CDC_DEFAULT_TOPIC_PREFIX,
     CDC_TOPIC_NAME_DOTTED_SCHEMA,
     CDC_TOPIC_NAME_REMEDY,
+    DOTTED_TABLE_MIN_PLUGIN_VERSION,
+    DebeziumSourceConfig,
+    SinkConnectorConfig,
     cdc_expected_connector_names,
     cdc_stack_name_is_valid,
+    cdc_table_list_params,
+    plugin_reads_dotted_tables,
+    plugin_supports_sink_keys,
+    table_include_entry,
+    topic_name_problems,
     topic_name_refusal,
     topic_name_refused_tables,
+    unescape_include_entry,
 )
 from dsql_migrator.core.cdc_deployer import CdcDeployError, run_cdc_start
 from dsql_migrator.core.models import ChunkState, MigrationJob, SourceType, StepStatus, Watermark
@@ -105,10 +121,37 @@ _FACT = (
     "topic name."
 )
 _ILLEGAL_FACT = _FACT.removeprefix("CDC cannot stream shop.a<U+0020>b")  # ": each table's ..."
-_DOTTED_FACT = (
-    ": the CDC sink reads every '.' in a table's qualified name as the one between its database "
-    "or schema and its table, so with a '.' inside either name, each change to that table fails "
-    "or lands in another table."
+
+
+def _old_plugin_fact(version=None):
+    """What a table whose name holds a '.' gets on a stack whose sink plugin, ``version``,
+    predates v57 (``None``: one this version cannot identify), after its names."""
+    deployed = (
+        f"it was deployed with CDC sink plugin {version}, which reads" if version else
+        "it was deployed with a CDC sink plugin this version cannot identify, which may read"
+    )
+    return (
+        f" on this CDC infrastructure: {deployed} every '.' in a table's qualified name as the "
+        "one between its database or schema and its table, so each change to such a table would "
+        "fail or land in another table. CDC infrastructure deployed with this version (sink "
+        "plugin v57 or later) streams it: Delete CDC infrastructure and deploy it again (on "
+        "MySQL, CDC then starts again from the Full Load's start point or your Manual start "
+        "point; on PostgreSQL the teardown also drops the replication slot, and the Delete "
+        "confirmation says what Start CDC then needs)."
+    )
+
+
+# ... with no plugin given, as every caller that passes none judges it (an unknown plugin is
+# judged as the oldest).
+_OLD_PLUGIN_FACT = _old_plugin_fact()
+_EMPTY_PART_FACT = (
+    ": the part of its name before or after its first '.' is empty, so CDC cannot tell its "
+    "database or schema from its table."
+)
+_DOTTED_SCHEMA_FACT = (
+    ": Evaluation found a database or schema whose name holds a '.' that each of these names "
+    "begins with (DOTTED_SCHEMA_NAME), so CDC cannot tell its changes apart from those of "
+    "another table read under the same name."
 )
 _COLLISION_FACT = (
     ": Kafka does not allow two topics whose names differ only in a '.' against a '_', so CDC "
@@ -238,17 +281,62 @@ def test_a_character_that_does_not_show_is_written_as_its_code_point() -> None:
         assert topic_name_refused_tables(_lists([name])) == [name], hex(code)
 
 
-_DOTTED = ["shop.a.b", "my.db.t", "public.public.orders", "shop.t.", ".shop.t", "shop..t"]
+# A '.' inside a table name: refused on a sink plugin older than v57 (or one this version
+# cannot identify), streamed from v57 on.
+_DOTTED = ["shop.a.b", "my.db.t", "public.public.orders", "shop.t.", "shop..t"]
+# The part before the first '.' is empty: refused on every plugin.
+_EMPTY_PART = [".shop.t", "..t", ".a.b.c"]
 
 
+@pytest.mark.parametrize("plugin", [None, "v56", "v1", "x", "", "V57"])
 @pytest.mark.parametrize("name", _DOTTED)
-def test_a_dot_inside_a_name_is_refused(name) -> None:
-    # FAILS WITHOUT THE FIX: Kafka takes such a topic, but the sink splits a qualified name on
-    # every '.', so every change to the table failed, and a tombstone of public."public.orders"
-    # deleted from public.orders.
-    assert topic_name_refused_tables(_lists(["shop.orders", name, "shop.items"])) == [name]
-    assert topic_name_refusal(_lists([name])) == (
-        f"CDC cannot stream {name}{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+def test_a_dot_inside_a_name_is_refused_on_an_older_or_unknown_sink_plugin(name, plugin) -> None:
+    # FAILS WITHOUT THE FIX: the refusal took no sink_plugin and named neither the deployed
+    # plugin nor Delete + Deploy. Such a sink splits a qualified name on every '.', so every
+    # change to the table failed, and a tombstone of public."public.orders" deleted from
+    # public.orders. The text names the deployed plugin when it is a version, and Delete +
+    # Deploy with each engine's cost.
+    known = plugin if plugin in ("v56", "v1") else None
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name, "shop.items"]), sink_plugin=plugin) == [name]
+    assert topic_name_refusal(_lists([name]), sink_plugin=plugin) == (
+        f"CDC cannot stream {name}{_old_plugin_fact(known)} {_DOTTED_SCHEMA} {_REMEDY}")
+    # No plugin given is an unknown one.
+    if plugin is None:
+        assert topic_name_refusal(_lists([name])) == topic_name_refusal(
+            _lists([name]), sink_plugin=None)
+
+
+@pytest.mark.parametrize("plugin", ["v57", "v58", " v57 ", "v100"])
+@pytest.mark.parametrize("name", _DOTTED)
+def test_a_dot_inside_a_table_name_streams_on_sink_plugin_v57_or_later(name, plugin) -> None:
+    # FAILS WITHOUT THE FIX: every such name was refused on every stack (there was no
+    # sink_plugin). The v57 sink reads a qualified name at its first '.' and skips every
+    # tombstone, so it streams there.
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name, "shop.items"]), sink_plugin=plugin) == []
+    assert topic_name_refusal(_lists(["shop.orders", name]), sink_plugin=plugin) is None
+    # Evaluation found no database or schema whose name holds a '.': the same.
+    assert topic_name_refusal(
+        _lists([name]), sink_plugin=plugin, dotted_schema_tables=frozenset()) is None
+
+
+@pytest.mark.parametrize("plugin", [None, "v56", "v57", "v58"])
+@pytest.mark.parametrize("name", _EMPTY_PART)
+def test_a_name_with_an_empty_part_before_its_first_dot_is_refused_on_every_plugin(
+    name, plugin
+) -> None:
+    # FAILS WITHOUT THE FIX: the refusal said the sink reads every '.', which v57 no longer
+    # does; such a name holds no database or schema the sink can read (the catalog read never
+    # produces one).
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", name]), sink_plugin=plugin) == [name]
+    assert topic_name_refusal(_lists([name]), sink_plugin=plugin) == (
+        f"CDC cannot stream {name}{_EMPTY_PART_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # Evaluation found no database or schema whose name holds a '.': no such sentence.
+    assert topic_name_refusal(
+        _lists([name]), sink_plugin=plugin, dotted_schema_tables=()) == (
+        f"CDC cannot stream {name}{_EMPTY_PART_FACT} {_REMEDY}")
 
 
 def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
@@ -256,16 +344,22 @@ def test_only_a_dot_after_the_topic_prefix_is_inside_a_name() -> None:
     assert topic_name_refused_tables([("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t")]) == []
     assert topic_name_refused_tables(
         [("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t.x")]) == ["shop.t.x"]
+    assert topic_name_refused_tables(
+        [("TopicPrefix", "a.b"), ("SinkTopics", "a.b.shop.t.x")], sink_plugin="v57") == []
     # A topic under another prefix than the one sent is judged on its characters only.
     assert topic_name_refused_tables(
         [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc.shop.a")]) == []
+    assert topic_name_refused_tables(
+        [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc..shop.a")]) == []
     # ...and Kafka compares whole topics, so it is not alike a name that only resembles it.
     assert topic_name_refused_tables(
         [("TopicPrefix", "other"), ("SinkTopics", "dsqlcdc.shop.a,other.dsqlcdc_shop.a")]) == []
-    # All of them in one sentence: sorted, five named and the rest counted.
-    assert topic_name_refusal(_lists(_DOTTED)) == (
-        "CDC cannot stream .shop.t, my.db.t, public.public.orders, shop..t, shop.a.b and 1 more"
-        f"{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # All of them in one sentence each: sorted, five named and the rest counted; the empty
+    # part's first, as it holds on every plugin.
+    assert topic_name_refusal(_lists([*_DOTTED, "shop.x.y", *_EMPTY_PART])) == (
+        f"CDC cannot stream ..t, .a.b.c, .shop.t{_EMPTY_PART_FACT} "
+        "CDC cannot stream my.db.t, public.public.orders, shop..t, shop.a.b, shop.t. and 1 more"
+        f"{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
 
 
 def test_names_whose_topics_differ_only_in_a_dot_against_an_underscore_are_refused() -> None:
@@ -311,14 +405,22 @@ def test_names_kafka_tells_apart_are_not_refused() -> None:
 
 
 def test_a_refused_name_is_never_a_collision_partner() -> None:
-    # A dotted name is refused for its '.', and its look-alike streams.
+    # On an older sink plugin a dotted name is refused for its '.', and its look-alike streams.
     assert topic_name_refused_tables(_lists(["shop.a.b", "shop.a_b"])) == ["shop.a.b"]
     assert topic_name_refusal(_lists(["shop.a.b", "shop.a_b"])) == (
-        f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     # Two dotted names alike once '.' is '_' are named as dotted only; two illegal ones, as
     # illegal only.
     assert topic_name_refusal(_lists(["shop.a.b_c", "shop.a_b.c"])) == (
-        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream shop.a.b_c, shop.a_b.c{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # A table of a database or schema whose name holds a '.' is refused for that on every
+    # plugin, and its look-alike streams.
+    for plugin in (None, "v56", "v57"):
+        assert topic_name_refused_tables(
+            _lists(["my.db.t", "my_db.t"]), sink_plugin=plugin,
+            dotted_schema_tables={"my.db.t"}) == ["my.db.t"], plugin
+    # So is a name with an empty part before its first '.'.
+    assert topic_name_refused_tables(_lists([".a.b", "_a_b"]), sink_plugin="v57") == [".a.b"]
     assert topic_name_refusal(_lists(["a.b c_d", "a_b c.d"])) == (
         "CDC cannot stream a.b<U+0020>c_d, a_b<U+0020>c.d: each table's Kafka topic is named "
         "after its database or schema and its table, and Kafka allows only ASCII letters, "
@@ -349,9 +451,9 @@ def test_the_stacks_own_topics_cannot_collide_with_a_table_topic() -> None:
     assert history.removeprefix("${TopicPrefix}").replace(".", "_").count("_") == 1
 
 
-def test_every_kind_in_one_capture_is_one_message() -> None:
+def test_every_kind_in_one_capture_is_one_message(monkeypatch) -> None:
     names = ["shop.orders", "app_v2.users", "shop.a b", "shop.a.b", "app.v2_users"]
-    dotted = f"CDC cannot stream shop.a.b{_DOTTED_FACT}"
+    dotted = f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT}"
     collision = f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them."
     facts = f"{_FACT} {dotted} {collision} {_DOTTED_SCHEMA}"
     refusal = topic_name_refusal(_lists(names))
@@ -368,9 +470,35 @@ def test_every_kind_in_one_capture_is_one_message() -> None:
     )
     from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
 
+    # The early deploy judges the names for the plugin this version bundles (pinned here).
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v56")
+    bundled = facts.replace(_OLD_PLUGIN_FACT, _old_plugin_fact("v56"))
     assert _deploy_block_notice(
         _deploy_ready(names, FLC), _Jobs({}), _inventory(names), None
-    ) == (CDC_TOPIC_NAME_HEADER, f"{facts} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}")
+    ) == (CDC_TOPIC_NAME_HEADER, f"{bundled} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}")
+
+
+def test_every_kind_on_one_stack_is_one_message_in_its_order() -> None:
+    # Illegal, then the names no plugin streams (a database or schema whose name holds a '.',
+    # an empty part), then the older plugin's, then the collisions; the dotted-schema sentence
+    # once (a refused name is one of Evaluation's DOTTED_SCHEMA_NAME tables), the remedy last.
+    names = ["shop.orders", "app_v2.users", "shop.a b", "my.db.t", ".x.t", "shop.a.b",
+             "app.v2_users"]
+    kw = dict(sink_plugin="v56", dotted_schema_tables={"my.db.t"})
+    refusal = topic_name_refusal(_lists(names), **kw)
+    assert refusal == (
+        f"{_FACT} CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} "
+        f"CDC cannot stream .x.t{_EMPTY_PART_FACT} "
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} "
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert refusal.endswith(CDC_TOPIC_NAME_REMEDY) and refusal.count(_REMEDY) == 1
+    assert topic_name_refused_tables(_lists(names), **kw) == names[1:]
+    # On v57 only the '.' inside the table name streams.
+    kw["sink_plugin"] = "v57"
+    assert topic_name_refused_tables(_lists(names), **kw) == [
+        "app_v2.users", "shop.a b", "my.db.t", ".x.t", "app.v2_users"]
+    assert "shop.a.b" not in topic_name_refusal(_lists(names), **kw)
 
 
 def test_the_prefix_is_read_from_the_parameters_and_sinktopics_order_is_kept() -> None:
@@ -417,7 +545,7 @@ def test_a_name_that_may_be_of_a_dotted_schema_is_not_sent_to_full_load_only() -
     # the facts and before the remedy; a name with one '.' never does.
     assert CDC_TOPIC_NAME_DOTTED_SCHEMA == _DOTTED_SCHEMA
     assert topic_name_refusal(_lists(["my.db.orders"])) == (
-        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+        f"CDC cannot stream my.db.orders{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
     # A name Kafka refuses, too (database "my.d b").
     assert topic_name_refusal(_lists(["my.d b.orders"])) == (
         f"CDC cannot stream my.d<U+0020>b.orders{_ILLEGAL_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
@@ -431,10 +559,177 @@ def test_a_name_that_may_be_of_a_dotted_schema_is_not_sent_to_full_load_only() -
         ["my.db.orders", "my.d b.orders", "shop.a.b", "x.y z.w", "app.v2_users", "app_v2.users"]))
     assert refusal == (
         f"CDC cannot stream my.d<U+0020>b.orders, x.y<U+0020>z.w{_ILLEGAL_FACT} "
-        f"CDC cannot stream my.db.orders, shop.a.b{_DOTTED_FACT} "
+        f"CDC cannot stream my.db.orders, shop.a.b{_OLD_PLUGIN_FACT} "
         f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
         f"{_DOTTED_SCHEMA} {_REMEDY}")
     assert refusal.count(_DOTTED_SCHEMA) == 1
+    # Where a '.' inside a table name streams (v57), a colliding pair holding one gets it too:
+    # without Evaluation's tables, shop.orders.v2 may be table v2 of database shop.orders.
+    assert topic_name_refusal(_lists(["shop.orders.v2", "shop.orders_v2"]), sink_plugin="v57") == (
+        f"CDC cannot stream shop.orders.v2 together with shop.orders_v2{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert topic_name_refused_tables(
+        _lists(["shop.orders_v2", "shop.items", "shop.orders.v2"]), sink_plugin="v57") == [
+        "shop.orders_v2", "shop.orders.v2"]
+
+
+@pytest.mark.parametrize("plugin", [None, "v56", "v57"])
+def test_evaluations_dotted_schema_tables_are_refused_with_their_own_fact(plugin) -> None:
+    # FAILS WITHOUT THE FIX: there was no dotted_schema_tables (TypeError). On MySQL, table t of
+    # database my.db and table db.t of database my have the same table id, which the escaped
+    # include entry captures both of, so a table Evaluation reported DOTTED_SCHEMA_NAME on is
+    # refused on every plugin, followed by the sentence that no step supports it.
+    assert topic_name_refusal(
+        _lists(["shop.orders", "my.db.t"]), sink_plugin=plugin, dotted_schema_tables={"my.db.t"}
+    ) == f"CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+    assert topic_name_refused_tables(
+        _lists(["shop.orders", "my.db.t"]), sink_plugin=plugin, dotted_schema_tables=["my.db.t"]
+    ) == ["my.db.t"]
+    # Sorted, five named and the rest counted, in one sentence.
+    seven = [f"my.db.t{c}" for c in "gfedcba"]
+    assert topic_name_refusal(
+        _lists(seven), sink_plugin=plugin, dotted_schema_tables=seven
+    ) == ("CDC cannot stream my.db.ta, my.db.tb, my.db.tc, my.db.td, my.db.te and 2 more"
+          f"{_DOTTED_SCHEMA_FACT} {_DOTTED_SCHEMA} {_REMEDY}")
+    # A name Kafka refuses that is one of them: its own fact, and the sentence.
+    assert topic_name_refusal(
+        _lists(["my.d b.t"]), sink_plugin=plugin, dotted_schema_tables={"my.d b.t"}
+    ) == f"CDC cannot stream my.d<U+0020>b.t{_ILLEGAL_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+
+
+def test_known_dotted_schema_tables_say_the_sentence_only_for_one_of_them() -> None:
+    # FAILS WITHOUT THE FIX: every refused name with two or more '.' got the dotted-schema
+    # sentence, also when Evaluation had found no database or schema whose name holds a '.'.
+    for known in (frozenset(), {"other.x.y"}, ()):
+        assert topic_name_refusal(
+            _lists(["shop.a.b"]), sink_plugin="v56", dotted_schema_tables=known
+        ) == f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} {_REMEDY}", known
+        assert topic_name_refusal(
+            _lists(["my.d b.orders"]), dotted_schema_tables=known
+        ) == f"CDC cannot stream my.d<U+0020>b.orders{_ILLEGAL_FACT} {_REMEDY}", known
+        assert topic_name_refusal(
+            _lists(["shop.orders.v2", "shop.orders_v2"]), sink_plugin="v57",
+            dotted_schema_tables=known,
+        ) == (f"CDC cannot stream shop.orders.v2 together with shop.orders_v2{_COLLISION_FACT} "
+              f"them. {_REMEDY}"), known
+    # Unknown (None, the default): today's rule, any refused name with two or more '.'.
+    assert topic_name_refusal(_lists(["shop.a.b"]), sink_plugin="v56") == (
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} {_DOTTED_SCHEMA} {_REMEDY}")
+    # One of them among other refused names: the sentence once, after every fact.
+    refusal = topic_name_refusal(
+        _lists(["shop.a.b", "my.db.t", "app.v2_users", "app_v2.users"]), sink_plugin="v56",
+        dotted_schema_tables={"my.db.t"})
+    assert refusal == (
+        f"CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} "
+        f"CDC cannot stream shop.a.b{_old_plugin_fact('v56')} "
+        f"CDC cannot stream app.v2_users together with app_v2.users{_COLLISION_FACT} them. "
+        f"{_DOTTED_SCHEMA} {_REMEDY}")
+    assert refusal.count(_DOTTED_SCHEMA) == 1
+
+
+# ---------------------------------------------------------------------------
+# 1b. The include entry, the sink plugin gate and Evaluation's view of the same rule
+# ---------------------------------------------------------------------------
+
+
+def _sent(names, message_key_columns=None):
+    return dict(cdc_table_list_params(
+        DebeziumSourceConfig(name="s", table_include_list=names,
+                             message_key_columns=message_key_columns or {}),
+        SinkConnectorConfig(name="k", topics=names, dlq_topic="dsql-sink-dlq"),
+    ))
+
+
+def test_plain_names_send_byte_identical_lists() -> None:
+    # Guard (passes before and after): for every name CDC streamed before, TableIncludeList,
+    # SinkTopics and MessageKeyColumns are 0.1.588's bytes, so a deployed stack's Start sees
+    # no configuration change. Spelled out from 0.1.588's output, not built with the helpers.
+    sent = _sent(_ACCEPTED, {"Shop.Order_Items-2": ["tenant_id", "id"],
+                             "shop.orders": ["region", "id"]})
+    assert sent["TableIncludeList"] == "shop.orders,Shop.Order_Items-2,db2024.t0123456789"
+    assert sent["SinkTopics"] == (
+        "dsqlcdc.shop.orders,dsqlcdc.Shop.Order_Items-2,dsqlcdc.db2024.t0123456789")
+    assert sent["MessageKeyColumns"] == (
+        "Shop\\.Order_Items-2:tenant_id,id;shop\\.orders:region,id")
+    # Every name Kafka allows with one '.' (or none) is its own entry, as written: each
+    # character Kafka allows but '.', at each end of either part and inside it.
+    for ch in sorted(_KAFKA - {"."}):
+        for name in (f"shop.t{ch}", f"{ch}shop.t", f"shop.{ch}t", f"s{ch}p.{ch}", f"t{ch}"):
+            assert table_include_entry(name) == name, name
+            assert unescape_include_entry(name) == name, name
+
+
+@pytest.mark.parametrize("name, entry", [
+    ("shop.orders.v2", "shop\\.orders\\.v2"),
+    ("app.app.orders", "app\\.app\\.orders"),
+    ("shop.t.", "shop\\.t\\."),
+    ("shop..t", "shop\\.\\.t"),
+    ("Shop.Order.Items-2_x", "Shop\\.Order\\.Items-2_x"),
+])
+def test_a_dot_inside_a_table_name_is_escaped_in_table_include_list(name, entry) -> None:
+    # FAILS WITHOUT THE FIX: TableIncludeList carried shop.orders.v2 as written, a regex whose
+    # '.' matches any character, so shop.orders_v2, shopXorders.v2 and shop_orders.v2 were
+    # captured too. SinkTopics keeps the topic as Debezium names it.
+    sent = _sent(["shop.orders", name])
+    assert sent["TableIncludeList"] == f"shop.orders,{entry}"
+    assert sent["SinkTopics"] == f"dsqlcdc.shop.orders,dsqlcdc.{name}"
+    assert table_include_entry(name) == entry
+    # The readback of a deployed TableIncludeList gives the name back.
+    assert unescape_include_entry(entry) == name
+    assert [unescape_include_entry(e) for e in sent["TableIncludeList"].split(",")] == [
+        "shop.orders", name]
+
+
+def test_every_name_cdc_streams_reads_back_from_its_entry() -> None:
+    # A name CDC streams holds only ASCII letters, digits, '.', '_' and '-', so its entry holds
+    # no other escape and reads back exactly.
+    alphabet = sorted(_KAFKA)
+    for i, a in enumerate(alphabet):
+        b = alphabet[(i * 7 + 3) % len(alphabet)]
+        for name in (f"s{a}.t{b}", f"s.{a}.{b}", f"{a}{b}.x.{a}", f"d.{b}{a}.{a}"):
+            if topic_name_refused_tables(_lists([name]), sink_plugin="v57"):
+                continue
+            assert unescape_include_entry(table_include_entry(name)) == name, name
+
+
+def test_the_sink_plugin_gate() -> None:
+    # FAILS WITHOUT THE FIX: no such gate.
+    assert DOTTED_TABLE_MIN_PLUGIN_VERSION == "v57"
+    for plugin in ("v56", "v1", "v0", None, "", "x", "V57", "v57a", "57", "v 57"):
+        assert plugin_reads_dotted_tables(plugin) is False, plugin
+    for plugin in ("v57", "v58", "v100", " v57 "):
+        assert plugin_reads_dotted_tables(plugin) is True, plugin
+    # The sink-key gate it was factored out of is unchanged.
+    for plugin in ("v50", None, "", "x"):
+        assert plugin_supports_sink_keys(plugin) is False, plugin
+    for plugin in ("v51", "v57", " v51 "):
+        assert plugin_supports_sink_keys(plugin) is True, plugin
+
+
+def test_the_new_parameters_are_keyword_only_and_unknown_by_default() -> None:
+    # None means unknown, judged as today's refusal: a caller that passes neither fails safe.
+    for fn in (topic_name_refusal, topic_name_refused_tables):
+        params = inspect.signature(fn).parameters
+        for name in ("sink_plugin", "dotted_schema_tables"):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (fn, name)
+            assert params[name].default is None, (fn, name)
+
+
+def test_evaluation_judges_names_as_a_v57_stack_does() -> None:
+    # topic_name_problems: the names Kafka refuses, and the '.'/'_' groups, in input order, a
+    # '.' inside a table name no problem on its own and joining the groups.
+    names = ["shop.orders", "shop.orders.v2", "shop.a b", "shop.orders_v2", "app_v2.users",
+             "app.v2_users", "shop.a b", "shop.x.y"]
+    assert topic_name_problems(names) == (
+        ["shop.a b"], [["shop.orders.v2", "shop.orders_v2"], ["app_v2.users", "app.v2_users"]])
+    assert topic_name_problems(["shop.orders", "shop.a.b"]) == ([], [])
+    assert topic_name_problems([]) == ([], [])
+    # The prefix is the topic's: a '.' inside it is not one inside a name.
+    assert topic_name_problems(["a.b_c", "a_b.c"], prefix="p.q") == ([], [["a.b_c", "a_b.c"]])
+    # The same tables topic_name_refusal names on a v57 stack, illegal ones and groups alike.
+    refused = topic_name_refused_tables(_lists(names), sink_plugin="v57")
+    illegal, groups = topic_name_problems(names)
+    assert set(refused) == {*illegal, *(n for g in groups for n in g)}
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +793,8 @@ def test_the_hold_remedy_follows_the_table_picker() -> None:
     started = _loaded_state(_NAMES)
     started.set_cdc_ops_window_start(_TS)
     assert _table_lock(started, jobs, None) == _FULL_LOAD_LOCK
-    assert _topic_name_hold_remedy(_REFUSAL, started, jobs, _table_lock(started, jobs, None)) == (
+    assert _topic_name_hold_remedy(
+        _REFUSAL, started, jobs, _table_lock(started, jobs, None), deploy=False) == (
         f"{_REFUSAL} The table picker is locked. {_FULL_LOAD_LOCK}")
     # CDC only with its infrastructure deployed: the infrastructure lock.
     cdc_only = _state(_NAMES, MigrationType.CDC_ONLY, phase="infra")
@@ -523,14 +819,14 @@ def test_a_refused_table_read_in_parts_is_named_as_one_that_cannot_be_deselected
         "(Start over to change it). Nor can the migration switch to Full load only until that "
         "reload, or until a match in Validation in CHECKSUM mode proves CDC's replay of it."
     )
-    assert _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": job}), None) == (
+    assert _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": job}), None, deploy=False) == (
         f"{refusal} {_OPEN} {split_text}")
     assert topic_name_hold_remedy(refusal, None, ["app.ev ents"], job) == (
         f"{refusal} {_OPEN} {split_text}")
     # No refused table read in parts: the picker's remedy alone.
     legal_split = _split_job(names, split={"app.big"})
-    assert _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": legal_split}), None) == (
-        f"{refusal} {_OPEN}")
+    assert _topic_name_hold_remedy(
+        refusal, state, _Jobs({"job-1": legal_split}), None, deploy=False) == f"{refusal} {_OPEN}"
     # CDC only has no Full Load step: the reload goes through Full load + CDC.
     through = (
         "to deselect it, switch the migration type to Full load + CDC, set Reader shards per "
@@ -539,7 +835,8 @@ def test_a_refused_table_read_in_parts_is_named_as_one_that_cannot_be_deselected
     )
     cdc_only = _state(names, MigrationType.CDC_ONLY, phase="infra")
     cdc_only.job_id = "job-1"
-    assert through in _topic_name_hold_remedy(refusal, cdc_only, _Jobs({"job-1": job}), None)
+    assert through in _topic_name_hold_remedy(
+        refusal, cdc_only, _Jobs({"job-1": job}), None, deploy=False)
     assert through in topic_name_hold_remedy(refusal, None, ["app.ev ents"], job, cdc_only=True)
     assert through not in topic_name_hold_remedy(refusal, None, ["app.ev ents"], job)
 
@@ -554,10 +851,10 @@ def test_a_colliding_name_read_in_parts_is_named_only_beside_its_partner() -> No
     state = _loaded_state(names)
     refusal = cdc_topic_name_refusal(names)
     one = _split_job(names, split={"app.v2_users"})
-    assert _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": one}), None) == (
+    assert _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": one}), None, deploy=False) == (
         f"{refusal} {_OPEN}")
     both = _split_job(names, split={"app.v2_users", "app_v2.users"})
-    text = _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": both}), None)
+    text = _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": both}), None, deploy=False)
     assert text == topic_name_hold_remedy(refusal, None, ["app.v2_users", "app_v2.users"], both)
     # Two or more are "they", never "them", as the subject ("so them cannot be deselected").
     assert text == (
@@ -776,11 +1073,14 @@ def test_the_card_and_the_early_deploy_except_a_dotted_database_or_schema(monkey
     # FAILS WITHOUT THE FIX: before a Full load + CDC load, the Full Load card's warning, the
     # early Deploy form and its click offered my.db.orders (database my.db) the
     # load-then-untick route and a Full load only copy, which no step supports for it.
+    # Before any stack they judge the names for the plugin this version bundles, pinned here
+    # to one older than v57 (with no Evaluation report, a name with two '.' is refused there).
     from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
 
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v56")
     names = ["shop.orders", "my.db.orders"]
     inv = _inventory(names)
-    facts = f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA}"
+    facts = f"CDC cannot stream my.db.orders{_old_plugin_fact('v56')} {_DOTTED_SCHEMA}"
     assert pre_load_topic_name_warning(_state(names), _Jobs({}), None, inv) == (
         CDC_TOPIC_NAME_HEADER,
         f"{facts} Deploy CDC infrastructure and Start CDC refuse a capture holding such a "
@@ -882,7 +1182,7 @@ def test_start_and_retry_except_a_dotted_database_or_schema(monkeypatch, retry) 
     jobs = _Jobs({"job-1": _loaded(names, _counts(names))})
     hits, submitted = _start_click(monkeypatch, _loaded_state(names), jobs, names, retry=retry)
     assert [h["body"] for h in hits] == [
-        f"CDC cannot stream my.db.orders{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY} {_OPEN}"]
+        f"CDC cannot stream my.db.orders{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY} {_OPEN}"]
     assert submitted == []
 
 
@@ -944,7 +1244,7 @@ def test_a_pipeline_that_streamed_with_a_dot_in_a_name_is_refused_at_its_next_st
     state.set_cdc_has_committed_offset(True)
     state.set_cdc_deployed_watermark(("mysql-bin.000042", "120"))
     hits, submitted = _start_click(monkeypatch, state, jobs, names)
-    refusal = f"CDC cannot stream shop.a.b{_DOTTED_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
+    refusal = f"CDC cannot stream shop.a.b{_OLD_PLUGIN_FACT} {_DOTTED_SCHEMA} {_REMEDY}"
     assert [h["body"] for h in hits] == [
         f"{refusal} The table picker is locked. {_FULL_LOAD_LOCK}"]
     assert submitted == []
@@ -1005,22 +1305,465 @@ def test_the_table_cap_speaks_first_when_both_apply(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. The core backstops refuse before anything is changed
+# 4b. Who each surface judges the capture for: Deploy CDC infrastructure (and the Full Load
+#     card while no stack is deployed, or while this session's deploy creates one) for the
+#     sink plugin this version bundles, which the deploy uploads; Start CDC and Retry CDC (and
+#     the card once a stack is deployed) for the deployed stack's, which Start keeps. Every
+#     surface with Evaluation's DOTTED_SCHEMA_NAME tables.
+# ---------------------------------------------------------------------------
+
+# A '.' inside a table name (MySQL table orders.v2 of database shop), beside a plain table.
+_DOTTED_TABLE = ["shop.orders", "shop.orders.v2"]
+# What it gets where it is refused: with no Evaluation report, a refused name with two '.'
+# may be a table of a database whose name holds one, so the sentence follows.
+_DOTTED_TABLE_FACTS = "CDC cannot stream shop.orders.v2{fact} " + _DOTTED_SCHEMA
+# Table t of database my.db, which Evaluation reported DOTTED_SCHEMA_NAME on.
+_DOTTED_DB = ["shop.orders", "my.db.t"]
+_DOTTED_DB_FACTS = f"CDC cannot stream my.db.t{_DOTTED_SCHEMA_FACT} {_DOTTED_SCHEMA}"
+
+
+def _ui_calls(path):
+    """``(enclosing function, callee, call)`` of each topic-name call in a UI module."""
+    tree = ast.parse(path.read_text())
+    wanted = {"cdc_topic_name_refusal", "cdc_topic_name_refused",
+              "cdc_pre_load_topic_name_warning", "_topic_name_context",
+              "_topic_name_hold_remedy", "warning"}
+    found = []
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", None) in wanted:
+                    found.append((fn.name, node.func.id, node))
+    return found
+
+
+def test_every_topic_name_check_of_the_ui_says_who_it_judges_for() -> None:
+    # FAILS WITHOUT THE FIX: no UI check passed a sink plugin or Evaluation's tables, so each
+    # judged an unknown plugin -- the oldest: a '.' inside a table name was refused even where
+    # the stack's sink reads it, an older plugin went unnamed, and a table of a database or
+    # schema whose name holds a '.' was not refused where the sink reads such a name.
+    import dsql_migrator.ui as ui_pkg
+
+    root = pathlib.Path(ui_pkg.__file__).parent
+    checks = {"cdc_topic_name_refusal", "cdc_topic_name_refused",
+              "cdc_pre_load_topic_name_warning"}
+    contexts: dict = {}
+    for path in sorted(root.rglob("*.py")):
+        for fn, callee, call in _ui_calls(path):
+            if callee in checks:
+                keywords = {k.arg for k in call.keywords}
+                spread = [ast.unparse(k.value) for k in call.keywords if k.arg is None]
+                assert {"sink_plugin", "dotted_schema_tables"} <= keywords or [
+                    text for text in spread if text.startswith("_topic_name_context(")
+                ], (path.name, fn, call.lineno)
+            if callee == "_topic_name_context":
+                (deploy,) = [ast.unparse(k.value) for k in call.keywords if k.arg == "deploy"]
+                contexts.setdefault(fn, set()).add(deploy)
+            if callee == "_topic_name_hold_remedy":
+                (deploy,) = [ast.unparse(k.value) for k in call.keywords if k.arg == "deploy"]
+                contexts.setdefault(f"remedy in {fn}", set()).add(deploy)
+            if callee == "warning" and fn == "_pre_load_cdc_warning":
+                assert [k for k in call.keywords if k.arg is None
+                        and ast.unparse(k.value) == "context"], call.lineno
+    # Deploy for the bundled plugin; Start and Retry (the Start click) for the deployed one; the
+    # split-read remedy as its surface; the card for the stack the next operation judges for.
+    assert contexts == {
+        "_deploy_block_notice": {"True"},
+        "_start_cdc_infra_deploy": {"True"},
+        "remedy in _deploy_topic_name_refused": {"True"},
+        "_render_cdc_start_button": {"False"},
+        "remedy in _render_cdc_start_button": {"False"},
+        "_start_cdc_deploy": {"False"},
+        "remedy in _start_cdc_deploy": {"False"},
+        "_topic_name_hold_remedy": {"deploy"},
+        "_pre_load_cdc_warning": {"not (planned and prep == 'ready')"},
+    }
+
+
+def test_the_context_names_the_bundled_or_the_deployed_plugin(monkeypatch) -> None:
+    from dsql_migrator.ui.data_migration._cdc_ui import _topic_name_context
+
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v99")
+    state = _state(_NAMES, phase="infra")
+    assert _topic_name_context(state, deploy=True) == {
+        "sink_plugin": "v99", "dotted_schema_tables": None}
+    assert _topic_name_context(state, deploy=False) == {
+        "sink_plugin": None, "dotted_schema_tables": None}
+    state.set_cdc_deployed_plugin_version("v56")
+    state.set_cdc_dotted_schema_tables(["my.db.t"])
+    assert _topic_name_context(state, deploy=True) == {
+        "sink_plugin": "v99", "dotted_schema_tables": frozenset({"my.db.t"})}
+    assert _topic_name_context(state, deploy=False) == {
+        "sink_plugin": "v56", "dotted_schema_tables": frozenset({"my.db.t"})}
+
+
+@pytest.mark.parametrize("bundled", ["v56", "v57"])
+def test_the_deploy_surfaces_judge_the_bundled_sink_plugin(monkeypatch, bundled) -> None:
+    # FAILS WITHOUT THE FIX: the Deploy form, its click and the Full Load card before any stack
+    # judged an unknown plugin: shop.orders.v2 was refused although the plugin the deploy
+    # uploads (v57) streams it, and an older bundled one went unnamed. A stale deployed
+    # version (the other one) is not what a deploy judges.
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", bundled)
+    stale = "v56" if bundled == "v57" else "v57"
+    names, inv = _DOTTED_TABLE, _inventory(_DOTTED_TABLE)
+    facts = _DOTTED_TABLE_FACTS.format(fact=_old_plugin_fact(bundled))
+    before, cdc_only = _deploy_ready(names, FLC), _deploy_ready(names)
+    card = _state(names)
+    for state in (before, cdc_only, card):
+        state.set_cdc_deployed_plugin_version(stale)
+    if bundled == "v57":
+        assert _deploy_block_notice(before, _Jobs({}), inv, None) is None
+        assert _deploy_block_notice(cdc_only, _Jobs({}), inv, None) is None
+        ui, notices = _render_deploy(monkeypatch, cdc_only, _Jobs({}), inv)
+        assert not [n for n in notices if n[1] == CDC_TOPIC_NAME_HEADER]
+        assert ui.deploy_button().enabled is True
+        assert pre_load_topic_name_warning(card, _Jobs({}), None, inv) is None
+        # The click goes on to the source's row estimates, then to an AWS call (which the fake
+        # fails): the names did not stop it.
+        calls = _fake_nicegui(monkeypatch, None)
+        with pytest.raises(AssertionError, match="no AWS call may run before the refusal"):
+            _click_deploy(cdc_only, inv)
+        assert len(calls) == 2, calls
+        return
+    early = f"{facts} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}"
+    assert _deploy_block_notice(before, _Jobs({}), inv, None) == (CDC_TOPIC_NAME_HEADER, early)
+    after = f"{facts} {_REMEDY} {_OPEN}"
+    assert _deploy_block_notice(cdc_only, _Jobs({}), inv, None) == (CDC_TOPIC_NAME_HEADER, after)
+    ui, notices = _render_deploy(monkeypatch, cdc_only, _Jobs({}), inv)
+    assert ("error", CDC_TOPIC_NAME_HEADER, after) in notices
+    assert ui.deploy_button().enabled is False
+    assert pre_load_topic_name_warning(card, _Jobs({}), None, inv) == (
+        CDC_TOPIC_NAME_HEADER,
+        f"{facts} Deploy CDC infrastructure and Start CDC refuse a capture holding such a "
+        f"table. {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}",
+    )
+    calls = _fake_nicegui(monkeypatch, None)
+    assert _click_deploy(before, inv) == [(early, "negative")]
+    assert _click_deploy(cdc_only, inv) == [(after, "negative")]
+    assert calls == []
+
+
+class _Reached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("deployed", [None, "v56", "v57", "v58"])
+@pytest.mark.parametrize("retry", [False, True], ids=["start", "retry"])
+def test_start_and_retry_judge_the_deployed_sink_plugin(monkeypatch, deployed, retry) -> None:
+    # FAILS WITHOUT THE FIX: Start CDC and Retry CDC judged an unknown plugin, so
+    # shop.orders.v2 was refused on a stack whose sink streams it (v57 or later), and an older
+    # one went unnamed. The bundled plugin (pinned to the other kind) is not what they judge:
+    # Start CDC keeps the plugin the stack was deployed with. None (not read) is judged as the
+    # oldest, as before: that case is a guard and passes before and after.
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    reads = plugin_reads_dotted_tables(deployed)
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v56" if reads else "v57")
+    names = _DOTTED_TABLE
+    jobs = _Jobs({"job-1": _loaded(names, _counts(names))})
+    state = _loaded_state(names)
+    state.set_cdc_deployed_plugin_version(deployed)
+    if reads:
+        # Past the names, the Start builds the connector configuration (spied on here).
+        monkeypatch.setattr(
+            _cdc_ui, "dispatch_source_config", lambda *_a, **_k: (_ for _ in ()).throw(_Reached()))
+        with pytest.raises(_Reached):
+            _start_click(monkeypatch, state, jobs, names, retry=retry)
+        return
+    hits, submitted = _start_click(monkeypatch, state, jobs, names, retry=retry)
+    facts = _DOTTED_TABLE_FACTS.format(fact=_old_plugin_fact(deployed))
+    assert [h["body"] for h in hits] == [f"{facts} {_REMEDY} {_OPEN}"]
+    assert submitted == []
+
+
+@pytest.mark.parametrize("deployed", [None, "v56", "v57"])
+def test_the_start_section_judges_the_deployed_sink_plugin(monkeypatch, deployed) -> None:
+    # FAILS WITHOUT THE FIX: the Start section held Start CDC for shop.orders.v2 on a v57 stack,
+    # and could not name an older one. None (not read): judged as the oldest, as before (a
+    # guard).
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v56" if deployed == "v57" else "v57")
+    notices: list = []
+    real = _cdc_ui.render_notice
+    monkeypatch.setattr(
+        _cdc_ui, "render_notice", lambda ui, **kw: notices.append(kw) or real(ui, **kw)
+    )
+    names = _DOTTED_TABLE
+    state = _state(names, phase="infra")
+    state.set_prereq_gated_mode(MigrationMode.CDC)
+    state.set_cdc_deployed_plugin_version(deployed)
+    ui = _RecordingUi()
+    _cdc_ui._render_cdc_start_button(
+        ui, state, _Jobs({}), lambda: None, inventory=_inventory(names), session=None,
+    )
+    hits = [n for n in notices if n.get("header") == CDC_TOPIC_NAME_HEADER]
+    (start,) = [b for b in ui.buttons if b.text == "Start CDC"]
+    if deployed == "v57":
+        assert hits == []
+        assert not [t for t in ui.tooltips if "CDC cannot stream" in t]
+        return
+    facts = _DOTTED_TABLE_FACTS.format(fact=_old_plugin_fact(deployed))
+    assert [h["body"] for h in hits] == [
+        f"{facts} {_REMEDY} The table picker is locked. {_INFRA_LOCK}"]
+    assert "disable" in start.props_seen
+
+
+def test_the_full_load_card_judges_for_the_stack_the_next_cdc_operation_judges_for(
+    monkeypatch,
+) -> None:
+    # FAILS WITHOUT THE FIX: the card judged an unknown plugin whatever the state. A deployed
+    # stack is judged on its own plugin (Start CDC keeps it); no stack, one being deleted, or
+    # the one this session's deploy is creating, on the bundled one (the deploy records it).
+    from dsql_migrator.core.models import MigrationJob as _Job
+
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v56")
+    names, inv = _DOTTED_TABLE, _inventory(_DOTTED_TABLE)
+    v56 = _DOTTED_TABLE_FACTS.format(fact=_old_plugin_fact("v56"))
+    ready = _state(names, phase="infra")
+    ready.set_cdc_deployed_plugin_version("v57")
+    assert pre_load_topic_name_warning(ready, _Jobs({}), None, inv) is None
+    ready.set_cdc_deployed_plugin_version("v56")
+    _h, body = pre_load_topic_name_warning(ready, _Jobs({}), None, inv)
+    assert body.startswith(f"{v56} Start CDC refuses a capture holding such a table. ")
+    # This session's deploy is creating the stack: the bundled plugin, whatever was read last.
+    deploying = _state(names)
+    deploying.set_cdc_deployed_plugin_version("v57")
+    deploying.set_cdc_deploy_job_id("d-1", kind="infra")
+    running = _Jobs({"d-1": _Job(job_id="d-1", status="RUNNING", chunks=[])})
+    _h, body = pre_load_topic_name_warning(deploying, running, None, inv)
+    assert body.startswith(f"{v56} Start CDC refuses a capture holding such a table. ")
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v57")
+    assert pre_load_topic_name_warning(deploying, running, None, inv) is None
+    # A deployed stack being deleted: the next one is deployed with the bundled plugin.
+    deleting = _state(names, phase=None)
+    deleting.set_cdc_stack_phase("unstable", status="DELETE_IN_PROGRESS")
+    deleting.set_cdc_deployed_plugin_version("v56")
+    assert pre_load_topic_name_warning(deleting, _Jobs({}), None, inv) is None
+
+
+def test_evaluations_dotted_schema_tables_are_refused_on_every_surface(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX: no surface passed Evaluation's DOTTED_SCHEMA_NAME tables, so on a
+    # sink plugin that reads a '.' inside a table name, my.db.t (table t of database my.db) was
+    # taken for table db.t of database my and streamed: on MySQL the escaped entry captures
+    # both, and the sink dead-letters every change of the one whose database holds a '.'.
+    from dsql_migrator.core.models import MigrationMode
+    from dsql_migrator.ui.data_migration import _cdc_ui
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v57")
+    names, inv = _DOTTED_DB, _inventory(_DOTTED_DB)
+
+    def _known(state, tables=("my.db.t",)):
+        state.set_cdc_deployed_plugin_version("v57")
+        state.set_cdc_dotted_schema_tables(tables)
+        return state
+
+    early = f"{_DOTTED_DB_FACTS} {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}"
+    assert _deploy_block_notice(_known(_deploy_ready(names, FLC)), _Jobs({}), inv, None) == (
+        CDC_TOPIC_NAME_HEADER, early)
+    assert pre_load_topic_name_warning(_known(_state(names)), _Jobs({}), None, inv) == (
+        CDC_TOPIC_NAME_HEADER,
+        f"{_DOTTED_DB_FACTS} Deploy CDC infrastructure and Start CDC refuse a capture holding "
+        f"such a table. {_ROUTES_DOTTED}{_ROUTES_OR}{_OPEN}",
+    )
+    calls = _fake_nicegui(monkeypatch, None)
+    assert _click_deploy(_known(_deploy_ready(names, FLC)), inv) == [(early, "negative")]
+    assert calls == []
+    for retry in (False, True):
+        jobs = _Jobs({"job-1": _loaded(names, _counts(names))})
+        hits, submitted = _start_click(
+            monkeypatch, _known(_loaded_state(names)), jobs, names, retry=retry)
+        assert [h["body"] for h in hits] == [f"{_DOTTED_DB_FACTS} {_REMEDY} {_OPEN}"], retry
+        assert submitted == []
+    notices: list = []
+    monkeypatch.setattr(_cdc_ui, "render_notice", lambda ui, **kw: notices.append(kw))
+    section = _known(_state(names, phase="infra"))
+    section.set_prereq_gated_mode(MigrationMode.CDC)
+    _cdc_ui._render_cdc_start_button(
+        _RecordingUi(), section, _Jobs({}), lambda: None, inventory=inv, session=None)
+    assert [n["body"] for n in notices if n.get("header") == CDC_TOPIC_NAME_HEADER] == [
+        f"{_DOTTED_DB_FACTS} {_REMEDY} The table picker is locked. {_INFRA_LOCK}"]
+    # Guards the guard: Evaluation found no such database (a known, empty set), so my.db.t is
+    # a '.' inside a table name, which a v57 stack streams; with no Evaluation report the same
+    # (the sink dead-letters a change whose database holds a '.', the backstop).
+    for tables in ((), None):
+        assert _deploy_block_notice(
+            _known(_deploy_ready(names, FLC), tables), _Jobs({}), inv, None) is None, tables
+        assert pre_load_topic_name_warning(
+            _known(_state(names), tables), _Jobs({}), None, inv) is None, tables
+
+
+def test_a_table_read_in_parts_is_named_only_where_its_surface_refuses_it() -> None:
+    # FAILS WITHOUT THE FIX: the split-read remedy judged its tables for an unknown plugin, so
+    # on a v57 stack it named shop.orders.v2, which the refusal before it does not name.
+    from dsql_migrator.ui.data_migration._cdc_ui import _topic_name_hold_remedy
+
+    names = ["app.users", "app.ev ents", "shop.orders.v2"]
+    job = _split_job(names, split={"app.ev ents", "shop.orders.v2"})
+    state = _loaded_state(names)
+    state.set_cdc_deployed_plugin_version("v57")
+    refusal = cdc_topic_name_refusal(names, sink_plugin="v57")
+    assert "shop.orders.v2" not in refusal
+    text = _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": job}), None, deploy=False)
+    assert "The Full Load read app.ev ents in parts, so it cannot be deselected" in text
+    assert text.count("shop.orders.v2") == 0
+    # On an older stack the refusal names both, and so does the remedy.
+    state.set_cdc_deployed_plugin_version("v56")
+    refusal = cdc_topic_name_refusal(names, sink_plugin="v56")
+    text = _topic_name_hold_remedy(refusal, state, _Jobs({"job-1": job}), None, deploy=False)
+    assert "The Full Load read app.ev ents, shop.orders.v2 in parts, so they cannot" in text
+
+
+def test_the_screen_hands_evaluations_dotted_schema_tables_to_the_state(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX: nothing recorded Evaluation's DOTTED_SCHEMA_NAME tables, so every
+    # surface judged without them. Each render reads the current report.
+    from dsql_migrator.core.assessor import (
+        CompatibilityAssessor,
+        dotted_schema_findings,
+        with_object_findings,
+    )
+    from dsql_migrator.core.models import TargetInventory
+    from dsql_migrator.ui.evaluation import EvaluationResult
+
+    from tests.test_g12_table_set_after_load import _loaded as _g12_loaded
+    from tests.test_g12_table_set_after_load import _screen
+
+    s = _screen(monkeypatch, job=_g12_loaded(), selected=["app.a", "app.b"])
+    s.content(lambda: None)
+    assert s.state.cdc_dotted_schema_tables == frozenset()  # a report with no such finding
+    inventory = _inventory(["app.a", "my.db.t", "my.db.v2.x", "shop.a.b"])
+    report = with_object_findings(
+        CompatibilityAssessor(source_type=SourceType.MYSQL).assess(inventory),
+        dotted_schema_findings(inventory, ["my.db"]),
+    )
+    s.evals.get_or_create("s1").set_result(EvaluationResult(
+        inventory=inventory, assessment=report, target_inventory=TargetInventory(schemas=[]),
+        target_conflicts=[]))
+    s.content(lambda: None)
+    assert s.state.cdc_dotted_schema_tables == frozenset({"my.db.t", "my.db.v2.x"})
+    s.evals.get_or_create("s1").clear_outputs()
+    s.content(lambda: None)
+    assert s.state.cdc_dotted_schema_tables is None  # no report: unknown
+
+
+def test_the_dotted_schema_tables_are_an_evaluation_fact_not_a_stacks() -> None:
+    # A stack change (another name, an absent stack, an adopted one) keeps them -- they come
+    # from the Evaluation report, which it does not change; Start over resets them.
+    from dsql_migrator.ui.data_migration import DataMigrationStore
+
+    store = DataMigrationStore()
+    state = store.get_or_create("s1")
+    assert state.cdc_dotted_schema_tables is None
+    state.set_cdc_dotted_schema_tables(["my.db.t", "my.db.t"])
+    assert state.cdc_dotted_schema_tables == frozenset({"my.db.t"})
+    state.set_cdc_stack_name("dsql-cdc-other")
+    state.set_cdc_stack_phase("absent")
+    state.adopt_cdc_stack("dsql-cdc-third")
+    assert state.cdc_dotted_schema_tables == frozenset({"my.db.t"})
+    state.set_cdc_dotted_schema_tables(())
+    assert state.cdc_dotted_schema_tables == frozenset()
+    state.set_cdc_dotted_schema_tables(["my.db.t"])
+    store.reset_in_place("s1")
+    assert state.cdc_dotted_schema_tables is None
+    state.set_cdc_dotted_schema_tables(None)
+    assert state.cdc_dotted_schema_tables is None
+
+
+def test_the_stack_probe_reads_an_escaped_include_entry_back_as_its_table(monkeypatch) -> None:
+    # FAILS WITHOUT THE FIX: the reconciled table set (an adopted pipeline's tables) and each
+    # attach candidate's held shop\.orders\.v2, which names no table, so the adopted
+    # pipeline's dotted table was unresolved and the attach scope check saw another set.
+    import dsql_migrator.core.cdc_deployer as deployer_mod
+    from dsql_migrator.ui.data_migration import DataMigrationState
+    from dsql_migrator.ui.data_migration._cdc_status import _probe_cdc_stack_phase
+
+    deployed = "shop\\.orders\\.v2,shop.items"
+    assert deployed == ",".join(table_include_entry(n) for n in ("shop.orders.v2", "shop.items"))
+    state = DataMigrationState()
+
+    def _disc(params):
+        return SimpleNamespace(stack_status="UPDATE_COMPLETE", is_stable=True,
+                               current_parameters=params)
+
+    class _Deployer:
+        def describe_stack_or_none(self, name):
+            return _disc({"TableIncludeList": deployed if name == state.cdc_stack_name
+                          else f" {deployed} ,"})
+
+        def list_cdc_stacks(self):
+            return [("dsql-cdc-other", "UPDATE_COMPLETE")]
+
+    monkeypatch.setattr(deployer_mod, "build_cdc_stack_deployer", lambda *a, **k: _Deployer())
+    session = SimpleNamespace(target_config=SimpleNamespace(region="us-east-1"), aws_profile=None)
+    _probe_cdc_stack_phase(state, session)
+    assert state.cdc_reconciled_table_names == ["shop.orders.v2", "shop.items"]
+    assert state.cdc_other_stack_tables == {"dsql-cdc-other": ["shop.orders.v2", "shop.items"]}
+
+
+def test_cdc_rule_tables_reads_any_finding_of_the_rule() -> None:
+    from dsql_migrator.ui.data_migration import cdc_cascade_gap_tables, cdc_rule_tables
+
+    def _item(name, rule, *concerns):
+        return SimpleNamespace(object_name=name, rule_id=rule,
+                               concerns=[SimpleNamespace(rule_id=c) for c in concerns])
+
+    report = SimpleNamespace(items=[
+        _item("my.db.t", "DOTTED_SCHEMA_NAME", "DOTTED_SCHEMA_NAME"),
+        _item("my.db.u", "PK_MISSING", "PK_MISSING", "DOTTED_SCHEMA_NAME"),
+        _item("shop.c", "FK_CASCADE_CDC_GAP"),
+        _item("my.db.t", "DOTTED_SCHEMA_NAME"),
+    ])
+    assert cdc_rule_tables(report, "DOTTED_SCHEMA_NAME") == ["my.db.t", "my.db.u"]
+    assert cdc_rule_tables(report, "DOTTED_SCHEMA_NAME", ["my.db.u"]) == ["my.db.u"]
+    assert cdc_rule_tables(None, "DOTTED_SCHEMA_NAME") == []
+    assert cdc_cascade_gap_tables(report) == ["shop.c"]
+
+
+# ---------------------------------------------------------------------------
+# 5. The core backstops refuse before anything is changed, judged for the sink plugin of the
+#    stack the capture is for: Deploy CDC infrastructure for the bundled one, the one it
+#    uploads and records as the new stack's PluginVersion; Start CDC and Retry CDC for the
+#    deployed one, read from the same describe.
 # ---------------------------------------------------------------------------
 
 
 def _refused_of_kind(kind, db, illegal):
     """Names of one kind CDC cannot stream (``illegal`` for that kind)."""
     return {"illegal": [illegal], "dotted": [f"{db}.a.b"],
-            "collision": [f"{db}.v2_users", f"{db}_v2.users"]}[kind]
+            "collision": [f"{db}.v2_users", f"{db}_v2.users"],
+            # Refused on every sink plugin, v57 included.
+            "empty": [f".{db}.t"],
+            "dotted_collision": [f"{db}.orders.v2", f"{db}.orders_v2"]}[kind]
 
 
-@pytest.mark.parametrize("kind", ["illegal", "dotted", "collision"])
+# (sink plugin, kind of name it refuses): a '.' inside a table name is refused on a plugin
+# older than v57 or one this version cannot identify (None), and only there.
+_PLUGIN_KINDS = [
+    *((plugin, kind) for plugin in (None, "v56") for kind in ("illegal", "dotted", "collision")),
+    *(("v57", kind) for kind in ("illegal", "empty", "collision", "dotted_collision")),
+]
+
+
+def _dotted_name(engine):
+    """A table whose name holds a '.', one of each engine's shapes: MySQL `shop`.`orders.v2`,
+    PostgreSQL public."public.orders" (an older sink read its tombstone as public.orders)."""
+    return "shop.orders.v2" if engine == "mysql" else "public.public.orders"
+
+
+@pytest.mark.parametrize(("bundled", "kind"), [pk for pk in _PLUGIN_KINDS if pk[0]])
 @pytest.mark.parametrize("engine", ["mysql", "postgres"])
-def test_deploy_refuses_before_the_bucket_or_any_upload(engine, kind) -> None:
+def test_deploy_refuses_before_the_bucket_or_any_upload(monkeypatch, engine, bundled, kind) -> None:
+    # FAILS WITHOUT THE FIX for a '.' inside a table name: the deploy judged every name for a
+    # plugin it could not identify, not for the one it bundles (here pinned, v56 or v57).
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", bundled)
     db = "shop" if engine == "mysql" else "public"
     refused = _refused_of_kind(kind, db, f"{db}.order$items")
     names = [f"{db}.orders", *refused]
+    params = _infra(engine, names, _counts(names))
     handle = _FakeHandle()
     logs, on_log = _logs()
     s3 = _FakeS3(absent=True)
@@ -1028,21 +1771,59 @@ def test_deploy_refuses_before_the_bucket_or_any_upload(engine, kind) -> None:
     with pytest.raises(CdcDeployError) as exc:
         _run_infra(
             handle, deployer, on_log, s3_client=s3, stack_name="dsql-cdc-shop",
-            template_body="T", params=_infra(engine, names, _counts(names)),
+            template_body="T", params=params,
             create_timeout_seconds=5.0, poll_interval_seconds=0.0,
         )
-    assert str(exc.value) == cdc_topic_name_refusal(names)
+    assert str(exc.value) == topic_name_refusal(params.filled, sink_plugin=bundled)
+    if kind == "dotted":
+        # The fact names the plugin the new stack would get, and Delete + Deploy.
+        assert f"CDC cannot stream {db}.a.b{_old_plugin_fact(bundled)}" in str(exc.value)
+    if kind in ("illegal", "collision"):
+        # Judged alike on every plugin, and as the Data Migration step judges them.
+        assert str(exc.value) == cdc_topic_name_refusal(names)
     assert s3.calls == [] and deployer.calls == [] and deployer.created == []
     assert set(_statuses(handle).values()) == {"PENDING"}
     assert handle.job.error_count == 1
     assert any(m.startswith(f"ERROR: CDC cannot stream {refused[0]}") for m in logs)
 
 
-@pytest.mark.parametrize("kind", ["illegal", "dotted", "collision"])
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_deploy_takes_a_dot_inside_a_table_name_with_a_bundled_plugin_that_reads_it(
+    monkeypatch, engine
+) -> None:
+    # FAILS WITHOUT THE FIX: the deploy refused it, judged for a plugin it could not identify,
+    # although the stack it creates gets the bundled plugin (here pinned to v57).
+    monkeypatch.setattr(s3_provision, "PLUGIN_VERSION", "v57")
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    names = [f"{db}.orders", dotted]
+    handle = _FakeHandle()
+    logs, on_log = _logs()
+    deployer = _FakeDeployer(stack_statuses=("CREATE_IN_PROGRESS", "CREATE_COMPLETE"))
+    _run_infra(
+        handle, deployer, on_log, stack_name="dsql-cdc-shop", template_body="T",
+        params=_infra(engine, names, _counts(names)),
+        create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert all(s == "DONE" for s in _statuses(handle).values())
+    assert handle.job.error_count == 0
+    (_stack, created), = deployer.created
+    sent = dict(created)
+    # The new stack records the plugin the names were judged for, so Start judges the same.
+    assert sent["PluginVersion"] == "v57"
+    assert sent["SinkTopics"] == f"dsqlcdc.{db}.orders,dsqlcdc.{dotted}"
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+
+
+@pytest.mark.parametrize(("plugin", "kind"), _PLUGIN_KINDS)
 @pytest.mark.parametrize("engine", ["mysql", "postgres"])
 @pytest.mark.parametrize("seed_mode", ["lambda", "external"])
 @pytest.mark.parametrize("running", [False, True], ids=["create", "both_running"])
-def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, running, kind) -> None:
+def test_start_refuses_before_bootstrap_seed_or_update(
+    engine, seed_mode, running, plugin, kind
+) -> None:
+    # FAILS WITHOUT THE FIX for a deployed v56 (its plugin named) and for a pair a '.' inside
+    # a table name collides in on v57: Start judged every name for an unknown plugin.
     db = "shop" if engine == "mysql" else "public"
     names = [f"{db}.orders", *_refused_of_kind(kind, db, f"{db}.a,b")]
     params = _start(engine, names)
@@ -1050,7 +1831,10 @@ def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, runnin
     deployer = _FakeDeployer(
         connector_states={SRC: list(states), SINK: list(states)},
         # Both RUNNING on this very config: the fast path that sends nothing.
-        discovery_params=dict(params.filled) if running else None,
+        discovery_params={
+            **(dict(params.filled) if running else {}),
+            **({"PluginVersion": plugin} if plugin else {}),
+        },
     )
     seeds: list = []
     handle = _FakeHandle()
@@ -1061,7 +1845,18 @@ def test_start_refuses_before_bootstrap_seed_or_update(engine, seed_mode, runnin
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
             seed_mode=seed_mode, seed_fn=lambda **kw: seeds.append(kw) or "true",
         )
-    assert str(exc.value) == cdc_topic_name_refusal(names)
+    assert str(exc.value) == topic_name_refusal(params.filled, sink_plugin=plugin)
+    if kind == "dotted":
+        # The fact names the deployed plugin (or says it cannot tell), and Delete + Deploy.
+        assert f"CDC cannot stream {db}.a.b{_old_plugin_fact(plugin)}" in str(exc.value)
+    if kind == "dotted_collision":
+        # On v57 a '.' inside a table name streams, so it collides like any other name.
+        assert str(exc.value).startswith(
+            f"CDC cannot stream {db}.orders.v2 together with {db}.orders_v2{_COLLISION_FACT}")
+    if plugin is None:
+        # A stack with no PluginVersion is judged as the Data Migration step judges a stack
+        # whose plugin it does not know.
+        assert str(exc.value) == cdc_topic_name_refusal(names)
     assert deployer.updates == []
     assert "submit_update" not in deployer.calls
     assert "get_bootstrap_brokers" not in deployer.calls
@@ -1084,6 +1879,43 @@ def test_names_cdc_can_stream_reach_the_stack_update() -> None:
     _start_with(_start("mysql", legal), deployer)
     assert "submit_update" in deployer.calls
     assert dict(deployer.updates[0])["SinkTopics"] == "dsqlcdc.shop.orders,dsqlcdc.shop.items"
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+@pytest.mark.parametrize("seed_mode", ["lambda", "external"])
+def test_a_dot_inside_a_table_name_reaches_the_stack_update_on_a_v57_stack(
+    engine, seed_mode
+) -> None:
+    # FAILS WITHOUT THE FIX: Start refused it, judged for a plugin it could not identify,
+    # although the describe it had just read says v57.
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    params = _start(engine, [f"{db}.orders", dotted])
+    deployer = _FakeDeployer(
+        connector_states={SRC: ["CREATING", "RUNNING"], SINK: ["CREATING", "RUNNING"]},
+        discovery_params={"PluginVersion": "v57"},
+    )
+    seeds: list = []
+    handle = _FakeHandle()
+    run_cdc_start(
+        handle, stack_name=STACK, params=params, deployer=deployer,
+        on_log=lambda ts, msg: None, sleep=lambda _s: None,
+        connector_timeout_seconds=5.0, poll_interval_seconds=0.0,
+        seed_mode=seed_mode, seed_fn=lambda **kw: seeds.append(kw) or "true",
+    )
+    assert handle.job.error_count == 0
+    assert deployer.calls.count("submit_update") == 1
+    sent = dict(deployer.updates[0])
+    topics = [f"dsqlcdc.{db}.orders", f"dsqlcdc.{dotted}"]
+    assert sent["SinkTopics"] == ",".join(topics)
+    # The exact escaped entry, so the source connector captures only that table.
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+    if seed_mode == "external":
+        # The in-process seed pre-creates the dotted table's topic by its literal name.
+        (seed,) = seeds
+        assert seed["sink_topics"] == topics
+    else:
+        assert seeds == []
 
 
 # ---------------------------------------------------------------------------
@@ -1148,3 +1980,237 @@ def test_the_manual_excepts_a_dotted_database_or_schema_before_the_routes(lang) 
     assert part.count(route) == 1, lang
     assert _flat(lang, _DOC_OTHER_TABLE[lang] + _DOC_UNTICK_ROUTE[lang]) in part, lang
     assert -1 < dotted < link < part.index(route), (lang, dotted, link)
+
+
+# Chapter 6 says, in every language, that a '.' inside a table name streams on CDC
+# infrastructure deployed by 0.1.589 or later and is refused on older infrastructure until
+# Delete + Deploy; that a '.'/'_' pair a dotted table name is in is still refused; that
+# Evaluation lists such tables (CDC_TOPIC_NAME); that a table whose name reads the same as a
+# dotted database's is refused too; and that the Lambda path names a leftover topic on new
+# infrastructure. The claim that CDC cannot capture any '.' inside a name is gone.
+_DOC_DOTTED_TABLE = {
+    "en": (
+        "A `.` inside a table name, such as MySQL `shop`.`orders.v2` or PostgreSQL "
+        '`app."orders.v2"`, is no problem on CDC infrastructure deployed by version 0.1.589 '
+        "or later. CDC infrastructure deployed by an earlier version cannot stream such a "
+        "table: there Start CDC and Retry CDC refuse it until you **Delete CDC "
+        "infrastructure** and deploy it again",
+        "`shop.orders.v2` and `shop.orders_v2`",
+        "Evaluation lists such tables (`CDC_TOPIC_NAME`, advice only).",
+        "(table `orders.v2` of database `shop` and table `v2` of database `shop.orders` are "
+        "both `shop.orders.v2`)",
+        "or as a rolled-back Start on the Lambda path (MySQL on ECS Fargate or run locally), "
+        "whose activity log names the topic on CDC infrastructure deployed by version 0.1.589 "
+        "or later.",
+    ),
+    "ko": (
+        'MySQL `shop`.`orders.v2`나 PostgreSQL `app."orders.v2"`처럼 테이블 이름 안에 `.`이 있는 '
+        "테이블은 버전 0.1.589 이상이 배포한 CDC 인프라에서는 문제가 없습니다. 그 이전 버전이 배포한 "
+        "CDC 인프라는 그런 테이블을 스트리밍할 수 없으므로, 거기서는 **Delete CDC infrastructure** "
+        "후 다시 배포할 때까지 Start CDC와 Retry CDC가 그 테이블을 거부합니다",
+        "`shop.orders.v2`와 `shop.orders_v2`",
+        "Evaluation은 그런 테이블을 알려 줍니다(`CDC_TOPIC_NAME`, 조언만).",
+        "(데이터베이스 `shop`의 테이블 `orders.v2`와 데이터베이스 `shop.orders`의 테이블 `v2`는 "
+        "둘 다 `shop.orders.v2`)",
+        "Lambda 경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백되며, 버전 0.1.589 "
+        "이상이 배포한 CDC 인프라에서는 그 활동 로그가 토픽을 명시합니다.",
+    ),
+    "ja": (
+        'MySQL の `shop`.`orders.v2` や PostgreSQL の `app."orders.v2"` のようにテーブル名の中に '
+        "`.` を含むテーブルは、バージョン 0.1.589 以降がデプロイした CDC インフラでは問題ありません。"
+        "それより前のバージョンがデプロイした CDC インフラはそのようなテーブルをストリーミングできないため、"
+        "そこでは CDC インフラを削除 (**Delete CDC infrastructure**) して再デプロイするまで、Start CDC "
+        "と Retry CDC がそのテーブルを拒否します",
+        "`shop.orders.v2` と `shop.orders_v2`",
+        "Evaluation はそのようなテーブルを示します (`CDC_TOPIC_NAME`、助言のみ)。",
+        "(データベース `shop` のテーブル `orders.v2` とデータベース `shop.orders` のテーブル `v2` は"
+        "どちらも `shop.orders.v2` です)",
+        "Lambda の経路 (ECS Fargate またはローカルで実行する MySQL) では Start がロールバックされ、"
+        "バージョン 0.1.589 以降がデプロイした CDC インフラではそのアクティビティログがトピックを示します。",
+    ),
+}
+# What chapter 6 said before v57: CDC cannot capture a '.' inside any name.
+_DOC_DOTTED_TABLE_STALE = {
+    "en": ("or a `.` inside the name (the CDC sink reads every `.`",),
+    "ko": ("나 이름 안의 `.`이 들어간", "(CDC 싱크는 모든 `.`을"),
+    "ja": ("か名前の中の `.` を含むテーブル", "(CDC のシンクはすべての `.` を"),
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_manual_says_a_dot_inside_a_table_name_streams_on_new_infrastructure(lang) -> None:
+    # FAILS WITHOUT THE FIX: chapter 6 said CDC cannot capture a table with a '.' inside any of
+    # its names, on any infrastructure, and that the Lambda path's rolled-back Start named
+    # nothing.
+    from tests.test_g25_docs import _has, _page
+
+    limitations = _page(lang, "06-limitations.md")
+    for phrase in _DOC_DOTTED_TABLE[lang]:
+        assert _has(lang, limitations, phrase), (lang, phrase)
+    for stale in _DOC_DOTTED_TABLE_STALE[lang]:
+        assert not _has(lang, limitations, stale), (lang, stale)
+
+
+_DOC_CH13_DOTTED = {
+    "en": (
+        "or its database or schema name holds a `.`,",
+        "A `.` inside a table name is no problem on CDC infrastructure deployed by version "
+        "0.1.589 or later; on CDC infrastructure deployed by an earlier version, Start CDC "
+        "refuses such a table too, until you untick it here or Delete CDC infrastructure and "
+        "deploy it again.",
+    ),
+    "ko": (
+        "데이터베이스나 스키마 이름 안에 `.`이 있거나,",
+        "테이블 이름 안의 `.`은 버전 0.1.589 이상이 배포한 CDC 인프라에서는 문제가 없습니다. 그 이전 "
+        "버전이 배포한 CDC 인프라에서는 여기서 선택을 해제하거나 Delete CDC infrastructure 후 다시 "
+        "배포할 때까지 Start CDC가 그런 테이블도 거부합니다.",
+    ),
+    "ja": (
+        "データベースまたはスキーマの名前の中に `.` を含む、",
+        "テーブル名の中の `.` は、バージョン 0.1.589 以降がデプロイした CDC インフラでは問題ありません。"
+        "それより前のバージョンがデプロイした CDC インフラでは、ここで選択を外すか、Delete CDC "
+        "infrastructure して再デプロイするまで、Start CDC がそのようなテーブルも拒否します。",
+    ),
+}
+_DOC_CH13_DOTTED_STALE = {
+    "en": "or a `.` inside one of those names",
+    "ko": "그 이름 안에 `.`이 있거나",
+    "ja": "それらの名前の中の `.` を含む",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_chapter_13_scopes_a_dot_inside_a_table_name_to_older_infrastructure(lang) -> None:
+    # FAILS WITHOUT THE FIX: the row listed a '.' inside any of the names among those CDC
+    # cannot stream, with untick as the only way on.
+    from tests.test_g25_docs import _flat, _has, _page
+
+    chapter = _page(lang, "13-excluding-tables-and-columns.md")
+    # Both phrases sit in the row that starts with the bold "A table whose name CDC cannot
+    # stream" (pinned above), after it.
+    row = chapter.index(_flat(lang, _DOC_FACTS[lang][1]))
+    for phrase in _DOC_CH13_DOTTED[lang]:
+        assert chapter.find(_flat(lang, phrase).strip(), row) > row, (lang, phrase)
+    assert not _has(lang, chapter, _DOC_CH13_DOTTED_STALE[lang]), lang
+
+
+# Chapter 2's findings reference lists CDC_TOPIC_NAME with the advice (Recommended), between
+# that block's heading and the incomplete-report paragraph after it -- not among the findings
+# that block the migration.
+_DOC_ADVICE_BLOCK = {
+    "en": ("**Advice only** (Recommended)", "**When the report is incomplete,**"),
+    "ko": ("**조언만** (Recommended)", "**리포트가 불완전하면,**"),
+    "ja": ("**助言のみ** (Recommended)", "**レポートが不完全なときは**"),
+}
+_DOC_ADVICE_CDC_TOPIC_NAME = {
+    "en": "- `CDC_TOPIC_NAME`: CDC cannot stream the table because of its Kafka topic name",
+    "ko": "- `CDC_TOPIC_NAME`: Kafka 토픽 이름 때문에 CDC가 그 테이블을 스트리밍할 수 없습니다",
+    "ja": "- `CDC_TOPIC_NAME`: Kafka のトピック名のために、CDC はそのテーブルをストリーミングできません",
+}
+_DOC_ADVICE_NOT_AFFECTED = {
+    "en": "A Full load only migration is not affected.",
+    "ko": "Full load only 마이그레이션에는 영향이 없습니다.",
+    "ja": "Full load only の移行には影響しません。",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_findings_reference_lists_cdc_topic_name_as_advice(lang) -> None:
+    # FAILS WITHOUT THE FIX: Evaluation reports CDC_TOPIC_NAME (Recommended), which the
+    # findings reference did not list.
+    from tests.test_g25_docs import _flat, _page
+
+    page = _page(lang, "02-evaluation-and-schema-conversion.md")
+    start, end = (page.index(_flat(lang, marker)) for marker in _DOC_ADVICE_BLOCK[lang])
+    entry = page.find(_flat(lang, _DOC_ADVICE_CDC_TOPIC_NAME[lang]))
+    assert start < entry < end, (lang, start, entry, end)
+    assert page.count("`CDC_TOPIC_NAME`") == 1, lang
+    assert _flat(lang, _DOC_ADVICE_NOT_AFFECTED[lang]) in page[entry:end], lang
+
+
+@pytest.mark.parametrize(
+    ("lang", "stale"), [("en", "tombstone"), ("ko", "tombstone"), ("ja", "トゥームストーン")])
+def test_chapter_4_does_not_say_the_sink_applies_tombstones(lang, stale) -> None:
+    # FAILS WITHOUT THE FIX: the sink table said a change is applied as an upsert, a delete
+    # "and Kafka tombstones"; from sink plugin v57 every tombstone is skipped (the delete before
+    # it is the delete).
+    from tests.test_g25_docs import _page
+
+    assert stale not in _page(lang, "04-cdc-and-dsql-constraints.md"), lang
+
+
+# ---------------------------------------------------------------------------
+# 7. This version bundles sink plugin v57, which streams a '.' inside a table name
+# ---------------------------------------------------------------------------
+
+
+def test_the_bundled_sink_plugin_reads_a_dot_inside_a_table_name() -> None:
+    # FAILS WITHOUT THE FIX: this version bundled sink plugin v56, so every stack it deployed
+    # was judged (and recorded) as one whose sink splits a qualified name at every '.'.
+    assert s3_provision.PLUGIN_VERSION == "v57"
+    assert plugin_reads_dotted_tables(s3_provision.PLUGIN_VERSION)
+    # The release is the gate's own version: an earlier bundle would refuse at every Deploy.
+    assert s3_provision.PLUGIN_VERSION == DOTTED_TABLE_MIN_PLUGIN_VERSION
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_this_versions_deploy_takes_a_dot_inside_a_table_name(engine) -> None:
+    # FAILS WITHOUT THE FIX: Deploy CDC infrastructure refused shop.orders.v2 (MySQL) and
+    # public."public.orders" (PostgreSQL) with the old-plugin fact naming v56. Not pinned: the
+    # plugin this version uploads, which the new stack records as its PluginVersion.
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    names = [f"{db}.orders", dotted]
+    params = _infra(engine, names, _counts(names))
+    assert topic_name_refusal(params.filled, sink_plugin=s3_provision.PLUGIN_VERSION) is None
+    handle = _FakeHandle()
+    _logs_seen, on_log = _logs()
+    deployer = _FakeDeployer(stack_statuses=("CREATE_IN_PROGRESS", "CREATE_COMPLETE"))
+    _run_infra(
+        handle, deployer, on_log, stack_name="dsql-cdc-shop", template_body="T",
+        params=params, create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert handle.job.error_count == 0
+    (_stack, created), = deployer.created
+    sent = dict(created)
+    assert sent["PluginVersion"] == s3_provision.PLUGIN_VERSION
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+
+
+def test_this_versions_deploy_surfaces_take_a_dot_inside_a_table_name() -> None:
+    # FAILS WITHOUT THE FIX: before any stack, the Deploy form and the Full Load card judged
+    # the bundled v56 and refused (or warned about) shop.orders.v2. Not pinned. A '.'/'_' pair
+    # it is in is still refused.
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    names, inv = _DOTTED_TABLE, _inventory(_DOTTED_TABLE)
+    assert _deploy_block_notice(_deploy_ready(names, FLC), _Jobs({}), inv, None) is None
+    assert _deploy_block_notice(_deploy_ready(names), _Jobs({}), inv, None) is None
+    assert pre_load_topic_name_warning(_state(names), _Jobs({}), None, inv) is None
+    pair = [*names, "shop.orders_v2"]
+    header, body = _deploy_block_notice(_deploy_ready(pair), _Jobs({}), _inventory(pair), None)
+    assert header == CDC_TOPIC_NAME_HEADER
+    assert body.startswith(
+        "CDC cannot stream shop.orders.v2 together with shop.orders_v2: Kafka does not allow "
+        "two topics whose names differ only in a '.' against a '_'"), body
+
+
+def test_the_plugin_history_records_v57() -> None:
+    # FAILS WITHOUT THE FIX: s3_provision's PLUGIN_VERSION history, which lists every bump, had
+    # no v57: what changed in the sink and seeder ZIPs, and that Delete + Deploy picks it up.
+    source = pathlib.Path(s3_provision.__file__).read_text(encoding="utf-8")
+    history = " ".join(source.replace("#", " ").split())
+    note = history.split("v57 (dotted table names):", 1)[1].split('PLUGIN_VERSION = "v57"', 1)[0]
+    for fact in (
+        "the sink reads a qualified table name at its FIRST '.'",
+        "or one with no source.table, is dead-lettered",
+        "every Debezium tombstone is skipped",
+        "the seeder Lambda names a topic Kafka refused",
+        "No config key, template property or Start CDC change",
+        "Debezium ZIPs and the sink's version() string are unchanged",
+        "Start CDC and Retry CDC refuse such a table, naming that plugin",
+        "a live cdc-stack needs Delete + Deploy CDC infrastructure to pick up v57",
+        "MySQL re-reads from the watermark; the PostgreSQL slot is recreated",
+        "Streaming both tables of a '.'/'_' pair is deferred",
+    ):
+        assert fact in note, fact
