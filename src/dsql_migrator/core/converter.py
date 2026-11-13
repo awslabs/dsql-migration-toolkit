@@ -7143,6 +7143,167 @@ def _object_reimplementation_warnings(
     return warnings
 
 
+def _pg_column_type_warnings(
+    table: TableDef, *, identity_key: "Optional[str]"
+) -> "list[ConversionWarning]":
+    """The notes on a PostgreSQL source table's column types, in column order: a
+    converted ENUM, a substituted type, a type Aurora DSQL does not support, a character
+    or numeric type clamped to DSQL's limits, a bare numeric stored at numeric(18,6).
+    ``identity_key`` is the key the identity strategy makes a bigint identity, which
+    gets no numeric note. :meth:`SchemaConverter.convert_table` adds them for a
+    PostgreSQL source."""
+    from dsql_migrator.core.converter_postgres import (
+        clamp_pg_character,
+        clamp_pg_numeric,
+        substitute_pg_unsupported_type,
+        pg_column_default_sql,
+        unconstrained_numeric_note,
+        unsupported_dsql_reason,
+    )
+
+    warnings: list[ConversionWarning] = []
+    for column in table.columns:
+        # A converted ENUM is no longer unsupported: it lands as text with a CHECK
+        # over the same labels, so it must not be graded UNSUPPORTED alongside the
+        # types that genuinely cannot be migrated -- it is a type CHANGE the
+        # application has to know about, which is MANUAL.
+        if column.type_kind == "enum" and column.enum_labels:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type="text",
+                    classification=Classification.MANUAL,
+                    # Leads with WHAT HAPPENED, not with "DSQL cannot": the
+                    # conversion succeeds and the value domain is kept, so a
+                    # message that opens on the negative reads in the losses list
+                    # as if the column had failed.
+                    message=(
+                        f"Column '{column.name}' was converted from the "
+                        f"user-defined ENUMERATED type '{column.mysql_type}' to "
+                        "text with a CHECK that preserves the SAME allowed values "
+                        "(" + ", ".join(column.enum_labels) + ")"
+                        + (
+                            ", and its DEFAULT is carried over as a text literal"
+                            if column.default
+                            else ""
+                        )
+                        + ". Aurora DSQL has no CREATE TYPE, so the type itself "
+                        "cannot exist there; this is the faithful port and it is "
+                        "what the MySQL ENUM path does too. Two things DO change "
+                        "for the application. Ordering and comparison are now "
+                        "TEXT: an enum sorted in DECLARATION order (the order "
+                        "above, which is not alphabetical), so any ORDER BY or "
+                        "range predicate on this column changes — sort on an "
+                        "explicit ranking if that order mattered. And adding a "
+                        "value later is ALTER TABLE ... DROP CONSTRAINT, then ADD "
+                        "CONSTRAINT ... CHECK (...) NOT VALID (one statement per "
+                        "transaction; Aurora DSQL adds a CHECK only as NOT VALID) "
+                        "rather than ALTER TYPE ... ADD VALUE."
+                    ),
+                )
+            )
+            continue
+        # A type the converter SUBSTITUTES is no longer unsupported: the emitted
+        # DDL applies and the loader reads the value into the new type, so grading
+        # it UNSUPPORTED alongside the types that genuinely cannot be migrated was
+        # both wrong and the reason the apply failed ("datatype text[] not
+        # supported") on a remodel the tool itself recommended.
+        substituted, substitute_note = substitute_pg_unsupported_type(
+            column.mysql_type, type_kind=column.type_kind
+        )
+        if substituted is not None and substitute_note is not None:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type=substituted,
+                    classification=Classification.MANUAL,
+                    message=substitute_note,
+                )
+            )
+            continue
+        reason = unsupported_dsql_reason(
+            column.mysql_type,
+            type_kind=column.type_kind,
+            enum_labels=column.enum_labels,
+        )
+        if reason is not None:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type=column.mysql_type,
+                    classification=Classification.UNSUPPORTED,
+                    message=reason,
+                )
+            )
+            continue
+        # A character column whose DECLARED LENGTH exceeds DSQL's ceiling
+        # (varchar 65535 / char 4096 bytes, live-verified) is emitted as text
+        # instead -- without this the whole CREATE TABLE is rejected at apply
+        # ("Datatype limit greater than 65535 bytes not supported for varchar")
+        # and nothing had warned. Checked BEFORE the numeric clamp: the two are
+        # mutually exclusive, and this one changes the type, not just its modifier.
+        char_clamped, char_note = clamp_pg_character(column.mysql_type)
+        if char_note is not None:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type=char_clamped,
+                    classification=Classification.MANUAL,
+                    message=char_note,
+                )
+            )
+            continue
+        # A supported numeric whose precision/scale exceeds DSQL's 1000 is clamped
+        # in the emitted DDL (converter_postgres._ddl_column_type); surface the
+        # lossy reduction here so it is not a silent range/scale change. Mirrors the
+        # MySQL DECIMAL clamp warning.
+        # The key the identity strategy makes bigint is no numeric any more: its
+        # own narrowing note says what that costs (a numeric(18,6) note would sit
+        # beside a BIGINT DDL and advise a type that removes the identity).
+        if column.name == identity_key:
+            continue
+        clamped, clamp_note = clamp_pg_numeric(column.mysql_type)
+        if clamp_note is not None:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type=clamped,
+                    classification=Classification.MANUAL,
+                    message=clamp_note,
+                )
+            )
+            continue
+        # A bare `numeric`/`decimal` (no declared precision) is stored by DSQL at
+        # its default numeric(18,6): a value beyond 6 fractional digits is rounded
+        # on load. Surface it so this is not a SILENT precision loss (Property 6) --
+        # Validation compares such a column at scale 6 (validation_sql), a schema
+        # decision that must be visible here, not hidden. Mutually exclusive with the
+        # clamp warning above (a bare numeric has no declared precision to clamp).
+        bare_note = unconstrained_numeric_note(column.mysql_type)
+        if bare_note is not None:
+            warnings.append(
+                ConversionWarning(
+                    object_name=table.name,
+                    column_name=column.name,
+                    source_type=column.mysql_type,
+                    target_type="numeric(18,6)",
+                    classification=Classification.MANUAL,
+                    message=bare_note,
+                )
+            )
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 # Converter
 # ---------------------------------------------------------------------------
@@ -7371,154 +7532,7 @@ class SchemaConverter:
         # needs the Full Load value path), so the DDL keeps the faithful source type and
         # the user is told to remodel before applying. Property 6 (no silent loss).
         if is_postgres:
-            from dsql_migrator.core.converter_postgres import (
-                clamp_pg_character,
-                clamp_pg_numeric,
-                substitute_pg_unsupported_type,
-                pg_column_default_sql,
-                unconstrained_numeric_note,
-                unsupported_dsql_reason,
-            )
-
-            for column in table.columns:
-                # A converted ENUM is no longer unsupported: it lands as text with a CHECK
-                # over the same labels, so it must not be graded UNSUPPORTED alongside the
-                # types that genuinely cannot be migrated -- it is a type CHANGE the
-                # application has to know about, which is MANUAL.
-                if column.type_kind == "enum" and column.enum_labels:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type="text",
-                            classification=Classification.MANUAL,
-                            # Leads with WHAT HAPPENED, not with "DSQL cannot": the
-                            # conversion succeeds and the value domain is kept, so a
-                            # message that opens on the negative reads in the losses list
-                            # as if the column had failed.
-                            message=(
-                                f"Column '{column.name}' was converted from the "
-                                f"user-defined ENUMERATED type '{column.mysql_type}' to "
-                                "text with a CHECK that preserves the SAME allowed values "
-                                "(" + ", ".join(column.enum_labels) + ")"
-                                + (
-                                    ", and its DEFAULT is carried over as a text literal"
-                                    if column.default
-                                    else ""
-                                )
-                                + ". Aurora DSQL has no CREATE TYPE, so the type itself "
-                                "cannot exist there; this is the faithful port and it is "
-                                "what the MySQL ENUM path does too. Two things DO change "
-                                "for the application. Ordering and comparison are now "
-                                "TEXT: an enum sorted in DECLARATION order (the order "
-                                "above, which is not alphabetical), so any ORDER BY or "
-                                "range predicate on this column changes — sort on an "
-                                "explicit ranking if that order mattered. And adding a "
-                                "value later is ALTER TABLE ... DROP CONSTRAINT, then ADD "
-                                "CONSTRAINT ... CHECK (...) NOT VALID (one statement per "
-                                "transaction; Aurora DSQL adds a CHECK only as NOT VALID) "
-                                "rather than ALTER TYPE ... ADD VALUE."
-                            ),
-                        )
-                    )
-                    continue
-                # A type the converter SUBSTITUTES is no longer unsupported: the emitted
-                # DDL applies and the loader reads the value into the new type, so grading
-                # it UNSUPPORTED alongside the types that genuinely cannot be migrated was
-                # both wrong and the reason the apply failed ("datatype text[] not
-                # supported") on a remodel the tool itself recommended.
-                substituted, substitute_note = substitute_pg_unsupported_type(
-                    column.mysql_type, type_kind=column.type_kind
-                )
-                if substituted is not None and substitute_note is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type=substituted,
-                            classification=Classification.MANUAL,
-                            message=substitute_note,
-                        )
-                    )
-                    continue
-                reason = unsupported_dsql_reason(
-                    column.mysql_type,
-                    type_kind=column.type_kind,
-                    enum_labels=column.enum_labels,
-                )
-                if reason is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type=column.mysql_type,
-                            classification=Classification.UNSUPPORTED,
-                            message=reason,
-                        )
-                    )
-                    continue
-                # A character column whose DECLARED LENGTH exceeds DSQL's ceiling
-                # (varchar 65535 / char 4096 bytes, live-verified) is emitted as text
-                # instead -- without this the whole CREATE TABLE is rejected at apply
-                # ("Datatype limit greater than 65535 bytes not supported for varchar")
-                # and nothing had warned. Checked BEFORE the numeric clamp: the two are
-                # mutually exclusive, and this one changes the type, not just its modifier.
-                char_clamped, char_note = clamp_pg_character(column.mysql_type)
-                if char_note is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type=char_clamped,
-                            classification=Classification.MANUAL,
-                            message=char_note,
-                        )
-                    )
-                    continue
-                # A supported numeric whose precision/scale exceeds DSQL's 1000 is clamped
-                # in the emitted DDL (converter_postgres._ddl_column_type); surface the
-                # lossy reduction here so it is not a silent range/scale change. Mirrors the
-                # MySQL DECIMAL clamp warning.
-                # The key the identity strategy makes bigint is no numeric any more: its
-                # own narrowing note says what that costs (a numeric(18,6) note would sit
-                # beside a BIGINT DDL and advise a type that removes the identity).
-                if column.name == identity_key:
-                    continue
-                clamped, clamp_note = clamp_pg_numeric(column.mysql_type)
-                if clamp_note is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type=clamped,
-                            classification=Classification.MANUAL,
-                            message=clamp_note,
-                        )
-                    )
-                    continue
-                # A bare `numeric`/`decimal` (no declared precision) is stored by DSQL at
-                # its default numeric(18,6): a value beyond 6 fractional digits is rounded
-                # on load. Surface it so this is not a SILENT precision loss (Property 6) --
-                # Validation compares such a column at scale 6 (validation_sql), a schema
-                # decision that must be visible here, not hidden. Mutually exclusive with the
-                # clamp warning above (a bare numeric has no declared precision to clamp).
-                bare_note = unconstrained_numeric_note(column.mysql_type)
-                if bare_note is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            object_name=table.name,
-                            column_name=column.name,
-                            source_type=column.mysql_type,
-                            target_type="numeric(18,6)",
-                            classification=Classification.MANUAL,
-                            message=bare_note,
-                        )
-                    )
+            warnings.extend(_pg_column_type_warnings(table, identity_key=identity_key))
 
             # PostgreSQL column DEFAULTs ARE carried to the target, verbatim
             # (_apply_pg_column_defaults attaches the source text; nothing re-renders it).
