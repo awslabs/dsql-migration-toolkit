@@ -1019,6 +1019,129 @@ def _hint_notes(rule, resolved, scope_counts, source_type) -> "list[str]":
     return notes
 
 
+# ---------------------------------------------------------------------------
+# The matching phase (A12)
+# ---------------------------------------------------------------------------
+
+
+class _TypeKeys:
+    """``(table, column) -> rule type name`` over the migratable tables, computed at most
+    once and only when something asks (a rule set with no type rule never pays for it).
+    Replaces the memoizing closure resolve_exclusion_rules held, so the matching phase and
+    the per-line status that follows it share ONE index."""
+
+    __slots__ = ("_tables", "_order", "_split", "_source_type", "_keys")
+
+    def __init__(self, tables: dict, order: list, split: dict, source_type: SourceType) -> None:
+        self._tables = tables
+        self._order = order
+        self._split = split
+        self._source_type = source_type
+        self._keys: Optional[dict] = None
+
+    def __call__(self) -> dict:
+        if self._keys is None:
+            self._keys = {
+                (name, column.name): rule_type_name(column, self._source_type)
+                for name in self._order if name in self._split
+                for column in self._tables[name].columns
+            }
+        return self._keys
+
+
+class _RuleMatches:
+    """What each rule line matches, before any of it is judged.
+
+    ``tables`` / ``columns`` map a line to the migratable tables (or ``(table, column)``
+    pairs) its parts match -- a type line's hits land in ``columns`` too -- ``types`` maps a
+    type line to the ``{written name: type key}`` it resolved, and ``errors`` holds the E2
+    misses the matching itself found, per line."""
+
+    __slots__ = ("tables", "columns", "types", "errors")
+
+    def __init__(self, tables: dict, columns: dict, types: dict, errors: dict) -> None:
+        self.tables = tables
+        self.columns = columns
+        self.types = types
+        self.errors = errors
+
+
+def _match_rules(
+    rules: dict,
+    source_lines: "Sequence[str]",
+    *,
+    tables: dict,
+    order: list,
+    split: dict,
+    source_type: SourceType,
+    type_keys: _TypeKeys,
+) -> _RuleMatches:
+    """Match every parsed rule line against the universe; judge nothing. Pure.
+
+    The first phase of :func:`resolve_exclusion_rules`, extracted whole (A12): per line, a
+    type line resolves each written type name against the keys that exist here (a name that
+    matches none is E2, a space-separated list is its own E2) and takes the columns of the
+    keys it resolved; a table or column line takes the tables (or table/column pairs) its
+    parts match, and a line matching nothing anywhere is E2. Nothing here reads the
+    selection, the lock or the context: include-wins, scope, eligibility and the per-line
+    status are the caller's, over what this returns.
+    """
+    table_hits: dict[int, list[str]] = {}
+    column_hits: dict[int, list[tuple[str, str]]] = {}
+    type_resolved: dict[int, dict[str, str]] = {}
+    errors: dict[int, list[RuleError]] = {}
+    for line, rule in sorted(rules.items()):
+        line_text = source_lines[line - 1]
+        if rule.kind == "type":
+            keys = type_keys()
+            key_counts: dict[str, int] = {}
+            for key in keys.values():
+                key_counts[key] = key_counts.get(key, 0) + 1
+            resolved: dict[str, str] = {}
+            for index, typed in enumerate(rule.type_names):
+                words = typed.text.split()
+                if (len(words) > 1 and typed.text not in key_counts
+                        and all(resolve_type_name(w, key_counts, source_type) is not None
+                                or (source_type is SourceType.MYSQL
+                                    and w.lower() in _MYSQL_LOB_TYPE_NAMES)
+                                for w in words)):
+                    # "longtext longblob" is a list typed with a space, not one type: on
+                    # MySQL the space cut would silently match only the first word.
+                    errors.setdefault(line, []).append(
+                        _type_list_miss(line, index, typed, line_text, words))
+                    continue
+                key = resolve_type_name(typed.text, key_counts, source_type)
+                if key is None:
+                    errors.setdefault(line, []).append(
+                        _type_miss(line, index, typed, line_text, key_counts, source_type))
+                else:
+                    resolved[typed.text] = key
+            wanted = set(resolved.values())
+            hits = [item for item, key in keys.items() if key in wanted]
+            if hits:
+                column_hits[line] = hits
+                type_resolved[line] = resolved
+            continue
+        matchers = [_part_matcher(p) for p in rule.parts]
+        if rule.kind == "table":
+            match_schema, match_table = matchers
+            hits_t = [n for n in order if n in split
+                      and match_schema(split[n][0]) and match_table(split[n][1])]
+            if hits_t:
+                table_hits[line] = hits_t
+        else:
+            match_schema, match_table, match_column = matchers
+            hits_c = [(n, column.name) for n in order if n in split
+                      and match_schema(split[n][0]) and match_table(split[n][1])
+                      for column in tables[n].columns if match_column(column.name)]
+            if hits_c:
+                column_hits[line] = hits_c
+        if line not in table_hits and line not in column_hits:
+            errors.setdefault(line, []).append(
+                _name_miss(line, rule, line_text, order, split, tables))
+    return _RuleMatches(table_hits, column_hits, type_resolved, errors)
+
+
 def resolve_exclusion_rules(
     text: str,
     *,
@@ -1100,70 +1223,15 @@ def resolve_exclusion_rules(
         schema, sep, rest = name.partition(".")
         if sep:
             split[name] = (schema, rest)
-    type_keys: Optional[dict] = None
-
-    def _type_keys() -> dict:
-        nonlocal type_keys
-        if type_keys is None:
-            type_keys = {
-                (name, column.name): rule_type_name(column, source_type)
-                for name in order if name in split
-                for column in tables[name].columns
-            }
-        return type_keys
-
-    table_hits: dict[int, list[str]] = {}
-    column_hits: dict[int, list[tuple[str, str]]] = {}
-    type_resolved: dict[int, dict[str, str]] = {}
-    for line, rule in sorted(rules.items()):
-        line_text = source_lines[line - 1]
-        if rule.kind == "type":
-            keys = _type_keys()
-            key_counts: dict[str, int] = {}
-            for key in keys.values():
-                key_counts[key] = key_counts.get(key, 0) + 1
-            resolved: dict[str, str] = {}
-            for index, typed in enumerate(rule.type_names):
-                words = typed.text.split()
-                if (len(words) > 1 and typed.text not in key_counts
-                        and all(resolve_type_name(w, key_counts, source_type) is not None
-                                or (source_type is SourceType.MYSQL
-                                    and w.lower() in _MYSQL_LOB_TYPE_NAMES)
-                                for w in words)):
-                    # "longtext longblob" is a list typed with a space, not one type: on
-                    # MySQL the space cut would silently match only the first word.
-                    errors.setdefault(line, []).append(
-                        _type_list_miss(line, index, typed, line_text, words))
-                    continue
-                key = resolve_type_name(typed.text, key_counts, source_type)
-                if key is None:
-                    errors.setdefault(line, []).append(
-                        _type_miss(line, index, typed, line_text, key_counts, source_type))
-                else:
-                    resolved[typed.text] = key
-            wanted = set(resolved.values())
-            hits = [item for item, key in keys.items() if key in wanted]
-            if hits:
-                column_hits[line] = hits
-                type_resolved[line] = resolved
-            continue
-        matchers = [_part_matcher(p) for p in rule.parts]
-        if rule.kind == "table":
-            match_schema, match_table = matchers
-            hits_t = [n for n in order if n in split
-                      and match_schema(split[n][0]) and match_table(split[n][1])]
-            if hits_t:
-                table_hits[line] = hits_t
-        else:
-            match_schema, match_table, match_column = matchers
-            hits_c = [(n, column.name) for n in order if n in split
-                      and match_schema(split[n][0]) and match_table(split[n][1])
-                      for column in tables[n].columns if match_column(column.name)]
-            if hits_c:
-                column_hits[line] = hits_c
-        if line not in table_hits and line not in column_hits:
-            errors.setdefault(line, []).append(
-                _name_miss(line, rule, line_text, order, split, tables))
+    _type_keys = _TypeKeys(tables, order, split, source_type)
+    matched = _match_rules(
+        rules, source_lines, tables=tables, order=order, split=split,
+        source_type=source_type, type_keys=_type_keys,
+    )
+    table_hits, column_hits, type_resolved = matched.tables, matched.columns, matched.types
+    for line, found in matched.errors.items():
+        # After this line's parse errors, as the one pass that produced both did.
+        errors.setdefault(line, []).extend(found)
 
     def _by_action(hits_by_line: dict, action: str) -> dict:
         found: dict = {}
