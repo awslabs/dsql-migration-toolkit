@@ -39,6 +39,7 @@ from dsql_migrator.core.cdc import (
     ConnectorStatus,
     build_cdc_status_view,
     cdc_expected_connector_names,
+    unescape_include_entry,
 )
 from dsql_migrator.core.job_manager import JobManager, JobNotFoundError
 from dsql_migrator.core.target_connection import DsqlConnector
@@ -1472,13 +1473,15 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
     # ADOPTED / out-of-band pipeline resolves its tables even when this session
     # holds no watermark or in-session selection. Empty when the stack is absent
     # or carries no such param (fresh infra) -- the normal config path then applies.
+    # Each entry is read back as the table it captures: Start CDC escapes a '.' inside a
+    # table name (core.cdc.table_include_entry, shop\.orders\.v2).
     includes_raw = (
         (getattr(discovery, "current_parameters", None) or {}).get("TableIncludeList", "")
         if discovery is not None
         else ""
     )
     migration_state.set_cdc_reconciled_table_names(
-        [n for n in includes_raw.split(",") if n.strip()]
+        [unescape_include_entry(n) for n in includes_raw.split(",") if n.strip()]
     )
     # The DEPLOYED PostgreSQL slot name, from the SAME describe, so the slot-health read
     # looks at the slot the connector actually holds instead of re-deriving a name from a
@@ -1534,7 +1537,9 @@ def _probe_cdc_stack_phase(migration_state, session) -> None:
             if candidate is not None
             else ""
         )
-        candidate_tables[name] = [n.strip() for n in raw.split(",") if n.strip()]
+        candidate_tables[name] = [
+            unescape_include_entry(n.strip()) for n in raw.split(",") if n.strip()
+        ]
     migration_state.set_cdc_other_stack_tables(candidate_tables)
 
 

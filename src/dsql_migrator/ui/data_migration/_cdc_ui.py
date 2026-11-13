@@ -4078,12 +4078,16 @@ def _render_cdc_start_button(
             _tables_refusal, migration_state, job_manager,
             _table_lock(migration_state, job_manager, session),
         )
-    # ...and each captured table's name must be one CDC can stream.
-    _topic_refusal = cdc_topic_name_refusal([t.name for t in _captured_now])
+    # ...and each captured table's name must be one CDC can stream, judged for the deployed
+    # stack's sink plugin (Start CDC keeps it).
+    _topic_refusal = cdc_topic_name_refusal(
+        [t.name for t in _captured_now],
+        **_topic_name_context(migration_state, deploy=False),
+    )
     if _topic_refusal:
         _topic_refusal = _topic_name_hold_remedy(
             _topic_refusal, migration_state, job_manager,
-            _table_lock(migration_state, job_manager, session),
+            _table_lock(migration_state, job_manager, session), deploy=False,
         )
     # A source column the target certainly lacks: the sink would dead-letter every change
     # to it (42703). Checked HERE as well as at Deploy, because Attach (which moves no data)
@@ -4765,11 +4769,12 @@ def _deploy_block_notice(
       reads the source's at the click, so only the two lists every deploy sends are held
       here; the plan's worst case is a warning (:func:`_deploy_partition_map_warning`). Its
       remedy: :func:`_deploy_table_list_refused`;
-    * with ``include_capture`` too, a captured table whose name CDC cannot stream -- a
-      character Kafka refuses in a topic name or a '.' inside its database, schema or table
-      name, or two names that differ only in a '.' against a '_'
-      (:func:`cdc_topic_name_refusal`) -- with the remedy of
-      :func:`_deploy_topic_name_refused`.
+    * with ``include_capture`` too, a captured table whose name CDC cannot stream on the
+      stack this deploy creates, whose sink plugin is the one this version bundles -- a
+      character Kafka refuses in a topic name, a table of a database or schema whose name
+      holds a '.', or two names that differ only in a '.' against a '_'
+      (:func:`cdc_topic_name_refusal`, with :func:`_topic_name_context`) -- with the remedy
+      of :func:`_deploy_topic_name_refused`.
 
     Attach passes ``include_missing=False, include_capture=False``: attaching moves no data
     and changes no DDL; it only locks the card, so only the saved-entry check applies.
@@ -4809,7 +4814,7 @@ def _deploy_block_notice(
             CDC_TABLE_LIST_HEADER,
             _deploy_table_list_refused(refusal, migration_state, job_manager, session),
         )
-    refusal = cdc_topic_name_refusal(names)
+    refusal = cdc_topic_name_refusal(names, **_topic_name_context(migration_state, deploy=True))
     if refusal:
         return (
             CDC_TOPIC_NAME_HEADER,
@@ -4904,6 +4909,36 @@ def _table_list_hold_remedy(refusal: str, migration_state, job_manager, lock) ->
     )
 
 
+def _topic_name_context(migration_state, *, deploy: bool) -> "dict[str, object]":
+    """The keywords of every topic-name check of the CDC step
+    (:func:`cdc_topic_name_refusal`, :func:`cdc_topic_name_refused`,
+    :func:`cdc_pre_load_topic_name_warning`): who the capture is judged for. Pure apart from
+    the state read.
+
+    - ``sink_plugin``: with ``deploy`` (Deploy CDC infrastructure; before the load, while no
+      stack is deployed or this session's deploy is creating one), the plugin this version
+      bundles (core.s3_provision PLUGIN_VERSION): the deploy uploads it and records it as the
+      new stack's PluginVersion. Otherwise (Start CDC, Retry CDC) the deployed stack's PluginVersion, read
+      by the stack-phase probe (``cdc_deployed_plugin_version``): Start CDC never re-registers
+      the plugins. Not read (``None``) is judged as the oldest, as the core backstop judges a
+      stack with no PluginVersion. Attach sends no parameter; the Start that follows judges
+      the attached stack's plugin.
+    - ``dotted_schema_tables``: the tables Evaluation reported DOTTED_SCHEMA_NAME on
+      (``cdc_dotted_schema_tables``, set on every Data Migration render; ``None`` without an
+      Evaluation report).
+    """
+    if deploy:
+        from dsql_migrator.core.s3_provision import PLUGIN_VERSION
+
+        sink_plugin: object = PLUGIN_VERSION
+    else:
+        sink_plugin = getattr(migration_state, "cdc_deployed_plugin_version", None)
+    return {
+        "sink_plugin": sink_plugin,
+        "dotted_schema_tables": getattr(migration_state, "cdc_dotted_schema_tables", None),
+    }
+
+
 def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, session) -> str:
     """A Deploy CDC infrastructure topic-name refusal with its remedy, as
     :func:`_deploy_table_list_refused` says a table-list one: before a Full load + CDC load,
@@ -4927,19 +4962,25 @@ def _deploy_topic_name_refused(refusal: str, migration_state, job_manager, sessi
             split=mysql_reads_may_split(session_source_type(session)),
             dotted_schema=CDC_TOPIC_NAME_DOTTED_SCHEMA in fact,
         )
-    return _topic_name_hold_remedy(refusal, migration_state, job_manager, lock)
+    return _topic_name_hold_remedy(refusal, migration_state, job_manager, lock, deploy=True)
 
 
-def _topic_name_hold_remedy(refusal: str, migration_state, job_manager, lock) -> str:
+def _topic_name_hold_remedy(
+    refusal: str, migration_state, job_manager, lock, *, deploy: bool
+) -> str:
     """A topic-name refusal after the load with the table picker's remedy (``lock`` is its
     lock reason), as Deploy, Start CDC and Retry CDC say it. A refused table the Full Load
     read in parts that still waits for CDC's replay (G137) is named as one that cannot be
     deselected yet (:func:`~dsql_migrator.ui.data_migration._models.topic_name_hold_remedy`).
     Those tables are judged on their own, on purpose: of two names that differ only in a '.'
     against a '_', one read in parts is named only when the other is too -- otherwise the
-    other can be deselected."""
+    other can be deselected. They are judged as the refusal is (``deploy``:
+    :func:`_topic_name_context`), so a table the refusal does not name is never named here."""
     job = _current_job(job_manager, getattr(migration_state, "job_id", None))
-    _split = cdc_topic_name_refused(_captured_split_tables(migration_state, job))
+    _split = cdc_topic_name_refused(
+        _captured_split_tables(migration_state, job),
+        **_topic_name_context(migration_state, deploy=deploy),
+    )
     return topic_name_hold_remedy(
         refusal, lock, _split,
         split_route_view(migration_state, job_manager, job) if _split else job,
@@ -9114,9 +9155,13 @@ def _start_cdc_deploy(
             ),
         )
         return
-    # ...and each captured table's name must be one CDC can stream -- refused before the
-    # submit below stamps the CDC operations window, which fixes the table set (G16).
-    _topic_refusal = cdc_topic_name_refusal([t.name for t in tables_for_config])
+    # ...and each captured table's name must be one CDC can stream on the deployed stack's
+    # sink plugin -- refused before the submit below stamps the CDC operations window, which
+    # fixes the table set (G16).
+    _topic_refusal = cdc_topic_name_refusal(
+        [t.name for t in tables_for_config],
+        **_topic_name_context(migration_state, deploy=False),
+    )
     if _topic_refusal:
         render_notice(
             ui,
@@ -9124,7 +9169,7 @@ def _start_cdc_deploy(
             header=CDC_TOPIC_NAME_HEADER,
             body=_topic_name_hold_remedy(
                 _topic_refusal, migration_state, job_manager,
-                _table_lock(migration_state, job_manager, session),
+                _table_lock(migration_state, job_manager, session), deploy=False,
             ),
         )
         return
@@ -9928,8 +9973,11 @@ async def _start_cdc_infra_deploy(
     _deploy_row_counts = None
     _tables_refusal = cdc_table_list_refusal(_captured_names, deploy=False)
     if not _tables_refusal:
-        # A table name CDC cannot stream: refused before the source is read too.
-        _topic_refusal = cdc_topic_name_refusal(_captured_names)
+        # A table name CDC cannot stream on the stack this deploy creates (the bundled sink
+        # plugin): refused before the source is read too.
+        _topic_refusal = cdc_topic_name_refusal(
+            _captured_names, **_topic_name_context(migration_state, deploy=True)
+        )
         if _topic_refusal:
             ui.notify(  # type: ignore[attr-defined]
                 _deploy_topic_name_refused(_topic_refusal, migration_state, job_manager, session),

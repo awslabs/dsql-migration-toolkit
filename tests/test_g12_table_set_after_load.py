@@ -751,7 +751,8 @@ def _screen(monkeypatch, *, job, selected, pg=False):
         sessions, "s1", job_manager=jobs, eval_store=evals, migration_store=migrations,
         conv_store=convs,
     )
-    return SimpleNamespace(content=content, ui=ui, session=session, state=state, jobs=jobs)
+    return SimpleNamespace(content=content, ui=ui, session=session, state=state, jobs=jobs,
+                           evals=evals)
 
 
 def _loaded():
