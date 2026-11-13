@@ -1439,7 +1439,8 @@ def test_the_cdc_only_hand_repair_says_which_key_values_the_card_withholds(lang:
     # The code is read first.
     sink = " ".join(_SINK_TASK.read_text(encoding="utf-8").split())
     assert 'isSurrogate(v) ? String.valueOf(v) : "<withheld>"' in sink
-    monitoring = (ROOT / "src/dsql_migrator/ui/data_migration/_cdc_monitoring.py").read_text(
+    # The card's key-value text moved with the drift copy to _cdc_drift_fix.py (cdcui-8).
+    monitoring = (ROOT / "src/dsql_migrator/ui/data_migration/_cdc_drift_fix.py").read_text(
         encoding="utf-8"
     )
     assert "shows a key value only when it is an integer or a " in monitoring

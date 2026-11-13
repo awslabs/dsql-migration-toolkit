@@ -32537,7 +32537,7 @@ def test_the_screen_wires_the_replica_identity_handles(monkeypatch) -> None:
 
 def _g2_tones(monkeypatch):
     """Record (tone, header, body) of every notice the CDC monitor draws."""
-    from dsql_migrator.ui.data_migration import _cdc_monitoring
+    from dsql_migrator.ui.data_migration import _cdc_drift_fix, _cdc_monitoring
 
     seen: list = []
     real = _cdc_monitoring.render_notice
@@ -32546,7 +32546,9 @@ def _g2_tones(monkeypatch):
         seen.append((kw.get("tone"), kw.get("header"), kw.get("body", "")))
         return real(ui, **kw)
 
-    monkeypatch.setattr(_cdc_monitoring, "render_notice", _notice)
+    # The Fix target schema dialog reads render_notice in _cdc_drift_fix (cdcui-8).
+    for module in (_cdc_monitoring, _cdc_drift_fix):
+        monkeypatch.setattr(module, "render_notice", _notice)
     return seen
 
 

@@ -833,7 +833,7 @@ def _kind_label(kind: str) -> str:
     if kind == OVERSIZED_VALUE_KIND:
         return _OVERSIZED_LABEL
     try:
-        from dsql_migrator.ui.data_migration._cdc_monitoring import _DRIFT_LABELS
+        from dsql_migrator.ui.data_migration._cdc_drift_fix import _DRIFT_LABELS
     except Exception:  # noqa: BLE001 - copy only
         return kind
     return _DRIFT_LABELS.get(kind, (kind, ""))[0]
