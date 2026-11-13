@@ -594,6 +594,25 @@ def stack_has_seeder_lambda(
     return (seed_mode or "lambda").strip().lower() == "lambda"
 
 
+def cdc_start_seed_mode(source_type: SourceType, host_seed_mode: str) -> str:
+    """Engine-aware CDC-Start SeedMode -- ONE source of truth shared with the infra build. Pure.
+
+    A PostgreSQL cdc-stack is ALWAYS created ``SeedMode=External`` (no in-VPC offset-seeder
+    Lambda; it resumes from a logical replication slot, and ``build_pg_cdc_infra_params``
+    hard-codes ``seed_mode="external"``). The External path does its Kafka prep -- creating
+    the pinned offset / DLQ / per-table data topics + seeding the offset -- **in-process at
+    Start** (``run_cdc_start``'s ``if seed_mode == "external"`` branch). So Start MUST also
+    use ``"external"`` for a PostgreSQL source, derived from the SOURCE ENGINE and NOT from
+    the host's ``cdc_seed_mode``: on a host whose ``cdc_seed_mode`` is the default (not
+    external) that branch would be skipped, the topics never created, and PG CDC never
+    streams. MySQL keeps deriving from the host config (the in-VPC EC2 host sets
+    ``external``; Fargate/local -> ``lambda``), so MySQL behavior is unchanged.
+    """
+    if source_type is SourceType.POSTGRES:
+        return "external"
+    return host_seed_mode
+
+
 def classify_schema_drift(
     error_code: Optional[str], message: Optional[str] = None
 ) -> Optional[SchemaDriftKind]:
@@ -3076,7 +3095,7 @@ def msk_seed_admission(
 ) -> MskSeedAdmission:
     """Decide the External-seed admission from facts only -- no probes, no AWS calls.
 
-    ``seed_mode`` is the RESOLVED mode for this migration (``_cdc_start_seed_mode``),
+    ``seed_mode`` is the RESOLVED mode for this migration (``cdc_start_seed_mode``),
     not the host default: keying on it rather than on the source engine is what keeps
     the in-VPC EC2 host's MySQL migrations working, because that host runs the
     in-process seed for MySQL too.

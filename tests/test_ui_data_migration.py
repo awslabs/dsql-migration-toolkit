@@ -3942,6 +3942,15 @@ def test_cdc_start_seed_mode_is_engine_aware() -> None:
     assert _cdc_start_seed_mode(SourceType.MYSQL, "external") == "external"
 
 
+def test_cdc_start_seed_mode_ui_name_is_the_core_rule() -> None:
+    # cdccore-3: the rule lives in core (core.cdc.cdc_start_seed_mode); the UI name the
+    # callers and the live harness import is that function, not a copy.
+    from dsql_migrator.core.cdc import cdc_start_seed_mode
+    from dsql_migrator.ui.data_migration import _cdc_ui
+
+    assert _cdc_ui._cdc_start_seed_mode is cdc_start_seed_mode
+
+
 def _run_start_cdc_capture_seed_mode(
     monkeypatch, *, source_type, host_seed_mode, msk_access=True
 ):

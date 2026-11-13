@@ -81,6 +81,9 @@ from dsql_migrator.core.cdc import (
     cdc_teardown_reason,
     stack_has_seeder_lambda,
 )
+# The engine-aware CDC-Start SeedMode rule lives in core (cdccore-3); the UI name stays
+# importable, bound to it, for the callers and the harness that import it from here.
+from dsql_migrator.core.cdc import cdc_start_seed_mode as _cdc_start_seed_mode
 from dsql_migrator.core.cdc_postgres import (
     dispatch_cdc_infra_params,
     dispatch_cdc_stack_params,
@@ -318,25 +321,6 @@ def _cdc_stack_has_seeder_lambda(migration_state) -> Optional[bool]:
     from dsql_migrator.ui.data_migration._models import session_has_seeder_lambda
 
     return session_has_seeder_lambda(getattr(migration_state, "_session", None))
-
-
-def _cdc_start_seed_mode(source_type: SourceType, host_seed_mode: str) -> str:
-    """Engine-aware CDC-Start SeedMode -- ONE source of truth shared with the infra build.
-
-    A PostgreSQL cdc-stack is ALWAYS created ``SeedMode=External`` (no in-VPC offset-seeder
-    Lambda; it resumes from a logical replication slot, and ``build_pg_cdc_infra_params``
-    hard-codes ``seed_mode="external"``). The External path does its Kafka prep -- creating
-    the pinned offset / DLQ / per-table data topics + seeding the offset -- **in-process at
-    Start** (``run_cdc_start``'s ``if seed_mode == "external"`` branch). So Start MUST also
-    use ``"external"`` for a PostgreSQL source, derived from the SOURCE ENGINE and NOT from
-    the host's ``cdc_seed_mode``: on a host whose ``cdc_seed_mode`` is the default (not
-    external) that branch would be skipped, the topics never created, and PG CDC never
-    streams. MySQL keeps deriving from the host config (the in-VPC EC2 host sets
-    ``external``; Fargate/local -> ``lambda``), so MySQL behavior is unchanged.
-    """
-    if source_type is SourceType.POSTGRES:
-        return "external"
-    return host_seed_mode
 
 
 def _cdc_resume_signal(migration_state, session):
