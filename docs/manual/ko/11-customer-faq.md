@@ -498,13 +498,16 @@ unfinished tables가 끝나지 않은 테이블마다 처음부터 다시 적재
 2. **app-stack** — `deploy/teardown.sh <스택이름>` 실행(ECS/ALB/IAM 스택 삭제; `DELETE_ECR=true`를
    주면 컨테이너 이미지 저장소까지 제거).
 3. **build-stack** — 선택적 CodeBuild 빌드 경로를 썼을 때만.
-4. **스택이 소유하지 않는 잔여 리소스 확인:** 도구는 계정/리전별 **플러그인 버킷**
-   `mysql-dsql-migrator-plugins-<계정>-<리전>`을 자동 생성하는데, 이건 어떤 스택에도 속하지 않아
-   `delete-stack`으로 지워지지 않습니다 — 완전히 깨끗이 하려면 직접 삭제하세요(`aws s3 rb`에
-   `--force`; 되돌릴 수 없고, 그 계정·리전의 모든 도구 배포가 이 버킷을 함께 쓰므로 그중 어느 것도
-   쓰지 않을 때만). 삭제 전에 계정 ID를 넣은 `aws s3api head-bucket --expected-bucket-owner`로
-   이 계정이 소유하는지 먼저 확인하세요: 이름이 계정 ID와 리전으로 정해지므로 그 이름의 버킷이 다른
-   계정 것일 수 있습니다(도구는 그런 버킷을 쓰지 않습니다). 이 버킷은 배포가 업로드한 CDC 플러그인 파일의 모든 버전을 한 부씩
+4. **스택이 소유하지 않는 잔여 리소스 확인:** 도구는 계정/리전별 **플러그인 버킷**을 자동 생성하는데,
+   이건 어떤 스택에도 속하지 않아 `delete-stack`으로 지워지지 않습니다:
+   `mysql-dsql-migrator-plugins-<계정>-<리전>-an`, 또는 이전 버전이 만든 이름인
+   `mysql-dsql-migrator-plugins-<계정>-<리전>`(그 버킷이 있는 배포는 계속 그것을 쓰고, me-south-1과
+   me-central-1은 항상 이 이름을 씀). 완전히 깨끗이 하려면 직접 삭제하세요(`aws s3 rb`에
+   `--force`; 되돌릴 수 없고, 그 계정·리전의 모든 도구 배포가 이 버킷을 쓰므로 그중 어느 것도
+   쓰지 않을 때만). 두 이름의 삭제 명령은 배포 가이드의 Teardown에 있습니다. 삭제 전에 계정 ID를 넣은
+   `aws s3api head-bucket --expected-bucket-owner`로 이 계정이 소유하는지 먼저 확인하세요: 이전 이름은
+   계정 ID와 리전으로 정해지므로 그 이름의 버킷이 다른 계정 것일 수 있습니다(도구는 그런 버킷을 쓰지
+   않습니다). 이 버킷은 배포가 업로드한 CDC 플러그인 파일의 모든 버전을 한 부씩
    보관하며(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB), 아무것도 이를 정리하지 않습니다. ECS
    Fargate에서는 저장된 세션·작업 상태도 이 버킷에 있습니다. 직접 만든 **Route 53** 레코드도 함께
    제거하고, 마지막으로 `mysql-dsql-*` 또는 `dsql-cdc-*` CloudFormation 스택이 남아 있지 않은지

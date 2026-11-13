@@ -503,14 +503,17 @@ with exact commands is
    pass `DELETE_ECR=true` to also remove the container image repo).
 3. **build-stack** — only if you used the optional CodeBuild build path.
 4. **Check for leftovers the stacks don't own:** the tool auto-creates a per-account/
-   region **plugin bucket** `mysql-dsql-migrator-plugins-<account>-<region>` that is NOT
-   part of any stack, so `delete-stack` won't remove it — delete it manually if you want a
-   truly clean slate (`aws s3 rb` with `--force`; it cannot be undone, and every
-   deployment of the tool in that account and region shares the bucket, so only once none
-   of them is in use). Delete it only after `aws s3api head-bucket --expected-bucket-owner`
-   with your account ID confirms that this account owns it: the name follows from the
-   account ID and Region, so a bucket by that name can belong to another account (the tool
-   refuses to use one). It keeps a copy of every version of a CDC plugin file that a deploy
+   region **plugin bucket** that is NOT part of any stack, so `delete-stack` won't remove
+   it: `mysql-dsql-migrator-plugins-<account>-<region>-an`, or
+   `mysql-dsql-migrator-plugins-<account>-<region>`, the name earlier versions created (a
+   deployment that has it keeps using it, and me-south-1 and me-central-1 always use it).
+   Delete it manually if you want a truly clean slate (`aws s3 rb` with `--force`; it
+   cannot be undone, and every deployment of the tool in that account and region uses the
+   bucket, so only once none of them is in use); the Deployment guide's teardown has the
+   commands for both names. Delete a bucket only after
+   `aws s3api head-bucket --expected-bucket-owner` with your account ID confirms that this
+   account owns it: the earlier name follows from the account ID and Region, so a bucket by
+   that name can belong to another account (the tool refuses to use one). It keeps a copy of every version of a CDC plugin file that a deploy
    uploaded (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each), and nothing prunes
    them; on ECS Fargate it also holds the saved session and job state. Also remove any
    **Route 53** records you added by hand. Then confirm no `mysql-dsql-*` or `dsql-cdc-*`

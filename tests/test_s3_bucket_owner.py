@@ -1882,7 +1882,9 @@ def test_the_owner_checked_commands_are_ones_the_cli_has(name: str) -> None:
 
 
 # What a pasted guide command runs: bash, with no `set -e` (as an interactive paste), and a
-# stub `aws` whose owner check fails or passes. Nothing else is on PATH, so nothing real runs.
+# stub `aws` whose owner check fails or passes -- for every bucket, or (STUB_BY_NAME=1) only
+# for the buckets named in STUB_OWNED, the others answering 404. Nothing else is on PATH, so
+# nothing real runs.
 _FENCED_BASH = re.compile(r"^```bash\n(.*?)^```$", re.M | re.S)
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _STUB_AWS = r"""#!/bin/sh
@@ -1890,7 +1892,18 @@ _STUB_AWS = r"""#!/bin/sh
 case "$1 $2" in
   "sts get-caller-identity") echo "$STUB_ACCOUNT" ;;
   "s3api head-bucket")
-    if [ "$STUB_OWNER_OK" != 1 ]; then
+    if [ "${STUB_BY_NAME:-0}" = 1 ]; then
+      prev=; bucket=
+      for a in "$@"; do
+        if [ "$prev" = --bucket ]; then bucket=$a; fi
+        prev=$a
+      done
+      case "|$STUB_OWNED|" in
+        *"|$bucket|"*) ;;
+        *) echo "An error occurred (404) when calling the HeadBucket operation: Not Found" >&2
+           exit 254 ;;
+      esac
+    elif [ "$STUB_OWNER_OK" != 1 ]; then
       echo "An error occurred (403) when calling the HeadBucket operation: Forbidden" >&2
       exit 254
     fi ;;
@@ -1934,11 +1947,12 @@ _GUIDE_SCRIPTS = {
 
 def _paste(
     tmp_path: Path, command: str, *, owner_ok: bool, shell: str = "bash",
-    probe: tuple[str, ...] = (),
+    probe: tuple[str, ...] = (), owned: Optional[tuple[str, ...]] = None,
 ) -> list[list[str]]:
     """Run ``command`` as a guide block pasted into ``shell``, in ``tmp_path``; the stub
     commands it called, with their arguments. ``probe`` names variables whose values the
-    paste then reports, as a last call (``envprobe``)."""
+    paste then reports, as a last call (``envprobe``). With ``owned``, the owner check
+    passes for exactly those buckets (the others answer 404) instead of by ``owner_ok``."""
     executable = shutil.which(shell)
     assert executable is not None
     bin_dir = _stub_bin(tmp_path, {
@@ -1960,6 +1974,8 @@ def _paste(
         "ACCOUNT": _ME, "AWS_REGION": _REGION, "ECR_REPO": "mysql-dsql-migrator",
         "TEMPLATE_BUCKET": f"mysql-dsql-migrator-templates-{_ME}-1a2b3c4d",
     }
+    if owned is not None:
+        env.update(STUB_BY_NAME="1", STUB_OWNED="|".join(owned))
     if probe:
         command += "\nenvprobe " + " ".join(f'"${name}"' for name in probe) + "\n"
     subprocess.run(
@@ -1993,10 +2009,14 @@ def test_every_deploy_and_teardown_runs_only_after_its_owner_check(
     # with only a comment between them, so a pasted block deployed after a 403; the AI-assist
     # redeploy and the cdc-stack README's manual deploy had no check at all. Each command now
     # runs as pasted: the owner check fails -> nothing is deployed or deleted; it passes ->
-    # the deploy or delete runs, against the very bucket the check named.
+    # each deploy or delete runs once, against the very bucket the check just before it
+    # named (a teardown block deletes each of the managed bucket's two names behind a check
+    # of its own).
     text = _guide(name)
     deploys, deletes = _gated_commands(text)
-    assert (len(deploys), len(deletes)) == ((1, 0) if name.startswith("cdc-stack") else (4, 2))
+    # The guides' deletes: the ECS Fargate teardown's two inline commands and the EC2
+    # teardown's block.
+    assert (len(deploys), len(deletes)) == ((1, 0) if name.startswith("cdc-stack") else (4, 3))
     for command in deploys + deletes:
         acts = ("cloudformation", "deploy") if command in deploys else ("s3", "rb")
         refused = _paste(tmp_path, command, owner_ok=False)
@@ -2005,10 +2025,81 @@ def test_every_deploy_and_teardown_runs_only_after_its_owner_check(
             _arg(c, "--expected-bucket-owner") in (_ME, "<account>") for c in checks
         ), command
         assert not [c for c in refused if tuple(c[1:3]) == acts], command
-        ran = [c for c in _paste(tmp_path, command, owner_ok=True) if tuple(c[1:3]) == acts]
-        assert len(ran) == 1, command
-        target = _arg(ran[0], "--s3-bucket") if acts[0] == "cloudformation" else ran[0][3]
-        assert target.removeprefix("s3://") == _arg(checks[-1], "--bucket"), command
+        calls = _paste(tmp_path, command, owner_ok=True)
+        ran = [i for i, c in enumerate(calls) if tuple(c[1:3]) == acts]
+        assert len(ran) == command.count(f"aws {' '.join(acts)} "), command
+        previous = -1
+        for at in ran:
+            gate = [c for c in calls[previous + 1:at] if c[1:3] == ["s3api", "head-bucket"]]
+            assert gate, command
+            call = calls[at]
+            target = _arg(call, "--s3-bucket") if acts[0] == "cloudformation" else call[3]
+            assert target.removeprefix("s3://") == _arg(gate[-1], "--bucket"), command
+            previous = at
+
+
+# The managed bucket's two names as the guides' teardowns write them, and as the cdc-stack
+# README's manual deploy derives them for this account and its us-east-1.
+_GUIDE_EARLIER = "mysql-dsql-migrator-plugins-<account>-<region>"
+_GUIDE_REGIONAL = f"{_GUIDE_EARLIER}-an"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("name", _GUIDES)
+def test_the_teardowns_delete_whichever_managed_bucket_this_account_owns(
+    name: str, tmp_path: Path
+) -> None:
+    # FAILS WITHOUT THE FIX: both teardowns deleted only the earlier name, so a new
+    # deployment's bucket, mysql-dsql-migrator-plugins-<account>-<region>-an (its plugin
+    # files and, on ECS Fargate, the saved job and session state), survived the "complete
+    # teardown" with no word about it. Pasted as written ("Run both commands"), each teardown
+    # now deletes exactly the names this account owns, the -an one, the earlier one, both, or
+    # neither, each behind its own owner check.
+    _, deletes = _gated_commands(_guide(name))
+    inline = [c for c in deletes if "\n" not in c]
+    fenced = [c for c in deletes if "\n" in c]
+    assert len(inline) == 2 and len(fenced) == 1, name
+    for paste in ("\n".join(inline), fenced[0]):
+        for owned in (
+            (), (_GUIDE_REGIONAL,), (_GUIDE_EARLIER,), (_GUIDE_REGIONAL, _GUIDE_EARLIER),
+        ):
+            calls = _paste(tmp_path, paste, owner_ok=False, owned=owned)
+            deleted = [c[3] for c in calls if c[1:3] == ["s3", "rb"]]
+            assert deleted == [f"s3://{b}" for b in owned], (name, owned)
+            assert all(
+                _arg(c, "--expected-bucket-owner") == "<account>"
+                for c in calls if c[1:3] == ["s3api", "head-bucket"]
+            ), (name, owned)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_manual_cdc_stack_deploy_stages_in_the_bucket_the_app_uses(tmp_path: Path) -> None:
+    # FAILS WITHOUT THE FIX: the cdc-stack README's manual deploy staged its template in the
+    # earlier name only, so for a new deployment, whose bucket (and the plugin files the app
+    # uploaded) is the -an one, the check answered 404 and nothing was deployed. It now picks
+    # the bucket as the app does: the -an bucket when this account owns one, else the earlier
+    # one, and deploys only after the owner check of the bucket it stages in.
+    (command,) = [
+        b for b in _FENCED_BASH.findall(_guide("cdc-stack/README.md"))
+        if "aws cloudformation deploy" in b
+    ]
+    earlier = s3_provision.earlier_plugin_bucket_name(_ME, "us-east-1")
+    regional = s3_provision.regional_plugin_bucket_name(_ME, "us-east-1")
+    for owned, staged in (
+        ((), None), ((regional,), regional), ((earlier,), earlier),
+        ((regional, earlier), regional),
+    ):
+        calls = _paste(tmp_path, command, owner_ok=False, owned=owned)
+        deployed = [c for c in calls if c[1:3] == ["cloudformation", "deploy"]]
+        if staged is None:
+            assert not deployed, owned
+            continue
+        (deploy,) = deployed
+        assert _arg(deploy, "--s3-bucket") == staged, owned
+        assert f"PluginBucketArn=arn:aws:s3:::{staged}" in deploy, owned
+        checks = [c for c in calls[:calls.index(deploy)] if c[1:3] == ["s3api", "head-bucket"]]
+        assert _arg(checks[-1], "--bucket") == staged, owned
+        assert all(_arg(c, "--expected-bucket-owner") == _ME for c in checks), owned
 
 
 @pytest.mark.skipif(

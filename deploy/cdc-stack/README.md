@@ -78,17 +78,24 @@ the canonical prefix. Set a per-DB name (suffix only) in the deploy form's Advan
 
 The template exceeds CloudFormation's 51,200-byte inline limit, so the CLI stages it in an S3
 bucket: the tool's plugin bucket, which `PluginBucketArn` names and the stack's connector
-plugins and offset seeder are read from. That bucket's name is derived from the account ID
-and Region, so another AWS account could own a bucket by that name: the deploy runs only if
-the `head-bucket` check confirms that this account owns it. Set `AWS_REGION` to the app's
-Region (the plugin bucket's name ends with it), replace `...` with the other parameters (the
+plugins and offset seeder are read from. That bucket is
+`mysql-dsql-migrator-plugins-<account>-<region>-an` or, for a deployment that has a bucket by
+the name earlier versions created (and always in me-south-1 and me-central-1),
+`mysql-dsql-migrator-plugins-<account>-<region>`. The block below uses the `-an` bucket when
+this account owns one, and the earlier one otherwise, as the app does (the app's activity log
+entry *S3 bucket in use* names the bucket it uses). The earlier name follows from the account
+ID and Region, so another AWS account could own a bucket by that name: the deploy runs only if
+the `head-bucket` check confirms that this account owns the bucket. Set `AWS_REGION` to the
+app's Region (the plugin bucket's name holds it), replace `...` with the other parameters (the
 template's `Parameters` section lists them), and add `--no-execute-changeset` to inspect the
 change set without applying it.
 
 ```bash
 export AWS_REGION=us-east-1
 export ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export PLUGIN_BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
+export PLUGIN_BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION-an
+aws s3api head-bucket --bucket "$PLUGIN_BUCKET" --expected-bucket-owner "$ACCOUNT" \
+  || export PLUGIN_BUCKET=mysql-dsql-migrator-plugins-$ACCOUNT-$AWS_REGION
 aws s3api head-bucket --bucket "$PLUGIN_BUCKET" --expected-bucket-owner "$ACCOUNT" \
   && aws cloudformation deploy --template-file deploy/cdc-stack/cdc-stack.yaml \
   --stack-name dsql-cdc-stack --region "$AWS_REGION" --capabilities CAPABILITY_NAMED_IAM \

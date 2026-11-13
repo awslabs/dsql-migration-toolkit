@@ -889,17 +889,21 @@ account yet*, accept the agreement as above and verify again.
 >    (CDC is the separate `cdc-stack`; see the CDC docs.)
 > 2. **app-stack** — `deploy/teardown.sh` (below).
 > 3. **build-stack** — only if you used Option B (CodeBuild) (below).
-> 4. **Plugin bucket (if present)** — the app creates
->    `mysql-dsql-migrator-plugins-<account>-<region>` itself, so no stack owns it and no
->    `delete-stack` removes it. It keeps every CDC plugin file a deploy uploaded
->    (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each; nothing prunes them) and, on
->    ECS Fargate, the saved session and job state. Every deployment of the tool in this
->    account and region shares it, so delete it only when none of them is still in use.
->    Deleting it cannot be undone, and frees the name: the tool creates the bucket again
->    under the same name when it next needs it, and refuses a bucket by that name that
->    another account created meanwhile. Delete it only if this account owns it — the
->    `head-bucket` check fails, and nothing is deleted, if it does not:
->    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+> 4. **Plugin bucket (if present)** — the app creates its managed bucket itself, so no
+>    stack owns it and no `delete-stack` removes it:
+>    `mysql-dsql-migrator-plugins-<account>-<region>-an`, or
+>    `mysql-dsql-migrator-plugins-<account>-<region>`, the name earlier versions created
+>    (a deployment that has it keeps using it, and me-south-1 and me-central-1 always use
+>    it). It keeps every CDC plugin file a deploy uploaded (`cdc-plugins/<hash>/<file>`, up
+>    to about 31 MiB each; nothing prunes them) and, on ECS Fargate, the saved session and
+>    job state. Every deployment of the tool in this account and region uses it, so delete
+>    it only when none of them is still in use. Deleting it cannot be undone; the tool
+>    creates a bucket again when it next needs one, and never uses one that another account
+>    owns. Run both commands: each deletes its bucket only if the bucket exists and this
+>    account owns it; otherwise its `head-bucket` check fails (404 or 403) and nothing is
+>    deleted:
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"`
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **Verify nothing is left** — no `mysql-dsql-*` or `dsql-cdc-*` CloudFormation stacks remain
 >    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    plus any **Route 53** records and the **CodeBuild source S3 bucket** you created.
@@ -963,23 +967,37 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
 - **Durable session resume**: each session's non-secret workbench snapshot
   (workflow progress, Evaluation result, schema choices, CDC start point) is
   written to the tool's managed plugin bucket
-  (`mysql-dsql-migrator-plugins-<account>-<region>`, auto-provisioned — no operator
-  input) under a `sessions/` prefix, so it survives a Fargate **task replacement**
+  (`mysql-dsql-migrator-plugins-<account>-<region>-an`, or the earlier name in the next
+  bullet; auto-provisioned — no operator input) under a `sessions/` prefix, so it
+  survives a Fargate **task replacement**
   (a redeploy), not just an in-task restart. Combined with the stable cookie secret
   above, a reconnecting browser resumes its workbench instead of re-running Step 1
   (Evaluation). Non-secret only (Property 7) — the source DB password is re-entered
   on the Connect screen.
-- **Managed bucket ownership**: the plugin bucket's name is derived from the account ID
-  and Region, so another AWS account could create a bucket with that name first. Every
-  request the app sends to it (the CDC plugin and template uploads and, on ECS Fargate, the
-  job and session state and the record of the DEFAULTs that column exclusions drop) names
-  this account as the bucket's expected owner, which S3 refuses unless this account owns
-  the bucket. The templates' IAM grants on the bucket also carry `s3:ResourceAccount` =
-  this account, so S3 refuses the roles on a bucket by that name in another account even
-  for a request that does not name the owner. A bucket by that name in another account is never used: Deploy CDC
-  infrastructure and Start CDC stop with an error that names the bucket and what to do,
-  and the job and session state are not saved (an error notice above every screen of the
-  app says so and names the bucket, and the activity log records it).
+- **Managed bucket ownership**: the app keeps the CDC plugin files and the cdc-stack
+  template it stages and, on ECS Fargate, the job and session state and the record of the
+  DEFAULTs that column exclusions drop in a bucket it creates itself, one per account and
+  Region. A new deployment's is `mysql-dsql-migrator-plugins-<account>-<region>-an`, in
+  this account's S3 account regional namespace, where only this account can create a
+  bucket. A deployment that already has a bucket by the name earlier versions created,
+  `mysql-dsql-migrator-plugins-<account>-<region>`, keeps using it and the state in it
+  (nothing is copied or moved) while it exists and this account owns it; me-south-1 and
+  me-central-1, which have no account regional namespace, always use that name. The
+  activity log's *S3 bucket in use* entry names the bucket the app uses and why. Every
+  request the app sends to the bucket names this account as its expected owner, which S3
+  refuses unless this account owns the bucket, and the templates' IAM grants on both names
+  carry `s3:ResourceAccount` = this account, so S3 refuses the roles on a bucket by either
+  name in another account even for a request that does not name the owner. The earlier
+  name follows from the account ID and Region, so another AWS account could create a
+  bucket by that name first: the tool never uses such a bucket, and uses the `-an` bucket
+  instead. If the tool has no bucket it can use (in me-south-1 or me-central-1 while
+  another account holds the earlier name, or elsewhere when this identity may not create
+  the `-an` bucket — an app stack template older than this version grants only the earlier
+  name, and an SCP or a permissions boundary can forbid it — and the earlier name is not
+  usable either), Deploy CDC infrastructure and Start CDC stop with an error that names
+  the buckets it tried and what to do, and the job and session state are not saved (an
+  error notice above every screen of the app says so and names them, and the activity log
+  records it).
   Without that record (the overlay ledger, manual §13.6), a Full Load that includes a
   table with excluded columns does not start: its Start dialog says *Could not read the
   record of excluded-column changes* and keeps Start disabled, and a run that reaches such a
@@ -987,18 +1005,17 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   this table* (the activity log's *overlay ledger unreadable* entry names the refused
   bucket). A Full Load whose tables have no excluded columns runs as usual. The same holds
   for a bucket set with `DSQL_MIGRATOR_JOB_STATE_BUCKET` or
-  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` (the overlay ledger is kept in the session state
-  bucket). The tool has no setting for another plugin bucket name, so while another account
-  holds a bucket by that name, Deploy CDC infrastructure cannot run in this account and
-  Region, and on ECS Fargate the job and session state are not saved and a Full Load that
-  includes a table with excluded columns cannot run.
+  `DSQL_MIGRATOR_SESSION_STATE_BUCKET` that another account owns (the overlay ledger is
+  kept in the session state bucket), except the earlier name, which the ECS Fargate
+  template sets: it means the managed bucket above.
 - **Ran an earlier version in this account?** Versions before the owner check used a
-  bucket by that name in another account when its bucket policy let them in, and an earlier
-  version of this guide created the template bucket as
-  `mysql-dsql-migrator-templates-<account>-<region>` without checking it. Check both names
-  as an administrator of this account, and before you update the app stack: on ECS Fargate
-  every start of the app (v0.1.93 and later) creates the plugin bucket in this account when
-  no bucket by that name exists.
+  bucket by the plugin bucket's earlier name, `mysql-dsql-migrator-plugins-<account>-<region>`,
+  in another account when its bucket policy let them in, and an earlier version of this
+  guide created the template bucket as `mysql-dsql-migrator-templates-<account>-<region>`
+  without checking it (the `-an` name needs no check: only this account can create it, and
+  no earlier version used it). Check both names as an administrator of this account, and
+  before you update the app stack: on ECS Fargate, an app start (v0.1.93 and later) can
+  create a bucket by the earlier plugin bucket name in this account when none exists.
   `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` answers 403 if
   another account owns the bucket now. Its 200 (this account owns it) and its 404 (no such
   bucket) do not clear the name by themselves: another account may have held it while an
@@ -1440,17 +1457,22 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > stack deletion** — delete it manually if you don't want to keep it (find it by the
 > `aws:cloudformation:stack-name` tag).
 
-If you deployed CDC, the app also created the plugin bucket
-`mysql-dsql-migrator-plugins-<account>-<region>`. No stack owns it, so it survives too, and
-nothing prunes it: it keeps every CDC plugin file a deploy uploaded
-(`cdc-plugins/<hash>/<file>`, up to about 31 MiB each). Every deployment of the tool in this
-account and region shares it; once none of them is still in use, delete it for a clean
-slate. This cannot be undone, and frees the name: the tool creates the bucket again under
-the same name when it next needs it, and refuses a bucket by that name that another account
-created meanwhile. Delete it only if this account owns it — the `head-bucket` check fails,
-and nothing is deleted, if it does not:
+If you deployed CDC, the app also created its plugin bucket:
+`mysql-dsql-migrator-plugins-<account>-<region>-an`, or
+`mysql-dsql-migrator-plugins-<account>-<region>`, the name earlier versions created (a
+deployment that has it keeps using it, and me-south-1 and me-central-1 always use it). No
+stack owns it, so it survives too, and nothing prunes it: it keeps every CDC plugin file a
+deploy uploaded (`cdc-plugins/<hash>/<file>`, up to about 31 MiB each). Every deployment of
+the tool in this account and region uses it; once none of them is still in use, delete it
+for a clean slate. This cannot be undone; the tool creates a bucket again when it next
+needs one, and never uses one that another account owns. Run both commands: each deletes
+its bucket only if the bucket exists and this account owns it; otherwise its `head-bucket`
+check fails (404 or 403) and nothing is deleted:
 
 ```bash
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"
 aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
   --expected-bucket-owner "<account>" \
   && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"

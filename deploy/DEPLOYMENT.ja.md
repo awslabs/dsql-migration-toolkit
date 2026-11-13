@@ -887,17 +887,21 @@ yet* で拒否された場合は、上記のとおり契約を承諾してから
 >    （CDC は別の `cdc-stack` です。CDC のドキュメントを参照。）
 > 2. **app-stack** — `deploy/teardown.sh`（下記）。
 > 3. **build-stack** — Option B（CodeBuild）を使用した場合のみ（下記）。
-> 4. **プラグインバケット（ある場合）** — アプリが
->    `mysql-dsql-migrator-plugins-<account>-<region>` を自ら作成するため、どのスタックも所有
->    しておらず、どの `delete-stack` でも削除されません。このバケットは、デプロイがアップロード
->    したすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB。
->    整理するものはありません）と、ECS Fargate では保存されたセッションとジョブの状態を保持します。
->    このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
->    使用していないときにだけ削除してください。削除は元に戻せず、名前を手放します: ツールは次に
->    必要になったとき同じ名前でバケットを作り直し、その間に別のアカウントがその名前で作成した
->    バケットは拒否します。このアカウントが所有している場合にだけ削除してください — 所有して
->    いなければ `head-bucket` の確認が失敗し、何も削除されません:
->    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+> 4. **プラグインバケット（ある場合）** — アプリが管理バケットを自ら作成するため、どのスタックも
+>    所有しておらず、どの `delete-stack` でも削除されません:
+>    `mysql-dsql-migrator-plugins-<account>-<region>-an`、または以前のバージョンが作成した名前の
+>    `mysql-dsql-migrator-plugins-<account>-<region>`（そのバケットがあるデプロイは引き続きそれを
+>    使用し、me-south-1 と me-central-1 は常にこの名前を使用します）。このバケットは、デプロイが
+>    アップロードしたすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約
+>    31 MiB。整理するものはありません）と、ECS Fargate では保存されたセッションとジョブの状態を保持
+>    します。このアカウントとリージョンにあるツールのすべてのデプロイがこのバケットを使用するため、
+>    どのデプロイももう使用していないときにだけ削除してください。削除は元に戻せません。ツールは次に
+>    必要になったときバケットを作り直し、別のアカウントが所有するバケットは決して使用しません。
+>    両方のコマンドを実行してください: 各コマンドは、バケットが存在しこのアカウントが所有している
+>    場合にだけそのバケットを削除し、そうでなければ `head-bucket` の確認が失敗し（404 または
+>    403）、何も削除されません:
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"`
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **何も残っていないことを確認** — `mysql-dsql-*` または `dsql-cdc-*` の CloudFormation
 >    スタックが残っていないこと
 >    （`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`）、
@@ -958,37 +962,48 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   DB/ユーザーの認証情報ではありません — テンプレート内に平文で存在することは決してありません。
 - **Durable なセッション再開**: 各セッションの非機密のワークベンチスナップショット（ワークフロー
   進捗・Evaluation 結果・スキーマ選択・CDC 開始点）を、ツールが管理するプラグインバケット
-  （`mysql-dsql-migrator-plugins-<account>-<region>`、自動プロビジョニング — 運用者の入力なし）の
-  `sessions/` プレフィックスに書き込むため、プロセス内再起動だけでなく Fargate の**タスク置換**
+  （`mysql-dsql-migrator-plugins-<account>-<region>-an`、または次項の以前の名前。自動プロビジョニング —
+  運用者の入力なし）の `sessions/` プレフィックスに書き込むため、プロセス内再起動だけでなく Fargate の**タスク置換**
   （再デプロイ）を越えて保持されます。上記の安定したクッキーシークレットと合わせて、再接続した
   ブラウザは Step 1（Evaluation）を再実行せずにワークベンチを再開します。非機密のみ（Property 7）—
   ソース DB のパスワードは Connect 画面で再入力します。
-- **管理バケットの所有権**: プラグインバケットの名前はアカウント ID とリージョンから決まるため、
-  別の AWS アカウントがその名前のバケットを先に作成できます。アプリがこのバケットに送るすべての
-  リクエスト（CDC プラグインとテンプレートのアップロード、そして ECS Fargate ではジョブとセッションの状態と、
-  列の除外が削除した DEFAULT の記録）は、このアカウントをバケットの想定所有者として指定し、このアカウントが
-  バケットを所有していなければ S3 が拒否します。テンプレートの IAM 権限にもこのバケットに対して
-  `s3:ResourceAccount` = このアカウントの条件が付いているため、所有者を指定しないリクエストでも、別のアカウントに
-  あるその名前のバケットに対しては S3 がロールを拒否します。別のアカウントにあるその名前のバケットは決して使用しません:
-  Deploy CDC infrastructure と Start CDC はバケット名と対処方法を示すエラーで止まり、ジョブとセッションの
-  状態は保存されません（アプリのすべての画面の上に、バケット名を示すエラー通知が表示され、
-  アクティビティログに記録されます）。その記録（オーバーレイ台帳、マニュアル §13.6）がないと、
+- **管理バケットの所有権**: アプリは CDC プラグインファイルとステージングする cdc-stack テンプレート、
+  そして ECS Fargate ではジョブとセッションの状態と列の除外が削除した DEFAULT の記録を、自ら作成する
+  バケット（アカウントとリージョンごとに 1 つ）に保持します。新しいデプロイのバケットは
+  `mysql-dsql-migrator-plugins-<account>-<region>-an` で、このアカウントだけがバケットを作成できる、
+  このアカウントの S3 アカウントリージョナル名前空間（account regional namespace）にあります。以前の
+  バージョンが作成した名前 `mysql-dsql-migrator-plugins-<account>-<region>` のバケットがすでにある
+  デプロイは、そのバケットが存在しこのアカウントが所有している間、そのバケットとその中の状態を引き続き
+  使用します（何もコピーも移動もしません）。アカウントリージョナル名前空間のない me-south-1 と
+  me-central-1 は常にその名前を使用します。アプリが使用するバケットとその理由は、アクティビティログの
+  *S3 bucket in use* エントリが示します。アプリがバケットに送るすべてのリクエストは、このアカウントを
+  バケットの想定所有者として指定し、このアカウントがバケットを所有していなければ S3 が拒否します。
+  テンプレートの IAM 権限にも両方の名前に対して `s3:ResourceAccount` = このアカウントの条件が付いている
+  ため、所有者を指定しないリクエストでも、別のアカウントにあるどちらの名前のバケットに対しても S3 が
+  ロールを拒否します。以前の名前はアカウント ID とリージョンから決まるため、別の AWS アカウントがその
+  名前のバケットを先に作成できます: ツールはそのようなバケットを決して使用せず、代わりに `-an` バケットを
+  使用します。ツールが使用できるバケットがない場合（me-south-1 または me-central-1 で別のアカウントが
+  以前の名前を持っている間、またはそれ以外のリージョンでこの ID が `-an` バケットを作成できず — この
+  バージョンより古いアプリスタックのテンプレートは以前の名前だけを許可し、SCP やアクセス許可の境界が
+  禁止することもあります — 以前の名前も使用できない場合）、Deploy CDC infrastructure と Start CDC は
+  試したバケットの名前と対処方法を示すエラーで止まり、ジョブとセッションの状態は保存されません（アプリの
+  すべての画面の上に、それらのバケット名を示すエラー通知が表示され、アクティビティログに記録されます）。その記録（オーバーレイ台帳、マニュアル §13.6）がないと、
   除外された列を持つテーブルを含む Full Load は開始されません: Start ダイアログが
   *Could not read the record of excluded-column changes* と表示して Start を無効にし、そのような
   テーブルに達した実行はそのテーブルを *cannot read the record of dropped DEFAULTs; nothing was changed
   on this table* で失敗させます（アクティビティログの *overlay ledger unreadable* エントリが拒否された
   バケットを示します）。除外された列のないテーブルだけの Full Load は通常どおり実行されます。
-  `DSQL_MIGRATOR_JOB_STATE_BUCKET` または `DSQL_MIGRATOR_SESSION_STATE_BUCKET` で指定したバケットも
-  同じです（オーバーレイ台帳はセッション状態のバケットにあります）。ツールにはプラグインバケットの別の
-  名前を選ぶ設定がないため、別のアカウントがその名前のバケットを持っている間は、このアカウントと
-  リージョンで Deploy CDC infrastructure を実行できず、ECS Fargate ではジョブとセッションの状態が
-  保存されず、除外された列を持つテーブルを含む Full Load を実行できません。
+  `DSQL_MIGRATOR_JOB_STATE_BUCKET` または `DSQL_MIGRATOR_SESSION_STATE_BUCKET` で指定したバケットを
+  別のアカウントが所有している場合も同じです（オーバーレイ台帳はセッション状態のバケットにあります）。
+  ただし、ECS Fargate のテンプレートが指定する以前の名前は、上記の管理バケットを意味します。
 - **このアカウントで以前のバージョンを実行した場合は?** 所有者の確認より前のバージョンは、別のアカウントに
-  あるその名前のバケットを、そのバケットポリシーが許可していれば使用しました。また、このガイドの以前の版は
-  テンプレートバケットを確認なしで `mysql-dsql-migrator-templates-<account>-<region>` として作成しました。
-  このアカウントの管理者として、アプリスタックを更新する前に両方の名前を確認してください: ECS Fargate
-  では、アプリは起動するたびに（v0.1.93 以降）、その名前のバケットがなければこのアカウントに
-  プラグインバケットを作成します。
+  あるプラグインバケットの以前の名前 `mysql-dsql-migrator-plugins-<account>-<region>` のバケットを、
+  そのバケットポリシーが許可していれば使用しました。また、このガイドの以前の版はテンプレートバケットを
+  確認なしで `mysql-dsql-migrator-templates-<account>-<region>` として作成しました（`-an` の名前は確認
+  不要です: このアカウントだけが作成でき、以前のバージョンはどれも使用していません）。このアカウントの
+  管理者として、アプリスタックを更新する前に両方の名前を確認してください: ECS Fargate では、アプリの
+  起動（v0.1.93 以降）が、プラグインバケットの以前の名前のバケットがなければ、このアカウントにその名前で
+  バケットを作成することがあります。
   `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>` は、いま別のアカウントが
   バケットを所有していれば 403 を返します。200（このアカウントが所有）と 404（そのようなバケットはない）
   だけでは、その名前が安全だとは言えません: 以前のバージョンがその名前を使っていた間に別のアカウントが
@@ -1419,16 +1434,22 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > 状態 EBS ボリュームは設計上 **`DeletionPolicy: Retain`** のため、**スタック削除後も残ります** —
 > 保持したくない場合は手動で削除してください（`aws:cloudformation:stack-name` タグで検索）。
 
-CDC をデプロイした場合、アプリはプラグインバケット `mysql-dsql-migrator-plugins-<account>-<region>`
-も作成しています。どのスタックも所有しないためこのバケットも残り、整理するものもありません: デプロイが
-アップロードしたすべての CDC プラグインファイル（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB）を
-保持します。このアカウントとリージョンにあるツールのすべてのデプロイが共有するため、どのデプロイももう
-使用していない状態になったら、クリーンな状態にするために削除してください。元に戻せず、名前を手放します:
-ツールは次に必要になったとき同じ名前でバケットを作り直し、その間に別のアカウントがその名前で作成した
-バケットは拒否します。このアカウントが所有している場合にだけ削除してください — 所有していなければ
-`head-bucket` の確認が失敗し、何も削除されません:
+CDC をデプロイした場合、アプリはプラグインバケットも作成しています:
+`mysql-dsql-migrator-plugins-<account>-<region>-an`、または以前のバージョンが作成した名前の
+`mysql-dsql-migrator-plugins-<account>-<region>`（そのバケットがあるデプロイは引き続きそれを使用し、
+me-south-1 と me-central-1 は常にこの名前を使用します）。どのスタックも所有しないためこのバケットも残り、
+整理するものもありません: デプロイがアップロードしたすべての CDC プラグインファイル
+（`cdc-plugins/<hash>/<file>`、それぞれ最大約 31 MiB）を保持します。このアカウントとリージョンにある
+ツールのすべてのデプロイがこのバケットを使用するため、どのデプロイももう使用していない状態になったら、
+クリーンな状態にするために削除してください。元に戻せません。ツールは次に必要になったときバケットを
+作り直し、別のアカウントが所有するバケットは決して使用しません。両方のコマンドを実行してください:
+各コマンドは、バケットが存在しこのアカウントが所有している場合にだけそのバケットを削除し、そうでなければ
+`head-bucket` の確認が失敗し（404 または 403）、何も削除されません:
 
 ```bash
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"
 aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
   --expected-bucket-owner "<account>" \
   && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"

@@ -699,8 +699,9 @@ def test_the_teardown_guides_delete_the_plugin_bucket_no_stack_owns(suffix: str)
     # links to §Teardown, already said so.
     from dsql_migrator.core import s3_provision
 
-    # The guides' teardown names the managed bucket's earlier name (the -an name is added
-    # with the guides' account-regional update).
+    # The guides' teardown names both of the managed bucket's names: the -an one (a new
+    # deployment's) and the earlier one (kept by a deployment that has it, and always used in
+    # me-south-1 and me-central-1).
     assert s3_provision.earlier_plugin_bucket_name("<account>", "<region>") == _PLUGIN_BUCKET
     assert s3_provision.regional_plugin_bucket_name("<account>", "<region>") == (
         f"{_PLUGIN_BUCKET}-an"
@@ -715,6 +716,7 @@ def test_the_teardown_guides_delete_the_plugin_bucket_no_stack_owns(suffix: str)
     text = (DEPLOY / f"DEPLOYMENT{suffix}.md").read_text(encoding="utf-8")
     fargate = _section(text, "### Teardown", r"^### ")
     ec2 = _section(text, "### 6. Teardown", r"^---\s*$")
+    regional = f"{_PLUGIN_BUCKET}-an"
     for block in (fargate, ec2):
         assert _PLUGIN_BUCKET in block, suffix
         assert "cdc-plugins/<hash>/<file>" in block, suffix
@@ -722,6 +724,11 @@ def test_the_teardown_guides_delete_the_plugin_bucket_no_stack_owns(suffix: str)
         # The owner check gates the delete: `check && delete`, the check first.
         joined = " ".join(block.replace("\\\n", " ").split())
         assert f"{_OWNER_CHECK} && {_RB}" in joined, suffix
+        # FAILS WITHOUT THE FIX: only the earlier name was deleted, so a new deployment's
+        # -an bucket survived the teardown. Its delete is gated the same way.
+        regional_check = _OWNER_CHECK.replace(_PLUGIN_BUCKET, regional)
+        regional_rb = _RB.replace(_PLUGIN_BUCKET, regional)
+        assert f"{regional_check} && {regional_rb}" in joined, suffix
     # The order deletes, then checks for, the DEFAULT cdc-stack name as well as a legacy one.
     assert "--stack-name dsql-cdc-stack" in fargate, suffix
     assert "starts_with(StackName,\\`dsql-cdc-\\`)" in fargate, suffix
@@ -736,6 +743,10 @@ def test_faq_q31_teardown_names_the_default_cdc_stack_and_how_to_remove_the_buck
     assert "`dsql-cdc-*`" in q31, lang
     assert "`aws s3 rb`" in q31 and "`--force`" in q31, lang
     assert _PLUGIN_BUCKET.replace("<account>-<region>", "") in q31, lang
+    # FAILS WITHOUT THE FIX: Q31 named only the earlier name; a new deployment's bucket is
+    # the -an one (the placeholders are translated in some languages).
+    assert re.search(r"`mysql-dsql-migrator-plugins-<[^>`]+>-<[^>`]+>-an`", q31), lang
+    assert re.search(r"`mysql-dsql-migrator-plugins-<[^>`]+>-<[^>`]+>`", q31), lang
     # ...only after the owner check confirms the bucket is this account's.
     assert "`aws s3api head-bucket --expected-bucket-owner`" in q31, lang
 

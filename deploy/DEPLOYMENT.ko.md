@@ -825,15 +825,18 @@ UI에서 AI를 켜고 **Verify AI access**를 실행하세요. 모델이 지금 
 >    (CDC는 별도 `cdc-stack` — CDC 문서 참고.)
 > 2. **app-stack** — `deploy/teardown.sh` (아래).
 > 3. **build-stack** — Option B(CodeBuild)를 썼을 때만 (아래).
-> 4. **플러그인 버킷 (있다면)** — 앱이 `mysql-dsql-migrator-plugins-<account>-<region>`을 직접 만들기
->    때문에 어떤 스택도 소유하지 않고, 어떤 `delete-stack`으로도 지워지지 않습니다. 이 버킷은 배포가
->    업로드한 모든 CDC 플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB — 정리하는 것은
->    없음)과, ECS Fargate에서는 저장된 세션·작업 상태를 보관합니다. 이 계정·리전의 모든 도구 배포가 함께
->    쓰므로, 그중 어느 것도 더 이상 쓰지 않을 때만 삭제하세요. 삭제는 되돌릴 수 없고 이름을 풀어 줍니다:
->    도구는 다음에 필요할 때 같은 이름으로 버킷을 다시 만들며, 그사이 다른 계정이 그 이름으로 만든 버킷은
->    거부합니다. 이 계정이 소유할 때만 삭제하세요 — 소유하지 않으면 `head-bucket` 확인이 실패하고 아무것도
->    삭제되지 않습니다:
->    `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
+> 4. **플러그인 버킷 (있다면)** — 앱이 관리형 버킷을 직접 만들기 때문에 어떤 스택도 소유하지 않고,
+>    어떤 `delete-stack`으로도 지워지지 않습니다: `mysql-dsql-migrator-plugins-<account>-<region>-an`,
+>    또는 이전 버전이 만든 이름인 `mysql-dsql-migrator-plugins-<account>-<region>`(그 버킷이 있는 배포는
+>    계속 그것을 쓰고, me-south-1과 me-central-1은 항상 이 이름을 씀). 이 버킷은 배포가 업로드한 모든 CDC
+>    플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB — 정리하는 것은 없음)과, ECS
+>    Fargate에서는 저장된 세션·작업 상태를 보관합니다. 이 계정·리전의 모든 도구 배포가 이 버킷을 쓰므로,
+>    그중 어느 것도 더 이상 쓰지 않을 때만 삭제하세요. 삭제는 되돌릴 수 없습니다. 도구는 다음에 필요할 때
+>    버킷을 다시 만들며, 다른 계정이 소유한 버킷은 절대 쓰지 않습니다. 두 명령을 모두 실행하세요: 각
+>    명령은 버킷이 있고 이 계정이 소유할 때만 그 버킷을 삭제하며, 그렇지 않으면 `head-bucket` 확인이
+>    실패(404 또는 403)하고 아무것도 삭제되지 않습니다:
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"`
+>    - `aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" --expected-bucket-owner "<account>" && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"`
 > 5. **잔여 확인** — `mysql-dsql-*` 또는 `dsql-cdc-*` CloudFormation 스택이 남지 않았는지
 >    (`aws cloudformation list-stacks --query "StackSummaries[?(starts_with(StackName,\`mysql-dsql\`) || starts_with(StackName,\`dsql-cdc-\`)) && StackStatus!=\`DELETE_COMPLETE\`].StackName"`),
 >    그리고 직접 만든 **Route 53** 레코드와 **CodeBuild 소스 S3 버킷**.
@@ -886,33 +889,42 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   `AWS::SecretsManager::Secret`(운영자 입력 없음)을 생성해, 재시작 간에도 브라우저 세션 id가 안정적으로
   유지됨 — 아래의 durable 스냅샷을 찾는 키. 쿠키만 서명 — DB/사용자 자격증명 아님 — 하고 템플릿에 평문으로 절대 없음.
 - **Durable 세션 재개**: 각 세션의 비밀 아닌 워크벤치 스냅샷(워크플로 진행·평가 결과·스키마 선택·CDC 시작점)을
-  툴의 관리형 플러그인 버킷(`mysql-dsql-migrator-plugins-<account>-<region>`, 자동 프로비저닝 — 운영자 입력 없음)의
-  `sessions/` 프리픽스에 기록해, 인프로세스 재시작뿐 아니라 Fargate **태스크 교체**(재배포)까지 견딤. 위의 안정적
-  쿠키 시크릿과 함께, 재연결한 브라우저가 Step 1(Evaluation) 재실행 없이 워크벤치를 재개. 비밀 아님만(Property 7) —
-  소스 DB 비밀번호는 Connect 화면에서 다시 입력.
-- **관리형 버킷 소유권**: 플러그인 버킷의 이름은 계정 ID와 리전으로 정해지므로, 다른 AWS 계정이 그 이름의
-  버킷을 먼저 만들 수 있음. 앱이 이 버킷에 보내는 모든 요청(CDC 플러그인·템플릿 업로드, 그리고 ECS
-  Fargate에서는 작업·세션 상태와 컬럼 제외가 제거한 DEFAULT의 기록)은 이 계정을 버킷의 예상 소유자로
-  지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 템플릿의 IAM 권한에도 이 버킷에 대해
-  `s3:ResourceAccount` = 이 계정 조건이 붙어 있어, 소유자를 지정하지 않는 요청이라도 다른 계정에 있는 그
-  이름의 버킷에는 S3가 역할을 거부함. 다른 계정에 있는 그 이름의 버킷은 절대 사용하지
-  않음: Deploy CDC infrastructure와 Start CDC는 버킷 이름과 조치 방법을 담은 오류로 멈추고, 작업·세션
-  상태는 저장되지 않음(앱의 모든 화면 위에 버킷 이름을 담은 오류 알림이 표시되고, 활동 로그에 기록됨).
+  툴의 관리형 플러그인 버킷(`mysql-dsql-migrator-plugins-<account>-<region>-an`, 또는 다음 항목의 이전 이름;
+  자동 프로비저닝 — 운영자 입력 없음)의 `sessions/` 프리픽스에 기록해, 인프로세스 재시작뿐 아니라
+  Fargate **태스크 교체**(재배포)까지 견딤. 위의 안정적 쿠키 시크릿과 함께, 재연결한 브라우저가
+  Step 1(Evaluation) 재실행 없이 워크벤치를 재개. 비밀 아님만(Property 7) — 소스 DB 비밀번호는
+  Connect 화면에서 다시 입력.
+- **관리형 버킷 소유권**: 앱은 CDC 플러그인 파일과 스테이징하는 cdc-stack 템플릿, 그리고 ECS
+  Fargate에서는 작업·세션 상태와 컬럼 제외가 제거한 DEFAULT의 기록을, 직접 만드는 버킷(계정·리전마다
+  하나)에 보관함. 새 배포의 버킷은 `mysql-dsql-migrator-plugins-<account>-<region>-an`으로, 이 계정만
+  버킷을 만들 수 있는 이 계정의 S3 계정 리전 네임스페이스(account regional namespace)에 있음. 이전
+  버전이 만든 이름 `mysql-dsql-migrator-plugins-<account>-<region>`의 버킷이 이미 있는 배포는, 그 버킷이
+  존재하고 이 계정이 소유하는 동안 그 버킷과 그 안의 상태를 계속 씀(아무것도 복사하거나 옮기지 않음).
+  계정 리전 네임스페이스가 없는 me-south-1과 me-central-1은 항상 그 이름을 씀. 앱이 쓰는 버킷과 그
+  이유는 활동 로그의 *S3 bucket in use* 항목이 알려 줌. 앱이 버킷에 보내는 모든 요청은 이 계정을 버킷의
+  예상 소유자로 지정하며, 이 계정이 버킷을 소유하지 않으면 S3가 거부함. 템플릿의 IAM 권한에도 두 이름
+  모두에 대해 `s3:ResourceAccount` = 이 계정 조건이 붙어 있어, 소유자를 지정하지 않는 요청이라도 다른
+  계정에 있는 어느 이름의 버킷에도 S3가 역할을 거부함. 이전 이름은 계정 ID와 리전으로 정해지므로 다른
+  AWS 계정이 그 이름의 버킷을 먼저 만들 수 있음: 툴은 그런 버킷을 절대 사용하지 않고, 대신 `-an` 버킷을
+  씀. 툴이 쓸 수 있는 버킷이 없으면(me-south-1이나 me-central-1에서 다른 계정이 이전 이름을 가지고 있는
+  동안, 또는 그 밖의 리전에서 이 자격 증명이 `-an` 버킷을 만들 수 없고 — 이 버전보다 오래된 앱 스택
+  템플릿은 이전 이름만 허용하며, SCP나 권한 경계가 막을 수도 있음 — 이전 이름도 쓸 수 없을 때), Deploy
+  CDC infrastructure와 Start CDC는 시도한 버킷의 이름과 조치 방법을 담은 오류로 멈추고, 작업·세션 상태는
+  저장되지 않음(앱의 모든 화면 위에 그 버킷 이름을 담은 오류 알림이 표시되고, 활동 로그에 기록됨).
   그 기록(오버레이 원장, 매뉴얼 §13.6)이 없으면, 제외된 컬럼이 있는 테이블을 포함한 Full Load는
   시작되지 않음: Start 대화상자가 *Could not read the record of excluded-column changes*를 표시하고
   Start를 비활성화하며, 그런 테이블에 이른 실행은 그 테이블을
   *cannot read the record of dropped DEFAULTs; nothing was changed on this table*로 실패시킴(활동 로그의
   *overlay ledger unreadable* 항목이 거부된 버킷을 알려 줌). 제외된 컬럼이 없는 테이블만의 Full Load는
   평소대로 실행됨. `DSQL_MIGRATOR_JOB_STATE_BUCKET` 또는 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`으로
-  지정한 버킷도 마찬가지(오버레이 원장은 세션 상태 버킷에 있음). 툴에는 플러그인 버킷의 다른 이름을 고르는
-  설정이 없으므로, 다른 계정이 그 이름의 버킷을 가지고 있는 동안에는 이 계정과 리전에서 Deploy CDC
-  infrastructure를 실행할 수 없고, ECS Fargate에서는 작업·세션 상태가 저장되지 않으며 제외된 컬럼이 있는
-  테이블을 포함한 Full Load를 실행할 수 없음.
-- **이 계정에서 이전 버전을 실행했다면?** 소유자 확인 이전 버전은 다른 계정에 있는 그 이름의 버킷을, 그
-  버킷 정책이 허용하면 사용했고, 이 가이드의 이전 버전은 템플릿 버킷을 확인 없이
-  `mysql-dsql-migrator-templates-<account>-<region>`으로 만들었음. 두 이름을 이 계정의 관리자로, 앱
-  스택을 업데이트하기 전에 확인할 것: ECS Fargate에서는 앱이 시작할 때마다(v0.1.93 이후), 그 이름의
-  버킷이 없으면 이 계정에 플러그인 버킷을 만듦.
+  지정한 버킷을 다른 계정이 소유할 때도 마찬가지(오버레이 원장은 세션 상태 버킷에 있음). 단, ECS Fargate
+  템플릿이 지정하는 이전 이름은 위의 관리형 버킷을 뜻함.
+- **이 계정에서 이전 버전을 실행했다면?** 소유자 확인 이전 버전은 다른 계정에 있는 플러그인 버킷의 이전
+  이름 `mysql-dsql-migrator-plugins-<account>-<region>`의 버킷을, 그 버킷 정책이 허용하면 사용했고, 이
+  가이드의 이전 버전은 템플릿 버킷을 확인 없이 `mysql-dsql-migrator-templates-<account>-<region>`으로
+  만들었음(`-an` 이름은 확인할 필요가 없음: 이 계정만 만들 수 있고, 어떤 이전 버전도 쓰지 않았음). 두
+  이름을 이 계정의 관리자로, 앱 스택을 업데이트하기 전에 확인할 것: ECS Fargate에서는 앱이
+  시작할 때(v0.1.93 이후), 플러그인 버킷의 이전 이름으로 된 버킷이 없으면 이 계정에 그 버킷을 만들 수 있음.
   `aws s3api head-bucket --bucket <name> --expected-bucket-owner <account>`는 지금 다른 계정이
   버킷을 소유하면 403으로 응답함. 200(이 계정이 소유)과 404(그런 버킷 없음)만으로는 그 이름이 안전하다고
   할 수 없음: 이전 버전이 그 이름을 쓰는 동안 다른 계정이 그 이름을 가지고 있다가 이후 버킷을 삭제했을 수
@@ -1319,15 +1331,20 @@ aws cloudformation wait stack-delete-complete --stack-name mysql-dsql-migrator-e
 > 상태 EBS 볼륨은 설계상 **`DeletionPolicy: Retain`**이라 **스택 삭제 후에도 남습니다** — 보관을
 > 원치 않으면 수동으로 삭제하세요(`aws:cloudformation:stack-name` 태그로 찾음).
 
-CDC를 배포했다면 앱이 플러그인 버킷 `mysql-dsql-migrator-plugins-<account>-<region>`도 만들었습니다.
-어떤 스택도 소유하지 않으므로 이 버킷도 남고, 그 내용을 정리하는 것도 없습니다: 배포가 업로드한 모든 CDC
-플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각 최대 약 31 MiB)을 보관합니다. 이 계정·리전의 모든 도구 배포가 함께
-쓰므로, 그중 어느 것도 더 이상 쓰지 않게 되면 깨끗이 정리하기 위해 삭제하세요. 되돌릴 수 없고 이름을 풀어
-줍니다: 도구는 다음에 필요할 때 같은 이름으로 버킷을 다시 만들며, 그사이 다른 계정이 그 이름으로 만든 버킷은
-거부합니다. 이 계정이 소유할 때만 삭제하세요 — 소유하지 않으면 `head-bucket` 확인이 실패하고 아무것도 삭제되지
+CDC를 배포했다면 앱이 플러그인 버킷도 만들었습니다: `mysql-dsql-migrator-plugins-<account>-<region>-an`,
+또는 이전 버전이 만든 이름인 `mysql-dsql-migrator-plugins-<account>-<region>`(그 버킷이 있는 배포는 계속
+그것을 쓰고, me-south-1과 me-central-1은 항상 이 이름을 씀). 어떤 스택도 소유하지 않으므로 이 버킷도 남고,
+그 내용을 정리하는 것도 없습니다: 배포가 업로드한 모든 CDC 플러그인 파일(`cdc-plugins/<hash>/<file>`, 각각
+최대 약 31 MiB)을 보관합니다. 이 계정·리전의 모든 도구 배포가 이 버킷을 쓰므로, 그중 어느 것도 더 이상 쓰지
+않게 되면 깨끗이 정리하기 위해 삭제하세요. 되돌릴 수 없습니다. 도구는 다음에 필요할 때 버킷을 다시 만들며,
+다른 계정이 소유한 버킷은 절대 쓰지 않습니다. 두 명령을 모두 실행하세요: 각 명령은 버킷이 있고 이 계정이
+소유할 때만 그 버킷을 삭제하며, 그렇지 않으면 `head-bucket` 확인이 실패(404 또는 403)하고 아무것도 삭제되지
 않습니다:
 
 ```bash
+aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>-an" \
+  --expected-bucket-owner "<account>" \
+  && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>-an" --force --region "$AWS_REGION"
 aws s3api head-bucket --bucket "mysql-dsql-migrator-plugins-<account>-<region>" \
   --expected-bucket-owner "<account>" \
   && aws s3 rb "s3://mysql-dsql-migrator-plugins-<account>-<region>" --force --region "$AWS_REGION"
