@@ -298,6 +298,11 @@ from dsql_migrator.ui.data_migration._models import (
     cdc_prerequisite_block_reason,
 )
 
+# The CDC activity-log anchor, re-exported: the render code below and the
+# connector-transition logger call it as THIS module's global (so a patch on
+# ``dm._log_cdc_event`` still reaches them), and ``_cdc_ui`` imports it from ``_cdc_log``
+# too -- no longer back from this package, which is what breaks the cycle (dmshared-05).
+from dsql_migrator.ui.data_migration._cdc_log import _log_cdc_event
 # CDC status / controller / deploy-formatting logic (NiceGUI-free): the render code
 # below resolves the pure helpers/constants it consumes, and the ``dm.<name>`` readers
 # the rest.
@@ -5183,36 +5188,6 @@ def _render_migration_type_selector(
         ).classes("text-xs text-gray-500")
 
 
-def _log_cdc_event(
-    action: str,
-    *,
-    detail: "Optional[str]" = None,
-    status: ActivityStatus = ActivityStatus.STARTED,
-    exc: "Optional[BaseException]" = None,
-) -> None:
-    """Append a discrete CDC lifecycle milestone to the activity log.
-
-    Records control-plane actions (deploy / start / stop / teardown) and connector
-    state transitions as one-line events -- the audit trail of WHAT happened to the
-    CDC pipeline and WHEN. Continuous progress (replication lag) stays out of the log
-    (it would flood the rotated file); it lives in the live monitoring panel.
-
-    Applied row counts are the ONE exception, added deliberately: the per-table
-    Inserts/Updates/Deletes existed only on screen, so for a CDC migration the audit
-    trail had no record of what the data path actually moved -- half the evidence a
-    cut-over approval rests on. They are logged as a THROTTLED roll-up
-    (:func:`cdc_applied_rollup_due`) plus one final cumulative line at Stop, never
-    per poll, so the original "do not flood the file" intent still holds.
-    """
-    log_activity(
-        ActivityCategory.CDC, action, status=status, detail=detail,
-        # Forwarded so a DEBUG level attaches the (value-free) stacktrace. Without it a
-        # failed deploy / start / stop / teardown -- the actions an operator is most likely
-        # to be stuck on -- gained nothing from raising the level.
-        exc=exc,
-    )
-
-
 def _log_cdc_connector_transitions(migration_state, job_manager) -> None:
     """Log connector RUNNING/FAILED state transitions to the activity log.
 
@@ -5425,13 +5400,13 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# CDC data-plane UI (moved to ``_cdc_ui`` for file size; see that module's
-# docstring). Imported HERE, at the bottom of the module, so that the four
-# names ``_cdc_ui`` imports back from this package (``_log_cdc_event``,
-# ``migration_type_lock_reason``, ``_LOGGER``, ``_render_notice``) are already
-# defined above -- this ordering is what breaks the import cycle. Re-exported for
-# the screen code above and the ``dm.<name>`` readers only: rebinding ``dm.<name>``
-# does not change what ``_cdc_ui`` calls, so tests patch ``_cdc_ui`` itself.
+# CDC data-plane UI (moved to ``_cdc_ui`` for file size; see that module's docstring).
+# ``_cdc_ui`` imports nothing back from this package at its top level (dmshared-05: the
+# activity-log anchor comes from the leaf ``_cdc_log``, the logger and the notice renderer
+# it binds itself), so this import no longer depends on sitting below any definition --
+# it stays at the bottom only because the modules imported with it render the screen code
+# above. Re-exported for that screen code and the ``dm.<name>`` readers only: rebinding
+# ``dm.<name>`` does not change what ``_cdc_ui`` calls, so tests patch ``_cdc_ui`` itself.
 # ---------------------------------------------------------------------------
 from dsql_migrator.ui.data_migration._cdc_ui import (  # noqa: E402
     # CDC-domain constants re-exported from ``core.cdc`` via ``_cdc_ui`` so the

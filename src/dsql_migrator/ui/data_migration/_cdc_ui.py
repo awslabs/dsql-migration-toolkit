@@ -16,8 +16,12 @@ neither defines nor imports them.
 Split out of ``data_migration/__init__.py``, which re-exports (at the bottom of that file)
 the names its screen code uses and the ones its readers reach as ``dm.<name>``. A test
 patches this module itself: rebinding ``dm.<name>`` does not change what this module calls.
-The activity-log anchor (``_log_cdc_event``) and its connector-transition logger, and the
-migration-type lock helper, stay in ``__init__``; the Full Load step's render lives in
+This module imports nothing from that package at its top level (dmshared-05): the
+activity-log anchor ``_log_cdc_event`` is the leaf ``_cdc_log``'s, which ``__init__``
+imports too and whose connector-transition logger stays there, and ``_LOGGER`` /
+``_render_notice`` are bound here. Two helpers it reads inside a function
+(``exclusion_card_locked``, ``table_set_lock_reason``) are still imported from the package
+at call time, which no import order constrains. The Full Load step's render lives in
 ``_full_load_ui``.
 """
 
@@ -196,21 +200,22 @@ from dsql_migrator.ui.design import (
     section_header,
 )
 
-# These four names live in the package ``__init__``: the activity-log anchor
-# ``_log_cdc_event`` (a monkeypatch target for the connector-transition logger that
-# stays there), the ``migration_type_lock_reason`` helper, and the ``_LOGGER`` /
-# ``_render_notice`` module constants. ``__init__`` imports THIS module for
-# re-export, so the import below is only safe because ``__init__`` performs that
-# re-export at the very bottom -- after these four names are already bound. The
-# moved functions reference them as module globals, so they must be real imports
-# here (a module-level ``__getattr__`` would not satisfy a function's LOAD_GLOBAL).
+# This module imports NOTHING back from the package ``__init__`` at its top level
+# (dmshared-05): ``__init__`` imports THIS module for re-export, so such an import only
+# worked because that re-export sits at the very bottom of ``__init__``, after the names
+# were bound -- an ordering nothing declared and any new top-level import would break.
+# The three names it took from there are bound here instead, each the SAME object as
+# before: the activity-log anchor from the leaf module both sides now import
+# (``_cdc_log``), the package's logger by name (``__package__`` is this package), and the
+# design system's notice renderer under its in-file alias. They stay module globals, as
+# the functions that call them read them that way (a module-level ``__getattr__`` would
+# not satisfy a function's LOAD_GLOBAL) and tests patch them here.
+# ``migration_type_lock_reason`` was imported and never used; it is gone.
 from dsql_migrator.core.activity_log import ActivityStatus
-from dsql_migrator.ui.data_migration import (
-    _log_cdc_event,
-    migration_type_lock_reason,
-    _LOGGER,
-    _render_notice,
-)
+from dsql_migrator.ui.data_migration._cdc_log import _log_cdc_event
+
+_LOGGER = logging.getLogger(__package__)
+_render_notice = render_notice
 
 # The pure CDC state/phase predicates were extracted to _cdc_state.py so both this
 # module and _cdc_monitoring.py can import them without a cycle. This module imports only

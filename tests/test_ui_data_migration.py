@@ -24683,10 +24683,13 @@ def test_cdc_failure_forwards_the_exception_for_debug_stacktraces(monkeypatch) -
     """
     import dsql_migrator.ui.data_migration as dm
     import dsql_migrator.ui.data_migration._cdc_ui as cdc_ui
+    import dsql_migrator.ui.data_migration._cdc_log as cdc_log
 
     calls: list = []
+    # dmshared-05: _log_cdc_event -- the anchor the lifecycle wrapper calls -- is _cdc_log's
+    # now, so its log_activity is the one to patch (the package re-exports the anchor only).
     monkeypatch.setattr(
-        dm, "log_activity",
+        cdc_log, "log_activity",
         lambda category, action, **kw: calls.append((category, action, kw)),
     )
 

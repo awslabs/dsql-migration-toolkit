@@ -19,8 +19,9 @@ the reads ``_cdc_drift_fix`` makes (its runbooks, the dialog's ``render_notice``
 modules' docstrings say what a patch there reaches.
 
 Its imports: at its top, ``_cdc_state`` / ``_models`` / ``_cdc_status`` /
-``_table_set_lock`` / ``_cdc_drift_fix`` / ``_full_load_ui`` / ``core`` / ``ui.design`` and
-the package's ``_LOGGER``; inside functions, more of those and also ``ui.ai_tools``,
+``_table_set_lock`` / ``_cdc_drift_fix`` / ``_full_load_ui`` / ``core`` / ``ui.design``,
+and nothing from the package ``__init__`` (it binds the package's logger by name); inside
+functions, more of those and also ``ui.ai_tools``,
 ``ui.cdc_catalog_drift_gate``, ``ui.cdc_dlq_gate``, ``ui.cdc_replica_identity_gate``,
 ``ui.connect`` and NiceGUI's ``run``. One-directional with ``_cdc_ui``: never imports from
 it, since ``_cdc_ui`` imports the panels it renders from here.
@@ -28,6 +29,7 @@ it, since ``_cdc_ui`` imports the panels it renders from here.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from collections.abc import Mapping, Sequence
 from typing import Optional
@@ -187,7 +189,10 @@ from dsql_migrator.ui.design import (
     notice_panel,
     render_notice,
 )
-from dsql_migrator.ui.data_migration import _LOGGER
+# The package's logger, by name: ``__package__`` IS this package, so this is the object
+# ``__init__``'s ``_LOGGER`` is -- imported from the package, it was the last top-level
+# import any submodule made back into ``__init__`` (dmshared-05).
+_LOGGER = logging.getLogger(__package__)
 
 # The two legend strings that make a CLAIM about cut-over safety, pulled out as constants so
 # a test can hold the claim without driving the whole live-monitoring render (and so a future
