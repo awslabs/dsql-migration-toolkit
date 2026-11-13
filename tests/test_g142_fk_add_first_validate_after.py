@@ -1083,13 +1083,15 @@ def test_the_full_load_card_wires_the_same_engine() -> None:
     from dsql_migrator.ui.data_migration import _full_load_ui as flu
 
     src = inspect.getsource(dm.build_data_migration_screen)
-    action = src[src.index("def apply_foreign_keys_now("):]
+    # dmshared-04: the FK actions are make_fk_actions', the card's wiring the screen's.
+    fk_src = inspect.getsource(dm.make_fk_actions)
+    action = fk_src[fk_src.index("def apply_foreign_keys_now("):]
     action = action[:action.index("def _fk_apply_running(")]
     assert "on_validation=migration_state.record_fk_validation" in action
     assert "watch_foreign_key_validation(force=True)" in action
     assert "foreign_keys_validation=migration_state.fk_validation_view," in src
-    assert "validate_foreign_keys_again=validate_foreign_keys_again," in src
-    assert "fk_counted_before_add=foreign_keys_counted_before_add(" in src
+    assert "validate_foreign_keys_again=_fk.validate_again," in src
+    assert "fk_counted_before_add=foreign_keys_counted_before_add(" in fk_src
     card = inspect.getsource(flu._render_full_load_step)
     assert "render_fk_validation(" in card
 

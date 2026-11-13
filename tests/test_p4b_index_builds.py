@@ -1408,9 +1408,10 @@ def test_the_screen_wires_the_watch_and_the_retry_carry() -> None:
     assert "watch_index_builds=watch_index_builds," in src
     assert "prior_index_builds=prior_index_builds," in src
     watch = src[src.index("def watch_index_builds("):]
-    watch = watch[:watch.index("def _fk_revalidating(")]
+    watch = watch[:watch.index("def accept_quarantine_and_continue(")]
     assert "index_build_watch_due(job, job_manager)" in watch
-    assert "connection_factory=_fk_target_connect()" in watch and "refresh=refresh" in watch
+    # dmshared-04: the DSQL connection factory comes off the FK action bundle.
+    assert "connection_factory=_fk.target_connect()" in watch and "refresh=refresh" in watch
 
 
 # ---------------------------------------------------------------------------

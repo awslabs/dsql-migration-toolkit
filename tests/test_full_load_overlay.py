@@ -1171,7 +1171,10 @@ def test_the_start_and_retry_builders_pass_the_overlay_inputs_and_consume_the_fo
     # Marked just before each submit, not while the inputs are built.
     assert src.count("_mark_overlay_use(migration_state, inputs.overlay_columns) migration_state.job_id = job_manager.submit(work)") == 1
     assert src.count("_mark_overlay_use(migration_state, retry_inputs.overlay_columns) migration_state.job_id = job_manager.submit(work)") == 1
-    fk_builder = src[src.index("def _fk_apply_inputs"):src.index("fk_inputs = _fk_apply_inputs()")]
+    # dmshared-04: the FK action and its inputs builder are make_fk_actions' now.
+    fk_src = _squash(inspect.getsource(dm.make_fk_actions))
+    fk_builder = fk_src[fk_src.index("def _fk_apply_inputs"):
+                        fk_src.index("fk_inputs = _fk_apply_inputs()")]
     assert "_overlay_inputs" not in fk_builder  # loads nothing, no ledger
 
 

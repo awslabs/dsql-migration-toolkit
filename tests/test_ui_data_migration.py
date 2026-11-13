@@ -22746,9 +22746,12 @@ def test_the_fk_action_never_writes_the_full_load_job_slot() -> None:
         "retry may re-key it. A third erases the load's per-table rows, completion badge "
         "and export watermark, and blocks the CDC handoff."
     )
-    action = src[src.index("def apply_foreign_keys_now("):]
-    action = action[:action.index("def accept_quarantine_and_continue(")]
-    assert not re.search(r"migration_state\.job_id\s*=(?!=)", action), (
+    # dmshared-04: the FK action lives in make_fk_actions; the screen's own writes are
+    # counted above, so a slot write moved there would be caught here.
+    fk_src = inspect.getsource(dm.make_fk_actions)
+    action = fk_src[fk_src.index("def apply_foreign_keys_now("):]
+    action = action[:action.index("def _fk_apply_running(")]
+    assert not re.search(r"migration_state\.job_id\s*=(?!=)", fk_src), (
         "the FK action writes the Full Load's job slot again"
     )
     assert "set_fk_apply_job(" in action
@@ -23035,16 +23038,16 @@ def test_fk_card_inputs_are_providers_not_values_captured_at_page_render() -> No
 
     src = inspect.getsource(dm.build_data_migration_screen)
     for frozen in (
-        "foreign_keys_running=_fk_apply_running()",
+        "foreign_keys_running=_fk.running()",
         "foreign_keys_progress=migration_state.fk_apply_progress,",
         "foreign_keys_applied=migration_state.fk_apply_result,",
-        "foreign_keys_pending=fk_pending_count(),",
+        "foreign_keys_pending=_fk.pending_count(),",
     ):
         assert frozen not in src, (
             f"{frozen!r} is evaluated once at page render; the live region must be given a "
             "provider it can re-read on every refresh"
         )
-    assert "foreign_keys_running=_fk_apply_running," in src
+    assert "foreign_keys_running=_fk.running," in src
     assert "foreign_keys_progress=lambda: migration_state.fk_apply_progress," in src
 
 
@@ -23093,7 +23096,7 @@ def test_the_fk_action_publishes_per_fk_progress_and_no_fake_completion() -> Non
 
     import dsql_migrator.ui.data_migration as dm
 
-    src = inspect.getsource(dm.build_data_migration_screen)
+    src = inspect.getsource(dm.make_fk_actions)  # dmshared-04
     assert "on_progress=migration_state.set_fk_apply_progress," in src, (
         "the action must hand the engine a reporter, or the card cannot advance"
     )
@@ -23255,7 +23258,7 @@ def test_the_total_provider_no_longer_zeroes_itself_once_a_result_exists() -> No
 
     import dsql_migrator.ui.data_migration as dm
 
-    src = inspect.getsource(dm.build_data_migration_screen)
+    src = inspect.getsource(dm.make_fk_actions)  # dmshared-04
     start = src.index("def fk_pending_count()")
     body = src[start:start + src[start:].index("def cancel_foreign_keys()")]
     assert "if migration_state.fk_apply_result is not None:" not in body, (
@@ -23279,7 +23282,7 @@ def test_resuming_a_stopped_fk_pass_reports_as_running() -> None:
 
     import dsql_migrator.ui.data_migration as dm
 
-    src = inspect.getsource(dm.build_data_migration_screen)
+    src = inspect.getsource(dm.make_fk_actions)  # dmshared-04
     start = src.index("def apply_foreign_keys_now()")
     body = src[start:start + src[start:].index("def _fk_apply_running()")]
     assert "set_fk_apply_result(None)" in body, (
@@ -28344,7 +28347,10 @@ def test_every_engine_read_in_the_data_migration_screen_survives_a_restore() -> 
         r"|[\"']source_config[\"'],\s*None\),\s*[\"']source_type[\"']"
         r"|\bsource_config\s*,\s*[\"']source_type[\"']"
     )
-    screen = inspect.getsource(dm.build_data_migration_screen)
+    # dmshared-04: the screen's FK actions (make_fk_actions) are read with it.
+    screen = inspect.getsource(dm.build_data_migration_screen) + inspect.getsource(
+        dm.make_fk_actions
+    )
     # Validation and Cut over (ui/cutover.py, split out of ui/validation.py), read together.
     cut_over = inspect.getsource(uival) + inspect.getsource(uicut)
     for where, src in (("build_data_migration_screen", screen),
@@ -30462,7 +30468,7 @@ def test_the_data_migration_fk_action_is_scoped_to_the_migration_selection() -> 
 
     import dsql_migrator.ui.data_migration as dm
 
-    src = " ".join(inspect.getsource(dm.build_data_migration_screen).split())
+    src = " ".join(inspect.getsource(dm.make_fk_actions).split())  # dmshared-04
     start = src.index("def _fk_apply_inputs")
     seg = src[start:src.index("def ", start + 10)]
     assert "_fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)" in seg

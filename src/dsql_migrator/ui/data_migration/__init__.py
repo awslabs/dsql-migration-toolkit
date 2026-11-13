@@ -2484,134 +2484,13 @@ def build_data_migration_screen(
                         ),
                     )
 
-            def _fk_apply_inputs():
-                """Rebuild the load inputs so the FK action applies the SAME conversions."""
-                _src = session.source_config
-                _tgt = session.target_config
-                _inv = _inventory()
-                # The session's engine (session_source_type), not _src's: a RESTORED
-                # session has no source_config, and reading it raised -- which the card's
-                # count swallowed as 0 pending keys.
-                _conv, _applied_conv = session_applied_conversions(session, _inv, conv_state)
-                # The migration's keys (a key is on its child) plus keys INTO it from an
-                # unselected child -- the ones a replace pre-drop or the CDC precondition
-                # may have removed. The pinned selection, not the live picker: a stale
-                # target inventory must not hide pending keys.
-                _fk_tables = getattr(migration_state.selection, "selected_tables", None)
-                _fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)
-                _fk_inputs = DataMigrationInputs(
-                    source_config=_src,
-                    source_password=session.source_password,
-                    target_config=_tgt,
-                    inventory=_inv,
-                    aws_profile=session.aws_profile,
-                    replace_tables=frozenset(),      # no data movement: DDL only
-                    is_cdc_migration=migration_state.migration_type
-                    is MigrationType.FULL_LOAD_AND_CDC,
-                    # Only the migrated tables' keys (a key is on its child): a table the
-                    # migration never loaded is not altered. The pinned selection, not the
-                    # live picker: a stale target inventory must not hide pending keys.
-                    table_conversions=_fk_scoped,
-                    # Already computed: saves re-deriving it on every 1.5 s poll.
-                    index_renames=_conv.index_renames,
-                    fk_optional_tables=foreign_keys_pointing_in(_fk_scoped, _fk_tables),
-                    # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
-                    excluded_lob_columns=effective_lob_exclusions(
-                        migration_state,
-                        _inv,
-                        applied_conversions=_applied_conv,
-                        preserve_foreign_keys=conv_state.preserve_foreign_keys,
-                    ),
-                )
-                # G142: the keys whose parent side is incomplete by design keep the orphan
-                # count before their ADD; every other key is added at once.
-                return dataclasses.replace(
-                    _fk_inputs,
-                    fk_counted_before_add=foreign_keys_counted_before_add(
-                        _fk_scoped, _fk_tables, _fk_inputs.excluded_lob_columns
-                    ),
-                )
-
-            def fk_pending_count() -> int:
-                """This run's TOTAL preserved-foreign-key count (static; no DB access).
-
-                It used to return 0 as soon as ``fk_apply_result`` was set, which hid a
-                STOPPED pass completely: the card reads this to work out how many foreign
-                keys a finished pass never reached (total - applied - skipped - failed), so
-                zeroing it made a 2-of-6 stop render as a green "2 applied / referential
-                integrity is in place" with the Apply button withdrawn -- and nothing ever
-                clears the result, so that screen was terminal. The renderer decides what to
-                SHOW; this only reports the denominator.
-                """
-                # Recomputed only when what it is derived from changes (the inventory is
-                # compared by identity: a re-read is a new object).
-                _absent = migration_state.fk_absent_children()
-                _key = (
-                    session_source_type(session),
-                    conv_state.preserve_foreign_keys,
-                    tuple(sorted((conv_state.edited_target_ddls or {}).items())),
-                    tuple(getattr(migration_state.selection, "selected_tables", None) or ()),
-                    migration_state.migration_type,
-                    # The children the last pass left out as absent: the pass's and Cut
-                    # over's own key set (foreign_keys_to_apply), so a clean pass leaves
-                    # nothing "NOT reached".
-                    tuple(sorted(_absent)),
-                )
-                _inv = _inventory()
-                if _fk_count_memo.get("inventory") is _inv and _fk_count_memo.get("key") == _key:
-                    return _fk_count_memo["count"]
-                try:
-                    count = pending_foreign_key_count(
-                        migrator_factory(_fk_apply_inputs()), absent=_absent
-                    )
-                except Exception:  # noqa: BLE001 - advisory count; never break the panel
-                    return 0
-                _fk_count_memo.update(inventory=_inv, key=_key, count=count)
-                return count
-
-            def cancel_foreign_keys() -> None:
-                """Stop the FK pass. Already-applied constraints stay; the rest remain
-                pending and the action can be run again (a duplicate ADD is a no-op, 42710).
-
-                A sibling of the action, not nested inside it: the renderer needs it, and a
-                nested definition is invisible there (the undefined-global guard caught that).
-                """
-                jid = migration_state.fk_apply_job_id
-                if jid:
-                    job_manager.request_cancel(jid)
-                refresh()
-
-            def _fk_target_connect():
-                """A fresh-DSQL-connection factory for the FK validation watch, or None."""
-                if getattr(session, "target_config", None) is None:
-                    return None
-                return DsqlConnector(
-                    session.target_config, aws_profile=session.aws_profile
-                ).connect
-
-            def _fk_defs():
-                """The FK metadata the watch explains a failure with (resolved in its job)."""
-                from dsql_migrator.ui.data_migration._fk_validation import foreign_key_defs
-
-                return foreign_key_defs(_fk_apply_inputs().table_conversions)
-
-            def watch_foreign_key_validation(force: bool = False) -> None:
-                """Start the background read of Aurora DSQL's verdict when one is due (a
-                render: something is still unread or being validated) or right after a pass
-                (``force``). Single flight; no I/O here."""
-                from dsql_migrator.ui.data_migration._fk_validation import (
-                    fk_watch_due,
-                    start_fk_validation_watch,
-                )
-
-                if not force and not fk_watch_due(
-                    migration_state, migration_state.fk_validation_view(), job_manager
-                ):
-                    return
-                start_fk_validation_watch(
-                    migration_state, job_manager, connection_factory=_fk_target_connect(),
-                    fk_defs=_fk_defs, category=ActivityCategory.FULL_LOAD, refresh=refresh,
-                )
+            # The foreign-key actions of the Full Load step (dmshared-04): one bundle, built
+            # per render like the handlers it replaces, over this render's refresh.
+            _fk = make_fk_actions(
+                ui, migration_state, job_manager, session, conv_state,
+                inventory=_inventory, migrator_factory=migrator_factory, refresh=refresh,
+                count_memo=_fk_count_memo,
+            )
 
             def watch_index_builds(job) -> None:
                 """P4b: start the background read of Aurora DSQL's builds of the secondary
@@ -2626,103 +2505,8 @@ def build_data_migration_screen(
                 if not index_build_watch_due(job, job_manager):
                     return
                 start_index_build_watch(
-                    job_manager, job, connection_factory=_fk_target_connect(), refresh=refresh
+                    job_manager, job, connection_factory=_fk.target_connect(), refresh=refresh
                 )
-
-            def _fk_revalidating() -> bool:
-                """Is a "Validate again" submission still running?"""
-                from dsql_migrator.ui.data_migration._fk_validation import _job_live
-
-                return _job_live(job_manager, migration_state.fk_revalidation_job_id)
-
-            def validate_foreign_keys_again(keys) -> None:
-                """"Validate again": Aurora DSQL checks the keys' rows anew (no DDL, no
-                drained attestation: every key in place already enforces new writes)."""
-                from dsql_migrator.ui.data_migration._fk_validation import (
-                    submit_fk_revalidation,
-                )
-
-                submit_fk_revalidation(
-                    migration_state, job_manager, connection_factory=_fk_target_connect(),
-                    keys=list(keys), fk_defs=_fk_defs,
-                    category=ActivityCategory.FULL_LOAD, refresh=refresh,
-                )
-                refresh()
-
-            def apply_foreign_keys_now() -> None:
-                """Apply the preserved foreign keys -- an explicit operator action.
-
-                Foreign keys are not applied as part of the load: this is the same flow a
-                CDC migration uses at cut over. G142: each key is added ``NOT VALID`` at
-                once (seconds; it enforces every new write from then on) and Aurora DSQL
-                validates the rows already loaded as an async job, whose id is recorded on
-                the session and read back by the background watch -- a failed validation
-                IS observable (sys.jobs, convalidated), and only then are its rows counted.
-                """
-                fk_inputs = _fk_apply_inputs()
-                fk_migrator = migrator_factory(fk_inputs)
-
-                total = pending_foreign_key_count(
-                    fk_migrator, absent=migration_state.fk_absent_children()
-                )
-                # CLEAR THE PREVIOUS RESULT, and do it BEFORE submitting. _fk_apply_running()
-                # returns False while a result exists, so a RESUMED pass (now reachable: the
-                # card keeps the action when a stopped pass left foreign keys unreached) would
-                # report as not-running for its whole duration -- stale summary, no spinner, no
-                # per-FK progress, no "Stop applying" (that branch owns the cancel), no poll
-                # re-arm, and an ENABLED Apply button the operator could click again to submit a
-                # second concurrent pass. Ordering is load-bearing: clearing AFTER submit can
-                # wipe a fast worker's fresh result and strand the card on "not yet applied".
-                # Placed after the inputs/count so a raise in migrator_factory leaves the
-                # previous result intact.
-                migration_state.set_fk_apply_result(None)
-                migration_state.set_fk_apply_progress(0, total)
-
-                def work(handle: JobHandle) -> None:
-                    # PER-FK progress. Before this the card only ever showed two values --
-                    # (0, total) written before submit and (total, total) written in a
-                    # finally -- so an operator watching a multi-minute pass saw
-                    # "0 of N done" the whole way and concluded it had hung, which is the
-                    # very thing the explicit action was introduced to stop. The engine now
-                    # reports each FK as it settles, and re-publishes the total, so a
-                    # denominator that disagreed with the pass is corrected too.
-                    #
-                    # No finally that forces (total, total): the card reads progress ONLY
-                    # while the job is running, so a terminal write is never displayed --
-                    # and forcing it would misreport a pass cut short by Stop as complete.
-                    result = _apply_foreign_keys_for(
-                        fk_migrator, handle,
-                        on_progress=migration_state.set_fk_apply_progress,
-                        # G142: the recorded VALIDATE jobs in (a running one is kept), the
-                        # submitted ones out, then the watch reads Aurora DSQL's verdict.
-                        validation_jobs={
-                            key: rec.job_id
-                            for key, rec in migration_state.fk_validation_records().items()
-                            if rec.job_id
-                        },
-                        on_validation=migration_state.record_fk_validation,
-                    )
-                    migration_state.set_fk_apply_result(result)
-                    watch_foreign_key_validation(force=True)
-
-                # Its OWN slot. Writing `migration_state.job_id` here (copied from the
-                # retry path, where the new job IS the load) made the Full Load panel read
-                # this job instead: per-table rows, the completion badge and the EXPORT
-                # WATERMARK all disappeared, and CDC then had "no usable Full Load
-                # watermark" -- the load's own result destroyed by the action the tool told
-                # the operator to run.
-                migration_state.set_fk_apply_job(job_manager.submit(work))
-                ui.notify(
-                    f"Adding {total} foreign key(s) — progress below. Each one is added at "
-                    "once and enforces every new write; Aurora DSQL then validates the rows "
-                    "already loaded in the background.",
-                    type="positive", position="top",
-                )
-                refresh()
-
-            def _fk_apply_running() -> bool:
-                """Is the FK action's OWN job still running? (:func:`fk_apply_running`)"""
-                return fk_apply_running(migration_state, job_manager)
 
             def accept_quarantine_and_continue() -> None:
                 # Accept permanently-quarantined rows (>1 MiB values, etc.) as an
@@ -3162,7 +2946,7 @@ def build_data_migration_screen(
                             accept_quarantine_and_continue=accept_quarantine_and_continue,
                             # Foreign keys are an explicit action, not part of the load --
                             # the same flow a CDC migration uses at cut over.
-                            apply_foreign_keys=apply_foreign_keys_now,
+                            apply_foreign_keys=_fk.apply_now,
                             # PROVIDERS, not values. The FK card is rendered inside the
                             # step's @ui.refreshable live region, so a value evaluated here
                             # is captured when the PAGE renders and then frozen: refreshing
@@ -3172,17 +2956,17 @@ def build_data_migration_screen(
                             # constraints existed on the target, and only a manual page
                             # reload showed "6 applied". A callable is re-read on every
                             # refresh, so the region reflects the job as it advances.
-                            foreign_keys_pending=fk_pending_count,
+                            foreign_keys_pending=_fk.pending_count,
                             foreign_keys_applied=lambda: migration_state.fk_apply_result,
-                            foreign_keys_running=_fk_apply_running,
+                            foreign_keys_running=_fk.running,
                             foreign_keys_progress=lambda: migration_state.fk_apply_progress,
-                            cancel_foreign_keys=cancel_foreign_keys,
+                            cancel_foreign_keys=_fk.cancel,
                             # G142: Aurora DSQL's verdict on the keys in place, read back
                             # from the target by the recorded job ids.
                             foreign_keys_validation=migration_state.fk_validation_view,
-                            validate_foreign_keys_again=validate_foreign_keys_again,
-                            foreign_keys_revalidating=_fk_revalidating,
-                            watch_foreign_keys=watch_foreign_key_validation,
+                            validate_foreign_keys_again=_fk.validate_again,
+                            foreign_keys_revalidating=_fk.revalidating,
+                            watch_foreign_keys=_fk.progress_watch,
                             # P4b: Aurora DSQL's builds of the secondary indexes the run
                             # submitted, read back by job id while the page is open.
                             watch_index_builds=watch_index_builds,
@@ -3598,6 +3382,288 @@ def build_data_migration_screen(
         runner()
 
     return content, header_runner
+
+
+@dataclass(frozen=True)
+class FkActions:
+    """The Full Load step's foreign-key actions (:func:`make_fk_actions`), as the FK card is
+    given them: PROVIDERS, not values -- the card renders inside a refreshable region, so a
+    value read when the page renders would freeze there."""
+
+    apply_inputs: "Callable[[], DataMigrationInputs]"
+    pending_count: "Callable[[], int]"
+    running: "Callable[[], bool]"
+    progress_watch: "Callable[..., None]"
+    cancel: "Callable[[], None]"
+    apply_now: "Callable[[], None]"
+    revalidating: "Callable[[], bool]"
+    validate_again: "Callable[[object], None]"
+    target_connect: "Callable[[], Optional[Callable[[], object]]]"
+
+
+def make_fk_actions(
+    ui,
+    migration_state,
+    job_manager,
+    session,
+    conv_state,
+    *,
+    inventory,
+    migrator_factory,
+    refresh,
+    count_memo,
+) -> FkActions:
+    """The Full Load step's foreign-key actions, for the screen that renders its card.
+
+    Lifted out of ``build_data_migration_screen``'s render closure unchanged (dmshared-04),
+    so each one is reachable on its own: the load inputs the pass applies, this run's
+    pending-key count (memoised in ``count_memo``, the dict the screen keeps across
+    renders), the running / revalidating predicates, Stop, "Apply foreign keys",
+    "Validate again" and the background watch of Aurora DSQL's verdict. ``inventory`` is the
+    screen's inventory provider (called, never a value: a re-read is a new object) and
+    ``refresh`` the render's own refresh. Built per render, as the handlers were.
+
+    ``target_connect`` is the fresh-DSQL-connection factory the FK watch runs on; the step's
+    index-build watch (P4b), which is not an FK action, takes it from here too.
+    """
+    # Under the names the handlers read in the closure they came from.
+    _inventory, _fk_count_memo = inventory, count_memo
+
+    def _fk_apply_inputs():
+        """Rebuild the load inputs so the FK action applies the SAME conversions."""
+        _src = session.source_config
+        _tgt = session.target_config
+        _inv = _inventory()
+        # The session's engine (session_source_type), not _src's: a RESTORED
+        # session has no source_config, and reading it raised -- which the card's
+        # count swallowed as 0 pending keys.
+        _conv, _applied_conv = session_applied_conversions(session, _inv, conv_state)
+        # The migration's keys (a key is on its child) plus keys INTO it from an
+        # unselected child -- the ones a replace pre-drop or the CDC precondition
+        # may have removed. The pinned selection, not the live picker: a stale
+        # target inventory must not hide pending keys.
+        _fk_tables = getattr(migration_state.selection, "selected_tables", None)
+        _fk_scoped = foreign_keys_in_scope(_applied_conv, _fk_tables)
+        _fk_inputs = DataMigrationInputs(
+            source_config=_src,
+            source_password=session.source_password,
+            target_config=_tgt,
+            inventory=_inv,
+            aws_profile=session.aws_profile,
+            replace_tables=frozenset(),      # no data movement: DDL only
+            is_cdc_migration=migration_state.migration_type
+            is MigrationType.FULL_LOAD_AND_CDC,
+            # Only the migrated tables' keys (a key is on its child): a table the
+            # migration never loaded is not altered. The pinned selection, not the
+            # live picker: a stale target inventory must not hide pending keys.
+            table_conversions=_fk_scoped,
+            # Already computed: saves re-deriving it on every 1.5 s poll.
+            index_renames=_conv.index_renames,
+            fk_optional_tables=foreign_keys_pointing_in(_fk_scoped, _fk_tables),
+            # The EFFECTIVE set (key columns dropped): see effective_lob_exclusions.
+            excluded_lob_columns=effective_lob_exclusions(
+                migration_state,
+                _inv,
+                applied_conversions=_applied_conv,
+                preserve_foreign_keys=conv_state.preserve_foreign_keys,
+            ),
+        )
+        # G142: the keys whose parent side is incomplete by design keep the orphan
+        # count before their ADD; every other key is added at once.
+        return dataclasses.replace(
+            _fk_inputs,
+            fk_counted_before_add=foreign_keys_counted_before_add(
+                _fk_scoped, _fk_tables, _fk_inputs.excluded_lob_columns
+            ),
+        )
+
+    def fk_pending_count() -> int:
+        """This run's TOTAL preserved-foreign-key count (static; no DB access).
+
+        It used to return 0 as soon as ``fk_apply_result`` was set, which hid a
+        STOPPED pass completely: the card reads this to work out how many foreign
+        keys a finished pass never reached (total - applied - skipped - failed), so
+        zeroing it made a 2-of-6 stop render as a green "2 applied / referential
+        integrity is in place" with the Apply button withdrawn -- and nothing ever
+        clears the result, so that screen was terminal. The renderer decides what to
+        SHOW; this only reports the denominator.
+        """
+        # Recomputed only when what it is derived from changes (the inventory is
+        # compared by identity: a re-read is a new object).
+        _absent = migration_state.fk_absent_children()
+        _key = (
+            session_source_type(session),
+            conv_state.preserve_foreign_keys,
+            tuple(sorted((conv_state.edited_target_ddls or {}).items())),
+            tuple(getattr(migration_state.selection, "selected_tables", None) or ()),
+            migration_state.migration_type,
+            # The children the last pass left out as absent: the pass's and Cut
+            # over's own key set (foreign_keys_to_apply), so a clean pass leaves
+            # nothing "NOT reached".
+            tuple(sorted(_absent)),
+        )
+        _inv = _inventory()
+        if _fk_count_memo.get("inventory") is _inv and _fk_count_memo.get("key") == _key:
+            return _fk_count_memo["count"]
+        try:
+            count = pending_foreign_key_count(
+                migrator_factory(_fk_apply_inputs()), absent=_absent
+            )
+        except Exception:  # noqa: BLE001 - advisory count; never break the panel
+            return 0
+        _fk_count_memo.update(inventory=_inv, key=_key, count=count)
+        return count
+
+    def cancel_foreign_keys() -> None:
+        """Stop the FK pass. Already-applied constraints stay; the rest remain
+        pending and the action can be run again (a duplicate ADD is a no-op, 42710).
+
+        A sibling of the action, not nested inside it: the renderer needs it, and a
+        nested definition is invisible there (the undefined-global guard caught that).
+        """
+        jid = migration_state.fk_apply_job_id
+        if jid:
+            job_manager.request_cancel(jid)
+        refresh()
+
+    def _fk_target_connect():
+        """A fresh-DSQL-connection factory for the FK validation watch, or None."""
+        if getattr(session, "target_config", None) is None:
+            return None
+        return DsqlConnector(
+            session.target_config, aws_profile=session.aws_profile
+        ).connect
+
+    def _fk_defs():
+        """The FK metadata the watch explains a failure with (resolved in its job)."""
+        from dsql_migrator.ui.data_migration._fk_validation import foreign_key_defs
+
+        return foreign_key_defs(_fk_apply_inputs().table_conversions)
+
+    def watch_foreign_key_validation(force: bool = False) -> None:
+        """Start the background read of Aurora DSQL's verdict when one is due (a
+        render: something is still unread or being validated) or right after a pass
+        (``force``). Single flight; no I/O here."""
+        from dsql_migrator.ui.data_migration._fk_validation import (
+            fk_watch_due,
+            start_fk_validation_watch,
+        )
+
+        if not force and not fk_watch_due(
+            migration_state, migration_state.fk_validation_view(), job_manager
+        ):
+            return
+        start_fk_validation_watch(
+            migration_state, job_manager, connection_factory=_fk_target_connect(),
+            fk_defs=_fk_defs, category=ActivityCategory.FULL_LOAD, refresh=refresh,
+        )
+
+    def _fk_revalidating() -> bool:
+        """Is a "Validate again" submission still running?"""
+        from dsql_migrator.ui.data_migration._fk_validation import _job_live
+
+        return _job_live(job_manager, migration_state.fk_revalidation_job_id)
+
+    def validate_foreign_keys_again(keys) -> None:
+        """"Validate again": Aurora DSQL checks the keys' rows anew (no DDL, no
+        drained attestation: every key in place already enforces new writes)."""
+        from dsql_migrator.ui.data_migration._fk_validation import (
+            submit_fk_revalidation,
+        )
+
+        submit_fk_revalidation(
+            migration_state, job_manager, connection_factory=_fk_target_connect(),
+            keys=list(keys), fk_defs=_fk_defs,
+            category=ActivityCategory.FULL_LOAD, refresh=refresh,
+        )
+        refresh()
+
+    def apply_foreign_keys_now() -> None:
+        """Apply the preserved foreign keys -- an explicit operator action.
+
+        Foreign keys are not applied as part of the load: this is the same flow a
+        CDC migration uses at cut over. G142: each key is added ``NOT VALID`` at
+        once (seconds; it enforces every new write from then on) and Aurora DSQL
+        validates the rows already loaded as an async job, whose id is recorded on
+        the session and read back by the background watch -- a failed validation
+        IS observable (sys.jobs, convalidated), and only then are its rows counted.
+        """
+        fk_inputs = _fk_apply_inputs()
+        fk_migrator = migrator_factory(fk_inputs)
+
+        total = pending_foreign_key_count(
+            fk_migrator, absent=migration_state.fk_absent_children()
+        )
+        # CLEAR THE PREVIOUS RESULT, and do it BEFORE submitting. _fk_apply_running()
+        # returns False while a result exists, so a RESUMED pass (now reachable: the
+        # card keeps the action when a stopped pass left foreign keys unreached) would
+        # report as not-running for its whole duration -- stale summary, no spinner, no
+        # per-FK progress, no "Stop applying" (that branch owns the cancel), no poll
+        # re-arm, and an ENABLED Apply button the operator could click again to submit a
+        # second concurrent pass. Ordering is load-bearing: clearing AFTER submit can
+        # wipe a fast worker's fresh result and strand the card on "not yet applied".
+        # Placed after the inputs/count so a raise in migrator_factory leaves the
+        # previous result intact.
+        migration_state.set_fk_apply_result(None)
+        migration_state.set_fk_apply_progress(0, total)
+
+        def work(handle: JobHandle) -> None:
+            # PER-FK progress. Before this the card only ever showed two values --
+            # (0, total) written before submit and (total, total) written in a
+            # finally -- so an operator watching a multi-minute pass saw
+            # "0 of N done" the whole way and concluded it had hung, which is the
+            # very thing the explicit action was introduced to stop. The engine now
+            # reports each FK as it settles, and re-publishes the total, so a
+            # denominator that disagreed with the pass is corrected too.
+            #
+            # No finally that forces (total, total): the card reads progress ONLY
+            # while the job is running, so a terminal write is never displayed --
+            # and forcing it would misreport a pass cut short by Stop as complete.
+            result = _apply_foreign_keys_for(
+                fk_migrator, handle,
+                on_progress=migration_state.set_fk_apply_progress,
+                # G142: the recorded VALIDATE jobs in (a running one is kept), the
+                # submitted ones out, then the watch reads Aurora DSQL's verdict.
+                validation_jobs={
+                    key: rec.job_id
+                    for key, rec in migration_state.fk_validation_records().items()
+                    if rec.job_id
+                },
+                on_validation=migration_state.record_fk_validation,
+            )
+            migration_state.set_fk_apply_result(result)
+            watch_foreign_key_validation(force=True)
+
+        # Its OWN slot. Writing `migration_state.job_id` here (copied from the
+        # retry path, where the new job IS the load) made the Full Load panel read
+        # this job instead: per-table rows, the completion badge and the EXPORT
+        # WATERMARK all disappeared, and CDC then had "no usable Full Load
+        # watermark" -- the load's own result destroyed by the action the tool told
+        # the operator to run.
+        migration_state.set_fk_apply_job(job_manager.submit(work))
+        ui.notify(
+            f"Adding {total} foreign key(s) — progress below. Each one is added at "
+            "once and enforces every new write; Aurora DSQL then validates the rows "
+            "already loaded in the background.",
+            type="positive", position="top",
+        )
+        refresh()
+
+    def _fk_apply_running() -> bool:
+        """Is the FK action's OWN job still running? (:func:`fk_apply_running`)"""
+        return fk_apply_running(migration_state, job_manager)
+
+    return FkActions(
+        apply_inputs=_fk_apply_inputs,
+        pending_count=fk_pending_count,
+        running=_fk_apply_running,
+        progress_watch=watch_foreign_key_validation,
+        cancel=cancel_foreign_keys,
+        apply_now=apply_foreign_keys_now,
+        revalidating=_fk_revalidating,
+        validate_again=validate_foreign_keys_again,
+        target_connect=_fk_target_connect,
+    )
 
 
 def overlay_in_play(migration_state, inventory) -> bool:
