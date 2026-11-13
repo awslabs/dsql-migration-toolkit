@@ -19,7 +19,9 @@ What is covered:
 - idempotent no-clobber: when the live offset is already at/past the watermark
   the seed is SKIPPED (a legitimately-advanced connector is never rewound);
 - read-modify-write preserves the live connector's offset shape;
-- Delete is a no-op success and the handler always sends a CFN response.
+- Delete is a no-op success and the handler always sends a CFN response;
+- a topic Kafka refuses is named in the FAILED response's Reason, and no other
+  exception's text ever becomes the Reason.
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ class _Recorder:
         self.throttled_calls = 0   # admin calls that fail "Node paused" before succeeding
         self.list_topics_calls = 0
         self.create_calls = 0
+        self.invalid_topics = set()  # names Kafka refuses: create_topics raises InvalidTopicError
 
 
 def _install_fakes(recorder: _Recorder) -> list[str]:
@@ -89,9 +92,11 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
     cfn.SUCCESS = "SUCCESS"
     cfn.FAILED = "FAILED"
     cfn.sent = []  # (status, data, physical_id)
+    cfn.sent_kwargs = []  # the keyword arguments of each send (reason=...)
 
     def _send(event, context, status, data, physical_id=None, **kw):
         cfn.sent.append((status, data, physical_id))
+        cfn.sent_kwargs.append(kw)
 
     cfn.send = _send
     sys.modules["cfnresponse"] = cfn
@@ -121,6 +126,12 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
         # paused for a throttle (MSK Serverless throttles CreateTopics).
         pass
 
+    class _InvalidTopicError(Exception):
+        # kafka.errors.InvalidTopicError (INVALID_TOPIC, errno 17): kafka-python 3.0.10
+        # raises it for a name Kafka does not allow, and for one that differs from a
+        # topic already on the cluster only in a '.' against a '_'.
+        errno = 17
+
     def _maybe_throttled():
         if recorder.throttled_calls > 0:
             recorder.throttled_calls -= 1
@@ -140,6 +151,11 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
             _maybe_throttled()
             if recorder.create_raises is not None:
                 raise recorder.create_raises()
+            for t in topics:
+                if t.name in recorder.invalid_topics:
+                    raise _InvalidTopicError(
+                        f"Request 'CreateTopicsRequest' failed for {t.name}"
+                    )
             for t in topics:
                 recorder.created_topics.append(
                     (t.name, t.num_partitions, t.topic_configs)
@@ -229,6 +245,7 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
     errors_mod = types.ModuleType("kafka.errors")
     errors_mod.TopicAlreadyExistsError = _TopicAlreadyExistsError
     errors_mod.NodeNotReadyError = _NodeNotReadyError
+    errors_mod.InvalidTopicError = _InvalidTopicError
 
     kafka.admin = admin_mod
     kafka.errors = errors_mod
@@ -240,6 +257,7 @@ def _install_fakes(recorder: _Recorder) -> list[str]:
     # Expose the exception type so a test can trigger the "topic already exists" path.
     recorder.TopicAlreadyExistsError = _TopicAlreadyExistsError
     recorder.NodeNotReadyError = _NodeNotReadyError
+    recorder.InvalidTopicError = _InvalidTopicError
     return added
 
 
@@ -1068,3 +1086,133 @@ def test_offset_and_dlq_topic_creation_are_throttle_tolerant_too(seeder_env, mon
     recorder.throttled_calls = 1
     module._ensure_dlq_topic("boot:9098", "ap-northeast-2", "dsql-sink-dlq", 4194304)
     assert {name for name, _p, _c in recorder.created_topics} == {"offsets", "dsql-sink-dlq"}
+
+
+# --- A topic Kafka refuses: the FAILED response names it (dotted-names step 2) ----------
+
+
+# The refusal, word for word: the topic, both causes, the rollback and the way on.
+_REFUSED_TOPIC_MSG = (
+    "Kafka refused to create the CDC topic dsqlcdc.app_v2.users: a topic already on the "
+    "cluster differs from it only in a '.' against a '_' (one an earlier Start CDC "
+    "created), or Kafka does not allow the name. CloudFormation rolls this Start CDC "
+    "back. Delete CDC infrastructure and deploy it again (its new cluster has no old "
+    "topics)."
+)
+
+
+def test_a_data_topic_kafka_refuses_is_named_and_none_after_it_is_tried(
+    seeder_env, monkeypatch,
+) -> None:
+    """FAILS WITHOUT THE FIX: kafka-python's InvalidTopicError (errno 17) propagated as is,
+    so CloudFormation's reason was only "See the details in CloudWatch Log Stream" and the
+    Start CDC activity log never said which topic or why. Say dsqlcdc.app.v2_users is
+    left on the cluster by an earlier Start: Kafka refuses dsqlcdc.app_v2.users. It
+    becomes a TopicRefusedError naming the topic, with the Kafka error kept as its cause;
+    the topics before it stay created, none after it is tried, and nothing is retried
+    (no wait fixes it)."""
+    module, recorder = seeder_env
+    slept: list = []
+    monkeypatch.setattr(module.time, "sleep", slept.append)
+    recorder.invalid_topics = {"dsqlcdc.app_v2.users"}
+    with pytest.raises(module.TopicRefusedError) as excinfo:
+        module._ensure_data_topics(
+            "boot:9098", "ap-northeast-2",
+            "dsqlcdc.app.orders,dsqlcdc.app_v2.users,dsqlcdc.app.items", 1,
+        )
+    assert str(excinfo.value) == _REFUSED_TOPIC_MSG
+    assert excinfo.value.topic == "dsqlcdc.app_v2.users"
+    assert isinstance(excinfo.value.__cause__, recorder.InvalidTopicError)
+    assert excinfo.value.__cause__.errno == 17
+    assert [name for name, _p, _c in recorder.created_topics] == ["dsqlcdc.app.orders"]
+    assert recorder.create_calls == 2 and slept == []
+
+
+def test_a_dlq_topic_kafka_refuses_is_named(seeder_env) -> None:
+    # FAILS WITHOUT THE FIX: the DLQ topic's InvalidTopicError propagated unnamed too.
+    module, recorder = seeder_env
+    recorder.invalid_topics = {"dsql-sink-dlq"}
+    with pytest.raises(module.TopicRefusedError) as excinfo:
+        module._ensure_dlq_topic("boot:9098", "ap-northeast-2", "dsql-sink-dlq", 4194304)
+    assert str(excinfo.value).startswith(
+        "Kafka refused to create the CDC topic dsql-sink-dlq: a topic already on the cluster"
+    )
+    assert isinstance(excinfo.value.__cause__, recorder.InvalidTopicError)
+
+
+def test_handler_sends_the_refused_topic_as_the_failed_reason(seeder_env) -> None:
+    """FAILS WITHOUT THE FIX: the handler sent no reason, so cfnresponse filled in its
+    log-stream pointer and the stack event (which Start CDC streams into its activity log)
+    named neither the topic nor the way on. Now the refusal's fixed text is the Reason."""
+    import cfnresponse
+
+    module, recorder = seeder_env
+    recorder.topic_partitions = set()
+    recorder.invalid_topics = {"dsqlcdc.app_v2.users"}
+    cfnresponse.sent.clear()
+    cfnresponse.sent_kwargs.clear()
+    module.handler(
+        _event("Create", SinkTopics="dsqlcdc.app.orders,dsqlcdc.app_v2.users"), _Ctx(),
+    )
+    status, _data, pid = cfnresponse.sent[-1]
+    assert status == cfnresponse.FAILED and pid == "pid-1"
+    assert cfnresponse.sent_kwargs[-1].get("reason") == _REFUSED_TOPIC_MSG
+    assert recorder.produced == []  # the offset seed never ran
+
+
+def test_handler_sends_no_reason_for_any_other_exception(seeder_env) -> None:
+    # Guard (passes before and after the fix): any other exception -- here a broker error
+    # whose text could carry anything -- sends no reason, so cfnresponse keeps its
+    # log-stream pointer and the exception's text never reaches the stack events
+    # (Property 7). Only a TopicRefusedError's fixed text is sent.
+    import cfnresponse
+
+    module, recorder = seeder_env
+    cfnresponse.sent.clear()
+    cfnresponse.sent_kwargs.clear()
+
+    class _BrokerError(Exception):
+        pass
+
+    recorder.create_raises = lambda: _BrokerError("broker said: something private")
+    module.handler(_event("Create", SinkTopics="dsqlcdc.app.orders"), _Ctx())
+    assert cfnresponse.sent[-1][0] == cfnresponse.FAILED
+    assert cfnresponse.sent_kwargs[-1].get("reason") is None
+
+
+@pytest.mark.parametrize(
+    "refused, expected_reason",
+    [
+        # FAILS WITHOUT THE FIX: the response CloudFormation receives carries the topic.
+        ({"dsqlcdc.app_v2.users"}, _REFUSED_TOPIC_MSG),
+        # Guard: any other exception keeps the real helper's log-stream pointer.
+        (set(), "See the details in CloudWatch Log Stream: log-stream"),
+    ],
+    ids=["refused-topic", "other-exception"],
+)
+def test_the_response_cloudformation_receives_carries_only_the_refusal_text(
+    seeder_env, monkeypatch, refused, expected_reason,
+) -> None:
+    """Through the REAL vendored cfnresponse: the JSON body PUT to CloudFormation's
+    pre-signed URL. Its Reason is what the stack event shows."""
+    module, recorder = seeder_env
+    real = _load_real_cfnresponse()
+    bodies: list = []
+
+    def _capture(req, timeout=None):  # noqa: ANN001
+        bodies.append(json.loads(req.data.decode("utf-8")))
+        return _Resp200()
+
+    monkeypatch.setattr(real.urllib.request, "urlopen", _capture)
+    monkeypatch.setattr(module, "cfnresponse", real)
+    recorder.topic_partitions = set()
+    if refused:
+        recorder.invalid_topics = set(refused)
+    else:
+        recorder.create_raises = lambda: RuntimeError("broker said: something private")
+    event = {**_cfn_event(), **_event("Create", SinkTopics="dsqlcdc.app_v2.users")}
+    module.handler(event, _Ctx())
+    assert len(bodies) == 1
+    assert bodies[0]["Status"] == "FAILED"
+    assert bodies[0]["Reason"] == expected_reason
+    assert "something private" not in bodies[0]["Reason"]

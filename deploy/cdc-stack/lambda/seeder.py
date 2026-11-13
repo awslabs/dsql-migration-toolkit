@@ -46,7 +46,33 @@ import cfnresponse
 # kafka-python + the MSK IAM SASL signer are bundled into the deployment zip.
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.admin import NewTopic
-from kafka.errors import NodeNotReadyError, TopicAlreadyExistsError
+from kafka.errors import InvalidTopicError, NodeNotReadyError, TopicAlreadyExistsError
+
+
+class TopicRefusedError(RuntimeError):
+    """Kafka refused to create a CDC topic: kafka-python raised ``InvalidTopicError``
+    (errno 17).
+
+    Kafka raises it for a name it does not allow and for a name that differs from a
+    topic already on the cluster only in a '.' against a '_' (say ``dsqlcdc.app.v2_users``,
+    left by an earlier Start CDC, against ``dsqlcdc.app_v2.users``). No wait fixes
+    either. The text is fixed and names only the topic, so :func:`handler` sends it as
+    the CloudFormation response's ``Reason``, which Start CDC shows in its activity log.
+    Every other failure keeps the default reason (this function's log stream): the text
+    of an arbitrary exception never becomes the Reason, which the stack events show
+    (Property 7).
+    """
+
+    def __init__(self, topic):
+        super().__init__(
+            f"Kafka refused to create the CDC topic {topic}: a topic already on the "
+            "cluster differs from it only in a '.' against a '_' (one an earlier Start "
+            "CDC created), or Kafka does not allow the name. CloudFormation rolls this "
+            "Start CDC back. Delete CDC infrastructure and deploy it again (its new "
+            "cluster has no old topics)."
+        )
+        self.topic = topic
+
 
 # MSK Serverless THROTTLES admin requests such as CreateTopics. kafka-python then PAUSES
 # the broker connection for the throttle time the response carries, and the next
@@ -237,6 +263,9 @@ def _ensure_data_topics(
     ``_throttle_tolerant``). Debezium ``topic.creation`` then no-ops on them.
     ``replication_factor=-1`` lets the broker apply its default (required for MSK
     Serverless).
+
+    A topic Kafka refuses raises :class:`TopicRefusedError` at once, naming it: the
+    topics before it stay created and none after it is tried.
     """
     topics = [t.strip() for t in (topics_csv or "").split(",") if t.strip()]
     if not topics:
@@ -262,6 +291,8 @@ def _ensure_data_topics(
                 created += 1
             except TopicAlreadyExistsError:
                 skipped += 1
+            except InvalidTopicError as exc:
+                raise TopicRefusedError(name) from exc
     finally:
         admin.close()
     print(
@@ -283,7 +314,8 @@ def _ensure_dlq_topic(bootstrap, region, dlq_topic, max_message_bytes):
     pre-create it here at the same max.message.bytes the data topics use (matching the
     band a rejected value can occupy). Idempotent: an existing DLQ topic is left as-is
     (its config was already altered / created); replication_factor=-1 uses the broker
-    default (required for MSK Serverless).
+    default (required for MSK Serverless). A name Kafka refuses raises
+    :class:`TopicRefusedError`, naming it.
     """
     if not dlq_topic:
         print("no DlqTopicName supplied -> skipping DLQ topic pre-creation")
@@ -303,6 +335,8 @@ def _ensure_dlq_topic(bootstrap, region, dlq_topic, max_message_bytes):
         )
     except TopicAlreadyExistsError:
         print(f"DLQ topic {dlq_topic} already exists -- reusing")
+    except InvalidTopicError as exc:
+        raise TopicRefusedError(dlq_topic) from exc
     finally:
         admin.close()
 
@@ -522,6 +556,12 @@ def handler(event, context):
     a CloudFormation response -- on success with the seed result, on any exception
     with FAILED + the error -- so a stack operation never hangs waiting on this
     resource. A stable PhysicalResourceId keeps Update from triggering a replace.
+
+    Only a :class:`TopicRefusedError` sets the response's ``Reason`` (its fixed text
+    naming the topic), which CloudFormation shows as this resource's status reason and
+    Start CDC streams into its activity log. Any other exception leaves the default
+    reason, which points at this function's CloudWatch log stream (the traceback is
+    there): its text could carry anything, so it never becomes the Reason (Property 7).
     """
     request_type = event.get("RequestType")
     physical_id = event.get("PhysicalResourceId") or "offset-seed"
@@ -540,4 +580,5 @@ def handler(event, context):
             cfnresponse.FAILED,
             {"Error": str(exc)},
             physical_id,
+            reason=str(exc) if isinstance(exc, TopicRefusedError) else None,
         )
