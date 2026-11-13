@@ -1906,10 +1906,16 @@ Resources:
         # also SHOP.users in another database -- into a topic of its own the sink never reads;
         # on PostgreSQL a filtered publication also took that table (see
         # PostgresSourceConnector).
-        # "(?-i)" at the start of an entry turns that flag off. The '.' in an entry still
-        # matches any character, but Start CDC refuses a name with any character other than
-        # ASCII letters, digits, '.', '_' and '-', or with a second '.' (topic_name_refusal),
-        # so it can match only the separator: each entry matches exactly one table, its own.
+        # "(?-i)" at the start of an entry turns that flag off. Start CDC refuses a name with
+        # any character other than ASCII letters, digits, '.', '_' and '-'
+        # (topic_name_refusal), so a refused name never reaches this template. A name with one
+        # '.' is written as it is: that '.' still matches any character, but can match only the
+        # separator. A name whose table name holds a '.' has every '.' escaped
+        # (table_include_entry: shop\.orders\.v2 for table orders.v2 of database shop), so it
+        # matches only itself. Each entry matches exactly one table id, its own. On MySQL,
+        # table v2 of a database shop.orders has that same id: Start CDC refuses the name when
+        # Evaluation found that database (DOTTED_SCHEMA_NAME), and otherwise the sink
+        # dead-letters that table's changes (its database name holds a '.').
         # Start CDC sets the parameter only on a stack it has not started before; the "false"
         # branch is the earlier Fn::Join, byte-identical, so a stack started before keeps its
         # connector configuration. Written out in both source connectors: CloudFormation
@@ -2443,8 +2449,9 @@ Resources:
         # Debezium record key -- except a table listed in target.key.columns -- and
         # applies INSERT ... ON CONFLICT upsert (build_sink_config: pk_mode=record_key,
         # insert_mode=upsert), so pk.mode/insert.mode are implicit and not set here.
-        # delete.enabled toggles DELETE/tombstone apply. Keys below match
-        # DsqlSinkConnectorConfig.
+        # delete.enabled toggles applying a Debezium delete (op=d) as a DELETE; a
+        # tombstone is always skipped (the op=d before it is the delete). Keys below
+        # match DsqlSinkConnectorConfig.
         delete.enabled: "true"
         # Re-keyed tables keyed on the SOURCE primary key in the change stream (G15): the
         # composite Aurora DSQL primary key the sink writes each one by. Omitted when empty.
@@ -2587,8 +2594,9 @@ Resources:
         # Debezium record key -- except a table listed in target.key.columns -- and
         # applies INSERT ... ON CONFLICT upsert (build_sink_config: pk_mode=record_key,
         # insert_mode=upsert), so pk.mode/insert.mode are implicit and not set here.
-        # delete.enabled toggles DELETE/tombstone apply. Keys below match
-        # DsqlSinkConnectorConfig.
+        # delete.enabled toggles applying a Debezium delete (op=d) as a DELETE; a
+        # tombstone is always skipped (the op=d before it is the delete). Keys below
+        # match DsqlSinkConnectorConfig.
         delete.enabled: "true"
         # Re-keyed tables keyed on the SOURCE primary key in the change stream (G15): the
         # composite Aurora DSQL primary key the sink writes each one by. Omitted when empty.

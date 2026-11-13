@@ -644,6 +644,12 @@ section.
 - `PARTITIONED_TABLE`: the partitions become one table, and no data is lost. With CDC,
   pause partition maintenance (drop, truncate, detach, attach) until cut over: CDC cannot
   carry those changes.
+- `CDC_TOPIC_NAME`: CDC cannot stream the table because of its Kafka topic name: its name
+  holds a character other than an ASCII letter, a digit, `.`, `_` or `-`, or differs from
+  another table's only in a `.` against a `_` (CDC can stream only one of the two). A Full
+  load only migration is not affected. With CDC, leave the table out of the CDC pipeline
+  and copy it in a Full load only migration once its writes stop, or rename it at the
+  source ([§6.2](06-limitations.md#62-migration-process-limits)).
 - `MULTIPLE_DATABASES` (MySQL): each database becomes its own schema; point the
   application at schema-qualified names, or set its `search_path`.
 - `NAME_COLLISION` (an index): an index whose name another table, view or index of the

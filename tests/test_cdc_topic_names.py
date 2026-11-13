@@ -1980,3 +1980,237 @@ def test_the_manual_excepts_a_dotted_database_or_schema_before_the_routes(lang) 
     assert part.count(route) == 1, lang
     assert _flat(lang, _DOC_OTHER_TABLE[lang] + _DOC_UNTICK_ROUTE[lang]) in part, lang
     assert -1 < dotted < link < part.index(route), (lang, dotted, link)
+
+
+# Chapter 6 says, in every language, that a '.' inside a table name streams on CDC
+# infrastructure deployed by 0.1.589 or later and is refused on older infrastructure until
+# Delete + Deploy; that a '.'/'_' pair a dotted table name is in is still refused; that
+# Evaluation lists such tables (CDC_TOPIC_NAME); that a table whose name reads the same as a
+# dotted database's is refused too; and that the Lambda path names a leftover topic on new
+# infrastructure. The claim that CDC cannot capture any '.' inside a name is gone.
+_DOC_DOTTED_TABLE = {
+    "en": (
+        "A `.` inside a table name, such as MySQL `shop`.`orders.v2` or PostgreSQL "
+        '`app."orders.v2"`, is no problem on CDC infrastructure deployed by version 0.1.589 '
+        "or later. CDC infrastructure deployed by an earlier version cannot stream such a "
+        "table: there Start CDC and Retry CDC refuse it until you **Delete CDC "
+        "infrastructure** and deploy it again",
+        "`shop.orders.v2` and `shop.orders_v2`",
+        "Evaluation lists such tables (`CDC_TOPIC_NAME`, advice only).",
+        "(table `orders.v2` of database `shop` and table `v2` of database `shop.orders` are "
+        "both `shop.orders.v2`)",
+        "or as a rolled-back Start on the Lambda path (MySQL on ECS Fargate or run locally), "
+        "whose activity log names the topic on CDC infrastructure deployed by version 0.1.589 "
+        "or later.",
+    ),
+    "ko": (
+        'MySQL `shop`.`orders.v2`나 PostgreSQL `app."orders.v2"`처럼 테이블 이름 안에 `.`이 있는 '
+        "테이블은 버전 0.1.589 이상이 배포한 CDC 인프라에서는 문제가 없습니다. 그 이전 버전이 배포한 "
+        "CDC 인프라는 그런 테이블을 스트리밍할 수 없으므로, 거기서는 **Delete CDC infrastructure** "
+        "후 다시 배포할 때까지 Start CDC와 Retry CDC가 그 테이블을 거부합니다",
+        "`shop.orders.v2`와 `shop.orders_v2`",
+        "Evaluation은 그런 테이블을 알려 줍니다(`CDC_TOPIC_NAME`, 조언만).",
+        "(데이터베이스 `shop`의 테이블 `orders.v2`와 데이터베이스 `shop.orders`의 테이블 `v2`는 "
+        "둘 다 `shop.orders.v2`)",
+        "Lambda 경로(ECS Fargate나 로컬에서 실행하는 MySQL)에서는 Start가 롤백되며, 버전 0.1.589 "
+        "이상이 배포한 CDC 인프라에서는 그 활동 로그가 토픽을 명시합니다.",
+    ),
+    "ja": (
+        'MySQL の `shop`.`orders.v2` や PostgreSQL の `app."orders.v2"` のようにテーブル名の中に '
+        "`.` を含むテーブルは、バージョン 0.1.589 以降がデプロイした CDC インフラでは問題ありません。"
+        "それより前のバージョンがデプロイした CDC インフラはそのようなテーブルをストリーミングできないため、"
+        "そこでは CDC インフラを削除 (**Delete CDC infrastructure**) して再デプロイするまで、Start CDC "
+        "と Retry CDC がそのテーブルを拒否します",
+        "`shop.orders.v2` と `shop.orders_v2`",
+        "Evaluation はそのようなテーブルを示します (`CDC_TOPIC_NAME`、助言のみ)。",
+        "(データベース `shop` のテーブル `orders.v2` とデータベース `shop.orders` のテーブル `v2` は"
+        "どちらも `shop.orders.v2` です)",
+        "Lambda の経路 (ECS Fargate またはローカルで実行する MySQL) では Start がロールバックされ、"
+        "バージョン 0.1.589 以降がデプロイした CDC インフラではそのアクティビティログがトピックを示します。",
+    ),
+}
+# What chapter 6 said before v57: CDC cannot capture a '.' inside any name.
+_DOC_DOTTED_TABLE_STALE = {
+    "en": ("or a `.` inside the name (the CDC sink reads every `.`",),
+    "ko": ("나 이름 안의 `.`이 들어간", "(CDC 싱크는 모든 `.`을"),
+    "ja": ("か名前の中の `.` を含むテーブル", "(CDC のシンクはすべての `.` を"),
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_manual_says_a_dot_inside_a_table_name_streams_on_new_infrastructure(lang) -> None:
+    # FAILS WITHOUT THE FIX: chapter 6 said CDC cannot capture a table with a '.' inside any of
+    # its names, on any infrastructure, and that the Lambda path's rolled-back Start named
+    # nothing.
+    from tests.test_g25_docs import _has, _page
+
+    limitations = _page(lang, "06-limitations.md")
+    for phrase in _DOC_DOTTED_TABLE[lang]:
+        assert _has(lang, limitations, phrase), (lang, phrase)
+    for stale in _DOC_DOTTED_TABLE_STALE[lang]:
+        assert not _has(lang, limitations, stale), (lang, stale)
+
+
+_DOC_CH13_DOTTED = {
+    "en": (
+        "or its database or schema name holds a `.`,",
+        "A `.` inside a table name is no problem on CDC infrastructure deployed by version "
+        "0.1.589 or later; on CDC infrastructure deployed by an earlier version, Start CDC "
+        "refuses such a table too, until you untick it here or Delete CDC infrastructure and "
+        "deploy it again.",
+    ),
+    "ko": (
+        "데이터베이스나 스키마 이름 안에 `.`이 있거나,",
+        "테이블 이름 안의 `.`은 버전 0.1.589 이상이 배포한 CDC 인프라에서는 문제가 없습니다. 그 이전 "
+        "버전이 배포한 CDC 인프라에서는 여기서 선택을 해제하거나 Delete CDC infrastructure 후 다시 "
+        "배포할 때까지 Start CDC가 그런 테이블도 거부합니다.",
+    ),
+    "ja": (
+        "データベースまたはスキーマの名前の中に `.` を含む、",
+        "テーブル名の中の `.` は、バージョン 0.1.589 以降がデプロイした CDC インフラでは問題ありません。"
+        "それより前のバージョンがデプロイした CDC インフラでは、ここで選択を外すか、Delete CDC "
+        "infrastructure して再デプロイするまで、Start CDC がそのようなテーブルも拒否します。",
+    ),
+}
+_DOC_CH13_DOTTED_STALE = {
+    "en": "or a `.` inside one of those names",
+    "ko": "그 이름 안에 `.`이 있거나",
+    "ja": "それらの名前の中の `.` を含む",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_chapter_13_scopes_a_dot_inside_a_table_name_to_older_infrastructure(lang) -> None:
+    # FAILS WITHOUT THE FIX: the row listed a '.' inside any of the names among those CDC
+    # cannot stream, with untick as the only way on.
+    from tests.test_g25_docs import _flat, _has, _page
+
+    chapter = _page(lang, "13-excluding-tables-and-columns.md")
+    # Both phrases sit in the row that starts with the bold "A table whose name CDC cannot
+    # stream" (pinned above), after it.
+    row = chapter.index(_flat(lang, _DOC_FACTS[lang][1]))
+    for phrase in _DOC_CH13_DOTTED[lang]:
+        assert chapter.find(_flat(lang, phrase).strip(), row) > row, (lang, phrase)
+    assert not _has(lang, chapter, _DOC_CH13_DOTTED_STALE[lang]), lang
+
+
+# Chapter 2's findings reference lists CDC_TOPIC_NAME with the advice (Recommended), between
+# that block's heading and the incomplete-report paragraph after it -- not among the findings
+# that block the migration.
+_DOC_ADVICE_BLOCK = {
+    "en": ("**Advice only** (Recommended)", "**When the report is incomplete,**"),
+    "ko": ("**조언만** (Recommended)", "**리포트가 불완전하면,**"),
+    "ja": ("**助言のみ** (Recommended)", "**レポートが不完全なときは**"),
+}
+_DOC_ADVICE_CDC_TOPIC_NAME = {
+    "en": "- `CDC_TOPIC_NAME`: CDC cannot stream the table because of its Kafka topic name",
+    "ko": "- `CDC_TOPIC_NAME`: Kafka 토픽 이름 때문에 CDC가 그 테이블을 스트리밍할 수 없습니다",
+    "ja": "- `CDC_TOPIC_NAME`: Kafka のトピック名のために、CDC はそのテーブルをストリーミングできません",
+}
+_DOC_ADVICE_NOT_AFFECTED = {
+    "en": "A Full load only migration is not affected.",
+    "ko": "Full load only 마이그레이션에는 영향이 없습니다.",
+    "ja": "Full load only の移行には影響しません。",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "ko", "ja"])
+def test_the_findings_reference_lists_cdc_topic_name_as_advice(lang) -> None:
+    # FAILS WITHOUT THE FIX: Evaluation reports CDC_TOPIC_NAME (Recommended), which the
+    # findings reference did not list.
+    from tests.test_g25_docs import _flat, _page
+
+    page = _page(lang, "02-evaluation-and-schema-conversion.md")
+    start, end = (page.index(_flat(lang, marker)) for marker in _DOC_ADVICE_BLOCK[lang])
+    entry = page.find(_flat(lang, _DOC_ADVICE_CDC_TOPIC_NAME[lang]))
+    assert start < entry < end, (lang, start, entry, end)
+    assert page.count("`CDC_TOPIC_NAME`") == 1, lang
+    assert _flat(lang, _DOC_ADVICE_NOT_AFFECTED[lang]) in page[entry:end], lang
+
+
+@pytest.mark.parametrize(
+    ("lang", "stale"), [("en", "tombstone"), ("ko", "tombstone"), ("ja", "トゥームストーン")])
+def test_chapter_4_does_not_say_the_sink_applies_tombstones(lang, stale) -> None:
+    # FAILS WITHOUT THE FIX: the sink table said a change is applied as an upsert, a delete
+    # "and Kafka tombstones"; from sink plugin v57 every tombstone is skipped (the delete before
+    # it is the delete).
+    from tests.test_g25_docs import _page
+
+    assert stale not in _page(lang, "04-cdc-and-dsql-constraints.md"), lang
+
+
+# ---------------------------------------------------------------------------
+# 7. This version bundles sink plugin v57, which streams a '.' inside a table name
+# ---------------------------------------------------------------------------
+
+
+def test_the_bundled_sink_plugin_reads_a_dot_inside_a_table_name() -> None:
+    # FAILS WITHOUT THE FIX: this version bundled sink plugin v56, so every stack it deployed
+    # was judged (and recorded) as one whose sink splits a qualified name at every '.'.
+    assert s3_provision.PLUGIN_VERSION == "v57"
+    assert plugin_reads_dotted_tables(s3_provision.PLUGIN_VERSION)
+    # The release is the gate's own version: an earlier bundle would refuse at every Deploy.
+    assert s3_provision.PLUGIN_VERSION == DOTTED_TABLE_MIN_PLUGIN_VERSION
+
+
+@pytest.mark.parametrize("engine", ["mysql", "postgres"])
+def test_this_versions_deploy_takes_a_dot_inside_a_table_name(engine) -> None:
+    # FAILS WITHOUT THE FIX: Deploy CDC infrastructure refused shop.orders.v2 (MySQL) and
+    # public."public.orders" (PostgreSQL) with the old-plugin fact naming v56. Not pinned: the
+    # plugin this version uploads, which the new stack records as its PluginVersion.
+    db = "shop" if engine == "mysql" else "public"
+    dotted = _dotted_name(engine)
+    names = [f"{db}.orders", dotted]
+    params = _infra(engine, names, _counts(names))
+    assert topic_name_refusal(params.filled, sink_plugin=s3_provision.PLUGIN_VERSION) is None
+    handle = _FakeHandle()
+    _logs_seen, on_log = _logs()
+    deployer = _FakeDeployer(stack_statuses=("CREATE_IN_PROGRESS", "CREATE_COMPLETE"))
+    _run_infra(
+        handle, deployer, on_log, stack_name="dsql-cdc-shop", template_body="T",
+        params=params, create_timeout_seconds=5.0, poll_interval_seconds=0.0,
+    )
+    assert handle.job.error_count == 0
+    (_stack, created), = deployer.created
+    sent = dict(created)
+    assert sent["PluginVersion"] == s3_provision.PLUGIN_VERSION
+    assert sent["TableIncludeList"] == f"{db}.orders,{table_include_entry(dotted)}"
+
+
+def test_this_versions_deploy_surfaces_take_a_dot_inside_a_table_name() -> None:
+    # FAILS WITHOUT THE FIX: before any stack, the Deploy form and the Full Load card judged
+    # the bundled v56 and refused (or warned about) shop.orders.v2. Not pinned. A '.'/'_' pair
+    # it is in is still refused.
+    from dsql_migrator.ui.data_migration._cdc_ui import _deploy_block_notice
+
+    names, inv = _DOTTED_TABLE, _inventory(_DOTTED_TABLE)
+    assert _deploy_block_notice(_deploy_ready(names, FLC), _Jobs({}), inv, None) is None
+    assert _deploy_block_notice(_deploy_ready(names), _Jobs({}), inv, None) is None
+    assert pre_load_topic_name_warning(_state(names), _Jobs({}), None, inv) is None
+    pair = [*names, "shop.orders_v2"]
+    header, body = _deploy_block_notice(_deploy_ready(pair), _Jobs({}), _inventory(pair), None)
+    assert header == CDC_TOPIC_NAME_HEADER
+    assert body.startswith(
+        "CDC cannot stream shop.orders.v2 together with shop.orders_v2: Kafka does not allow "
+        "two topics whose names differ only in a '.' against a '_'"), body
+
+
+def test_the_plugin_history_records_v57() -> None:
+    # FAILS WITHOUT THE FIX: s3_provision's PLUGIN_VERSION history, which lists every bump, had
+    # no v57: what changed in the sink and seeder ZIPs, and that Delete + Deploy picks it up.
+    source = pathlib.Path(s3_provision.__file__).read_text(encoding="utf-8")
+    history = " ".join(source.replace("#", " ").split())
+    note = history.split("v57 (dotted table names):", 1)[1].split('PLUGIN_VERSION = "v57"', 1)[0]
+    for fact in (
+        "the sink reads a qualified table name at its FIRST '.'",
+        "or one with no source.table, is dead-lettered",
+        "every Debezium tombstone is skipped",
+        "the seeder Lambda names a topic Kafka refused",
+        "No config key, template property or Start CDC change",
+        "Debezium ZIPs and the sink's version() string are unchanged",
+        "Start CDC and Retry CDC refuse such a table, naming that plugin",
+        "a live cdc-stack needs Delete + Deploy CDC infrastructure to pick up v57",
+        "MySQL re-reads from the watermark; the PostgreSQL slot is recreated",
+        "Streaming both tables of a '.'/'_' pair is deferred",
+    ):
+        assert fact in note, fact
