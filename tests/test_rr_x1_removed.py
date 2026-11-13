@@ -98,6 +98,8 @@ _DELETED_NAMES: dict[str, tuple[str, ...]] = {
     ),
     # X1b: the HTML export's AI section (its ai_report argument was never passed).
     "dsql_migrator.core.assessor": ("_render_ai_html_section",),
+    # ...and the module the export now lives in (A8).
+    "dsql_migrator.core.assessment_report": ("_render_ai_html_section",),
     "dsql_migrator.ui.ai_assist": (
         "AI_STATUS_PENDING_REVIEW",
         "AI_STATUS_EDITED",
