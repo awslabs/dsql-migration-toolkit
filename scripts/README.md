@@ -156,8 +156,10 @@ DELETE to the exact operations, independent of the count comparison.
 set -a; source .env; set +a
 
 # Full Load (plan first, then run) — fresh load of the whole schema
-.venv/bin/python scripts/run_full_load.py --schema sales --clean          # plan
-.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes    # run
+# plan
+.venv/bin/python scripts/run_full_load.py --schema sales --clean
+# run
+.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes
 
 # After Full Load: counts should match
 .venv/bin/python scripts/compare_rows.py -t sales.orders -t sales.customers

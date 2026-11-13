@@ -77,8 +77,10 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 クローンした直後の状態から:
 
 ```bash
-uv sync                          # ローカルの仮想環境に依存関係をインストール
-uv run mysql-dsql-migrator ui    # Web UI を起動 (既定では 127.0.0.1:8080 にバインド)
+# ローカルの仮想環境に依存関係をインストール
+uv sync
+# Web UI を起動 (既定では 127.0.0.1:8080 にバインド)
+uv run mysql-dsql-migrator ui
 ```
 
 その後、ブラウザで **http://127.0.0.1:8080** を開きます。
@@ -101,12 +103,12 @@ Application Load Balancer の背後に(任意で Amazon Cognito OIDC 認証に�
 [`deploy/DEPLOYMENT.ja.md`](../../../deploy/DEPLOYMENT.ja.md) にあります。要点は次のとおりです。
 
 ```bash
-# 1. イメージをビルド + プッシュ。ローカルに Docker がない場合は AWS CodeBuild を使用:
-AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # イメージ URI を出力
+# 1. イメージをビルド + プッシュ。ローカルに Docker がない場合は AWS CodeBuild を使用(イメージ URI を出力):
+AWS_REGION=us-east-1 deploy/build_in_codebuild.sh
 
 # 2. app-stack (ECS Fargate + ALB + IAM) をデプロイし、そのイメージ URI と
 #    VPC/サブネット/証明書/DSQL/ソースの詳細をパラメータとして渡す。
-#    正確な `aws cloudformation deploy` コマンドは deploy/DEPLOYMENT.ja.md を参照。
+#    正確な aws cloudformation deploy コマンドは deploy/DEPLOYMENT.ja.md を参照。
 ```
 
 新規の `git clone` から最小限のセットアップでデプロイできます — コネクタプラグインのアーティファクトは

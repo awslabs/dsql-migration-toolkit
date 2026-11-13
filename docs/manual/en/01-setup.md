@@ -77,8 +77,10 @@ starts: [§1.6](#16-prepare-the-source-for-cdc).
 From a fresh clone:
 
 ```bash
-uv sync                          # install dependencies into a local virtualenv
-uv run mysql-dsql-migrator ui    # launch the web UI (binds to 127.0.0.1:8080 by default)
+# install dependencies into a local virtualenv
+uv sync
+# launch the web UI (binds to 127.0.0.1:8080 by default)
+uv run mysql-dsql-migrator ui
 ```
 
 Then open **http://127.0.0.1:8080** in your browser.
@@ -102,12 +104,12 @@ image in Amazon ECR. The full, parameterized CloudFormation flow is in
 [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md); in essence:
 
 ```bash
-# 1. Build + push the image. No local Docker? Use AWS CodeBuild instead:
-AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # prints the image URI
+# 1. Build + push the image. No local Docker? Use AWS CodeBuild instead (it prints the image URI):
+AWS_REGION=us-east-1 deploy/build_in_codebuild.sh
 
 # 2. Deploy the app stack (ECS Fargate + ALB + IAM) with that image URI and your
 #    VPC/subnet/cert/DSQL/source details as parameters; the exact
-#    `aws cloudformation deploy` command is in deploy/DEPLOYMENT.md.
+#    aws cloudformation deploy command is in deploy/DEPLOYMENT.md.
 ```
 
 A fresh `git clone` deploys with minimal setup: the connector plugin artifacts are

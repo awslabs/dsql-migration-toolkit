@@ -143,8 +143,10 @@ op-log(`{ts, op, table, pk}` 형식의 JSONL)를 기록하는 스크립트로 �
 set -a; source .env; set +a
 
 # Full Load (계획 먼저, 그다음 실행) — 스키마 전체 새로 적재
-.venv/bin/python scripts/run_full_load.py --schema sales --clean          # 계획
-.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes    # 실행
+# 계획
+.venv/bin/python scripts/run_full_load.py --schema sales --clean
+# 실행
+.venv/bin/python scripts/run_full_load.py --schema sales --clean --yes
 
 # Full Load 후: 카운트가 일치해야 함
 .venv/bin/python scripts/compare_rows.py -t sales.orders -t sales.customers

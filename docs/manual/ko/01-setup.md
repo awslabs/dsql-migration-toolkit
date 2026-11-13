@@ -72,8 +72,10 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 새로 클론한 뒤:
 
 ```bash
-uv sync                          # 로컬 가상환경에 의존성 설치
-uv run mysql-dsql-migrator ui    # 웹 UI 실행 (기본 127.0.0.1:8080 바인딩)
+# 로컬 가상환경에 의존성 설치
+uv sync
+# 웹 UI 실행 (기본 127.0.0.1:8080 바인딩)
+uv run mysql-dsql-migrator ui
 ```
 
 브라우저에서 **http://127.0.0.1:8080** 을 엽니다.
@@ -96,12 +98,12 @@ Balancer 뒤에(선택적으로 Amazon Cognito OIDC 인증) 배포하고, 컨테
 [`deploy/DEPLOYMENT.md`](../../../deploy/DEPLOYMENT.md)에 있고, 핵심은:
 
 ```bash
-# 1. 이미지 빌드 + 푸시. 로컬 Docker가 없으면 AWS CodeBuild 사용:
-AWS_REGION=us-east-1 deploy/build_in_codebuild.sh      # 이미지 URI 출력
+# 1. 이미지 빌드 + 푸시. 로컬 Docker가 없으면 AWS CodeBuild 사용(이미지 URI 출력):
+AWS_REGION=us-east-1 deploy/build_in_codebuild.sh
 
 # 2. app-stack(ECS Fargate + ALB + IAM) 배포. 위 이미지 URI와
 #    VPC/서브넷/인증서/DSQL/소스 정보를 파라미터로 전달.
-#    정확한 `aws cloudformation deploy` 명령은 deploy/DEPLOYMENT.md 참조.
+#    정확한 aws cloudformation deploy 명령은 deploy/DEPLOYMENT.md 참조.
 ```
 
 새 `git clone`만으로 최소 설정으로 배포할 수 있습니다 — 커넥터 플러그인 아티팩트가 커밋돼 있고(Java/Maven

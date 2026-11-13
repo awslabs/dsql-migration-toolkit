@@ -135,7 +135,8 @@ Load만** 실행한 뒤에는 그 선택지가 사라지고, 나중에 CDC를 �
 ```bash
 git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
-uv sync                       # .venv 가상환경 생성·채움 (uv 필요)
+# .venv 가상환경 생성·채움 (uv 필요)
+uv sync
 uv run mysql-dsql-migrator ui
 ```
 

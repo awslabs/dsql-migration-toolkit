@@ -149,7 +149,8 @@ need to be usable in your shell (`aws sso login`, `AWS_PROFILE=…`).
 ```bash
 git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
-uv sync                       # create + fill a .venv (needs uv)
+# create + fill a .venv (needs uv)
+uv sync
 uv run mysql-dsql-migrator ui
 ```
 

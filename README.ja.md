@@ -149,7 +149,8 @@ Web UI は **Connect** を準備ステップとし、5 つのステップで移�
 ```bash
 git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
-uv sync                       # .venv 仮想環境を作成（uv が必要）
+# .venv 仮想環境を作成（uv が必要）
+uv sync
 uv run mysql-dsql-migrator ui
 ```
 

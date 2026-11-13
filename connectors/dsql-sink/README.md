@@ -159,8 +159,10 @@ errors — it does **not** run this connector in-process. This connector is the
 
 ```bash
 # Requires JDK 17+ and Maven.
-mvn -B -ntp test       # runs the offline unit tests (no AWS/DSQL needed)
-mvn -B -ntp package    # produces target/dsql-sink-connector-*.jar (shaded)
+# runs the offline unit tests (no AWS/DSQL needed)
+mvn -B -ntp test
+# produces target/dsql-sink-connector-*.jar (shaded)
+mvn -B -ntp package
 ```
 
 The shaded jar is the MSK Connect custom plugin artifact (uploaded to S3 by
