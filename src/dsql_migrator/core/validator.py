@@ -82,6 +82,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
 
@@ -2305,7 +2306,6 @@ class Validator:
                 pass
 
         source_dialect = dialect_for(source.source_type)
-        source_engine = self._source_engine_factory(source)
         items: list[TableValidationResult] = []
         orphan_findings: list[OrphanFinding] = []
         orphan_unchecked: list[UncheckedForeignKey] = []
@@ -2313,92 +2313,77 @@ class Validator:
         # orphan check (G138).
         live_keys: dict[str, tuple[str, ...]] = {}
         current_gtid: Optional[str] = None
-        try:
-            with source_engine.connect() as raw_connection:
-                source_connection = raw_connection.execution_options(
-                    isolation_level="AUTOCOMMIT"
+        with self._source_snapshot(source, source_dialect) as source_connection:
+            # Drift coordinates are MySQL binlog/GTID concepts. On a PostgreSQL
+            # source these probes are SQL syntax errors that would ABORT the
+            # shared snapshot transaction (PostgreSQL fails the whole txn on any
+            # statement error), poisoning every subsequent table read -- so skip
+            # them for PG (these MySQL binlog/GTID drift coordinates do not exist
+            # for a PostgreSQL source, which uses LSN watermarks, so drift stays
+            # "undeterminable"). MySQL runs them as before on the same snapshot.
+            current_gtid: Optional[str] = None
+            current_binlog_file: Optional[str] = None
+            current_binlog_position: Optional[int] = None
+            if not _source_is_postgres(source_dialect):
+                current_gtid = _source_gtid(source_connection)
+                # Also capture file:pos -- the drift fallback when the source has
+                # no GTID (the normal case on RDS MySQL 8.0).
+                current_binlog_file, current_binlog_position = (
+                    _source_binlog_position(source_connection)
                 )
-                source_connection.execute(text(source_dialect.snapshot_start_sql))
-                try:
-                    # Drift coordinates are MySQL binlog/GTID concepts. On a PostgreSQL
-                    # source these probes are SQL syntax errors that would ABORT the
-                    # shared snapshot transaction (PostgreSQL fails the whole txn on any
-                    # statement error), poisoning every subsequent table read -- so skip
-                    # them for PG (these MySQL binlog/GTID drift coordinates do not exist
-                    # for a PostgreSQL source, which uses LSN watermarks, so drift stays
-                    # "undeterminable"). MySQL runs them as before on the same snapshot.
-                    current_gtid: Optional[str] = None
-                    current_binlog_file: Optional[str] = None
-                    current_binlog_position: Optional[int] = None
-                    if not _source_is_postgres(source_dialect):
-                        current_gtid = _source_gtid(source_connection)
-                        # Also capture file:pos -- the drift fallback when the source has
-                        # no GTID (the normal case on RDS MySQL 8.0).
-                        current_binlog_file, current_binlog_position = (
-                            _source_binlog_position(source_connection)
+            target_connection = _ReconnectingTargetConnection(
+                lambda: self._target_connection_factory(target)
+            )
+            # PostgreSQL aborts the whole snapshot transaction on any failed
+            # statement, so one table whose read is refused (its row-level
+            # security, say) failed every table after it with 25P02. Each table
+            # reads inside a savepoint that is rolled back after it: the snapshot
+            # (taken at the transaction's first read) stays, and so does the next
+            # table's read. MySQL keeps its transaction through an error.
+            savepoints = _source_is_postgres(source_dialect)
+            try:
+                total = len(tables)
+                for index, table in enumerate(tables, start=1):
+                    # Cooperative stop at the table boundary: cleanly exit
+                    # (COMMIT + dispose run in the finally blocks) and
+                    # signal the cancellation rather than return a partial.
+                    if cancel():
+                        raise ValidationCancelled(
+                            "Validation cancelled before completing all "
+                            "tables."
                         )
-                    target_connection = _ReconnectingTargetConnection(
-                        lambda: self._target_connection_factory(target)
+                    _report_progress(table.name, index, total)
+                    # Best effort, like the rollback: a lost connection makes
+                    # the table's own reads fail with their own error, as before,
+                    # instead of the SAVEPOINT aborting the whole run.
+                    in_savepoint = savepoints and _open_table_savepoint(
+                        source_connection
                     )
-                    # PostgreSQL aborts the whole snapshot transaction on any failed
-                    # statement, so one table whose read is refused (its row-level
-                    # security, say) failed every table after it with 25P02. Each table
-                    # reads inside a savepoint that is rolled back after it: the snapshot
-                    # (taken at the transaction's first read) stays, and so does the next
-                    # table's read. MySQL keeps its transaction through an error.
-                    savepoints = _source_is_postgres(source_dialect)
-                    try:
-                        total = len(tables)
-                        for index, table in enumerate(tables, start=1):
-                            # Cooperative stop at the table boundary: cleanly exit
-                            # (COMMIT + dispose run in the finally blocks) and
-                            # signal the cancellation rather than return a partial.
-                            if cancel():
-                                raise ValidationCancelled(
-                                    "Validation cancelled before completing all "
-                                    "tables."
-                                )
-                            _report_progress(table.name, index, total)
-                            # Best effort, like the rollback: a lost connection makes
-                            # the table's own reads fail with their own error, as before,
-                            # instead of the SAVEPOINT aborting the whole run.
-                            in_savepoint = savepoints and _open_table_savepoint(
-                                source_connection
-                            )
-                            item = self._validate_table(
-                                source_connection,
-                                target_connection,
-                                table,
-                                mode,
-                                watermark,
-                                reconcile,
-                                cancel,
-                                source_dialect,
-                                deep_only_on_count_mismatch=(
-                                    deep_only_on_count_mismatch
-                                ),
-                                live_keys=live_keys,
-                            )
-                            if in_savepoint:
-                                _rollback_to_table_savepoint(source_connection)
-                            if check_orphans:
-                                found, unchecked, item = self._check_orphans(
-                                    target_connection, table, item, cancel, live_keys
-                                )
-                                orphan_findings.extend(found)
-                                orphan_unchecked.extend(unchecked)
-                            items.append(item)
-                    finally:
-                        _safe_close(target_connection)
-                finally:
-                    # A lost source connection ended its snapshot with it: a COMMIT
-                    # there raises PendingRollbackError, which would discard every
-                    # table's result (or replace the error / the Stop that is
-                    # propagating) -- the per-table errors already say what happened.
-                    if not getattr(source_connection, "invalidated", False):
-                        source_connection.execute(text(COMMIT))
-        finally:
-            source_engine.dispose()
+                    item = self._validate_table(
+                        source_connection,
+                        target_connection,
+                        table,
+                        mode,
+                        watermark,
+                        reconcile,
+                        cancel,
+                        source_dialect,
+                        deep_only_on_count_mismatch=(
+                            deep_only_on_count_mismatch
+                        ),
+                        live_keys=live_keys,
+                    )
+                    if in_savepoint:
+                        _rollback_to_table_savepoint(source_connection)
+                    if check_orphans:
+                        found, unchecked, item = self._check_orphans(
+                            target_connection, table, item, cancel, live_keys
+                        )
+                        orphan_findings.extend(found)
+                        orphan_unchecked.extend(unchecked)
+                    items.append(item)
+            finally:
+                _safe_close(target_connection)
 
         drift = _build_drift(
             watermark, current_gtid, current_binlog_file, current_binlog_position,
@@ -2539,10 +2524,41 @@ class Validator:
         is already isolated inside :meth:`_validate_table` and :meth:`_check_orphans`.
         """
         source_dialect = dialect_for(source.source_type)
-        source_engine = self._source_engine_factory(source)
         orphans: list[OrphanFinding] = []
         unchecked: list[UncheckedForeignKey] = []
         live_keys: dict[str, tuple[str, ...]] = {}
+        with self._source_snapshot(source, source_dialect) as source_connection:
+            target_connection = _ReconnectingTargetConnection(
+                lambda: self._target_connection_factory(target)
+            )
+            try:
+                item = self._validate_table(
+                    source_connection, target_connection, table,
+                    mode, watermark, reconcile, cancel, source_dialect,
+                    deep_only_on_count_mismatch=deep_only_on_count_mismatch,
+                    live_keys=live_keys,
+                )
+                if check_orphans:
+                    orphans, unchecked, item = self._check_orphans(
+                        target_connection, table, item, cancel, live_keys
+                    )
+            finally:
+                _safe_close(target_connection)
+        return item, orphans, unchecked
+
+    @contextmanager
+    def _source_snapshot(
+        self, source: SourceConnectionConfig, source_dialect: SourceDialect
+    ) -> Iterator[Any]:
+        """The source connection both comparison paths read in: one consistent-snapshot
+        transaction, read-only (Property 1).
+
+        Builds the source engine, opens one connection in AUTOCOMMIT, starts the dialect's
+        snapshot transaction and yields the connection. On the way out -- returned, raised or
+        stopped -- it COMMITs that transaction (unless the connection was lost), closes the
+        connection and disposes of the engine, in that order.
+        """
+        source_engine = self._source_engine_factory(source)
         try:
             with source_engine.connect() as raw_connection:
                 source_connection = raw_connection.execution_options(
@@ -2550,22 +2566,7 @@ class Validator:
                 )
                 source_connection.execute(text(source_dialect.snapshot_start_sql))
                 try:
-                    target_connection = _ReconnectingTargetConnection(
-                        lambda: self._target_connection_factory(target)
-                    )
-                    try:
-                        item = self._validate_table(
-                            source_connection, target_connection, table,
-                            mode, watermark, reconcile, cancel, source_dialect,
-                            deep_only_on_count_mismatch=deep_only_on_count_mismatch,
-                            live_keys=live_keys,
-                        )
-                        if check_orphans:
-                            orphans, unchecked, item = self._check_orphans(
-                                target_connection, table, item, cancel, live_keys
-                            )
-                    finally:
-                        _safe_close(target_connection)
+                    yield source_connection
                 finally:
                     # A lost source connection ended its snapshot with it: a COMMIT
                     # there raises PendingRollbackError, which would discard every
@@ -2575,7 +2576,6 @@ class Validator:
                         source_connection.execute(text(COMMIT))
         finally:
             source_engine.dispose()
-        return item, orphans, unchecked
 
     def _read_source_position(
         self, source: SourceConnectionConfig
