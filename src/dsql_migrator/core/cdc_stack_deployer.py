@@ -57,6 +57,19 @@ def is_stable_stack_status(status: "Optional[str]") -> bool:
     return bool(status) and str(status).strip().upper() in _STABLE_STACK_STATES
 
 
+def _stack_parameters(stack: "Mapping[str, object]") -> "dict[str, str]":
+    """The ``{ParameterKey: ParameterValue}`` map of one DescribeStacks stack. Pure.
+
+    One reading of the CloudFormation shape for every describe the deployer does (the
+    Start precondition, its re-read after a rollback recovery, and the status probe), so
+    a stack with no ``Parameters`` key reads the same -- an empty map -- everywhere.
+    """
+    return {
+        p.get("ParameterKey", ""): p.get("ParameterValue", "")
+        for p in stack.get("Parameters", []) or []  # type: ignore[union-attr]
+    }
+
+
 def _stack_absent_error(exc: Exception) -> bool:
     """True when a ``describe_stacks`` failure means the stack does not EXIST (as
     opposed to a read/credential error).
@@ -423,10 +436,7 @@ class CdcStackDeployer:
             raise CdcDeployError(f"cdc-stack '{stack_name}' not found.")
         stack = stacks[0]
         status = str(stack.get("StackStatus", ""))
-        params = {
-            p.get("ParameterKey", ""): p.get("ParameterValue", "")
-            for p in stack.get("Parameters", []) or []
-        }
+        params = _stack_parameters(stack)
         unfilled = [k for k, v in params.items() if str(v).startswith(CDC_PLACEHOLDER_PREFIX)]
         if unfilled:
             raise CdcDeployError(
@@ -446,15 +456,9 @@ class CdcStackDeployer:
         # self-healing precondition.
         if status == "UPDATE_ROLLBACK_FAILED":
             status = self._recover_rollback_failed(stack_name)
-            params = {
-                p.get("ParameterKey", ""): p.get("ParameterValue", "")
-                for p in (
-                    client.describe_stacks(StackName=stack_name)
-                    .get("Stacks", [{}])[0]
-                    .get("Parameters", [])
-                    or []
-                )
-            }
+            params = _stack_parameters(
+                client.describe_stacks(StackName=stack_name).get("Stacks", [{}])[0]
+            )
         is_stable = status in _STABLE_STACK_STATES
         if not is_stable:
             raise CdcDeployError(
@@ -884,10 +888,7 @@ class CdcStackDeployer:
             return None
         stack = stacks[0]
         status = str(stack.get("StackStatus", ""))
-        params = {
-            p.get("ParameterKey", ""): p.get("ParameterValue", "")
-            for p in stack.get("Parameters", []) or []
-        }
+        params = _stack_parameters(stack)
         return CdcStackDiscovery(
             stack_status=status,
             current_parameters=params,

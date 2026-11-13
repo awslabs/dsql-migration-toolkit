@@ -155,6 +155,25 @@ def test_discover_ok_stable_stack() -> None:
     assert disc.current_parameters["VpcId"] == "vpc-1"
 
 
+def test_stack_parameters_reads_the_describe_shape_once() -> None:
+    # cdccore-12: every describe the deployer does reads its parameters through ONE
+    # helper, so a stack with no Parameters key (or an empty / null one) is an empty map
+    # on each of them -- the Start precondition, its re-read after a rollback recovery
+    # and the status probe.
+    from dsql_migrator.core.cdc_stack_deployer import _stack_parameters
+
+    assert _stack_parameters({}) == {}
+    assert _stack_parameters({"Parameters": None}) == {}
+    assert _stack_parameters(
+        {"Parameters": [{"ParameterKey": "VpcId", "ParameterValue": "vpc-1"}]}
+    ) == {"VpcId": "vpc-1"}
+    client = _FakeClient({"describe_stacks": {"Stacks": [{"StackStatus": "CREATE_COMPLETE"}]}})
+    assert _dep(client).discover_stack("mysql-dsql-cdc-stack").current_parameters == {}
+    client2 = _FakeClient({"describe_stacks": {"Stacks": [{"StackStatus": "CREATE_COMPLETE"}]}})
+    probe = _dep(client2).describe_stack_or_none("mysql-dsql-cdc-stack")
+    assert probe is not None and probe.current_parameters == {}
+
+
 def test_discover_missing_stack_raises() -> None:
     client = _FakeClient({}, raise_on={"describe_stacks": RuntimeError("not found")})
     with pytest.raises(CdcDeployError):
