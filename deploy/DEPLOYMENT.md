@@ -974,7 +974,9 @@ aws cloudformation delete-stack --stack-name mysql-dsql-migrator-build --region 
   request the app sends to it (the CDC plugin and template uploads and, on ECS Fargate, the
   job and session state and the record of the DEFAULTs that column exclusions drop) names
   this account as the bucket's expected owner, which S3 refuses unless this account owns
-  the bucket. A bucket by that name in another account is never used: Deploy CDC
+  the bucket. The templates' IAM grants on the bucket also carry `s3:ResourceAccount` =
+  this account, so S3 refuses the roles on a bucket by that name in another account even
+  for a request that does not name the owner. A bucket by that name in another account is never used: Deploy CDC
   infrastructure and Start CDC stop with an error that names the bucket and what to do,
   and the job and session state are not saved (an error notice above every screen of the
   app says so and names the bucket, and the activity log records it).

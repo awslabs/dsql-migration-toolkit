@@ -5,6 +5,25 @@ _Language: **English** | [한국어](CHANGELOG.ko.md) | [日本語](CHANGELOG.ja
 All notable changes to this project are recorded here. This project follows
 [semantic versioning](https://semver.org/) (patch releases for bug fixes).
 
+## v0.1.588
+
+A security hardening release, defense in depth for v0.1.587's bucket owner check: the deployment templates' IAM roles now refuse a bucket by the managed bucket's name that another AWS account owns. Only the IAM policies and the image version change; apply it with a full template update of the app stack (an image-only update keeps the old policies).
+
+### Security
+
+- **Every IAM grant on the managed bucket `mysql-dsql-migrator-plugins-<account>-<region>` now carries the condition `s3:ResourceAccount` = your account ID, so S3 refuses the role on a bucket by that name another account owns, whatever the request asserts.** v0.1.587 made every request the app sends name your account as the bucket's expected owner; the condition also covers a request that would not, among them the reads AWS services make with these roles' credentials (the cdc-stack template, the connector plugins and the offset seeder's code). It applies to the app stack's task role and CDC deploy role (`deploy/cloudformation.yaml`), the single EC2 host's host role and CDC deploy role, and the host role's read of the source tarball with `SourceMode=s3` (`deploy/cloudformation-ec2.yaml`), and the CDC stack's connector role (`deploy/cdc-stack/cdc-stack.yaml`). `s3:CreateBucket` moves to a statement of its own without the condition: creating a name another account owns fails whatever the policy says.
+
+### Documentation
+
+- **The deployment guide's *Managed bucket ownership* [security note](deploy/DEPLOYMENT.md#security-notes) now names the IAM condition,** in English, Korean and Japanese.
+
+### Upgrade notes
+
+- **App stack (ECS Fargate): update the stack with this release's `deploy/cloudformation.yaml` and set `ContainerImageUri` to the 0.1.588 image** (the published one, this template's new default, or your own build). `aws cloudformation deploy` keeps every parameter you do not pass, so the stack keeps its old image until you set it. From v0.1.587's template, the update changes only the task role, the CDC deploy role and the task definition; finish or stop running jobs first: the task replacement ends them. An image-only update leaves the old IAM policies in place, where v0.1.587's owner check in the app still applies.
+- **Single EC2 host: a stack update to this release's `deploy/cloudformation-ec2.yaml` adds the condition to the host role and the CDC deploy role** without restarting the host, unless a newer Amazon Linux 2023 image makes the update replace it (v0.1.587's notes say what that does). Not tested on a live host. The host keeps the code it fetched at first boot, so the CDC stack's connector role gets the condition only from a host launched from this release.
+- **CDC infrastructure: nothing to redeploy.** The next Start CDC from a 0.1.588 app updates the CDC stack with the template it bundles, which adds the condition to the connector role; until then the connector role keeps its old grant, and the app still uploads nothing to a bucket another account owns. The sink plugin is still v56.
+- **Nothing to migrate. Going back to v0.1.587 keeps the app's owner check but its templates drop the IAM condition;** do not go back to v0.1.586 or earlier (v0.1.587's notes say why).
+
 ## v0.1.587
 
 A security release. The app now uses its managed S3 bucket, `mysql-dsql-migrator-plugins-<account>-<region>`, only if your account owns it, where earlier versions could use one that another AWS account owned; the deployment guide's template bucket gets a random suffix and an owner check. Run the check in the upgrade notes, then update every deployment and local checkout: an image-only update fixes the ECS Fargate app stack, and a single EC2 host gets the fix only when launched from this release. The rest is a `.env` quoting fix, a `DB_PORT` startup fix, AI Assist text fixes and internal refactoring.
