@@ -1488,6 +1488,34 @@ def test_delete_without_eni_data_logs_no_eni_line() -> None:
     assert not any("seeder network interface" in m for m in logs)
 
 
+def test_cdccore_8_the_eni_reporter_is_its_own_unit() -> None:
+    # cdccore-8: the reporting is _SeederEniReporter, driven one poll at a time, so the
+    # whole rule can be exercised without a stack wait: first reading logs, an unchanged
+    # count within the interval does not, an unreadable count is not a reading, and
+    # "released" follows a count that had been pending.
+    import time
+    from types import SimpleNamespace
+
+    import dsql_migrator.core.cdc_deployer as cdc_deployer
+
+    counts: list = [2, 2, None, 0]
+    deployer = SimpleNamespace(seeder_eni_count=lambda _name: counts.pop(0))
+    logs: list[str] = []
+    driver = SimpleNamespace(log=logs.append)
+    reporter = cdc_deployer._SeederEniReporter()
+    original, clock = time.monotonic, iter([0.0, 1.0, 2.0, 3.0])
+    time.monotonic = lambda: next(clock)
+    try:
+        for _ in range(4):
+            reporter.report(deployer, STACK, driver)
+    finally:
+        time.monotonic = original
+    assert len(logs) == 2, logs
+    assert "reclaim 2 seeder network interfaces" in logs[0]
+    assert "min so far" not in logs[0]
+    assert logs[1] == "Seeder network interfaces released."
+
+
 def test_delete_cleans_up_source_secret_when_region_given(monkeypatch) -> None:
     handle = _FakeHandle()
     logs, on_log = _logs()

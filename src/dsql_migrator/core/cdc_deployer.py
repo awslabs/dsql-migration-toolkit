@@ -282,6 +282,7 @@ class _StageDriver:
 # enough to prove liveness without drowning the stack events (polls are ~30s).
 _ENI_REPORT_INTERVAL_SECONDS = 120.0
 
+
 # What a Delete and a redeploy then cost, per engine (G25): this text is read on either, and
 # nothing here says which. A MySQL Start on the new stack re-reads the binary log from a start
 # point -- with CDC only and none, from the source's current position. A PostgreSQL delete
@@ -1250,6 +1251,62 @@ def _rollback_failure_message(
     return f"Stack operation ended in '{status}'."
 
 
+class _SeederEniReporter:
+    """Reports, per poll of a Delete wait, the seeder-ENI reclamation CloudFormation is
+    silent about, so the long tail of the teardown does not look frozen.
+
+    One instance per wait; :meth:`report` is called on every poll and carries all the
+    state the reporting needs. A line is written on a CHANGE of the pending count *and*
+    periodically while it is unchanged -- the wait routinely runs ~15-20 min with no
+    stack event, so a change-only line left an observed 18m30s silent gap between
+    "MskCluster DELETE_COMPLETE" and "Seeder network interfaces released.", which reads
+    as a hung teardown: the very symptom this reporting exists to cure. The re-report
+    carries elapsed minutes so the operator can see it is progressing rather than stuck.
+    """
+
+    def __init__(self) -> None:
+        # ``-2`` is an unused sentinel so the first real reading (including 0) always
+        # prints. The two timestamps drive the periodic re-report.
+        self._last_count = -2
+        self._wait_started: Optional[float] = None
+        self._last_logged: Optional[float] = None
+
+    def report(self, deployer, stack_name: str, driver: "_StageDriver") -> None:
+        """Log this poll's reading, if it is one worth logging. A count the deployer
+        cannot read (``None``) is not a reading: nothing is logged and nothing changes."""
+        import time as _time
+
+        count = deployer.seeder_eni_count(stack_name)
+        if count is None:
+            return
+        now_mono = _time.monotonic()
+        changed = count != self._last_count
+        if count > 0:
+            if self._wait_started is None:
+                self._wait_started = now_mono
+            due = (
+                self._last_logged is None
+                or (now_mono - self._last_logged) >= _ENI_REPORT_INTERVAL_SECONDS
+            )
+            if changed or due:
+                noun = "interface" if count == 1 else "interfaces"
+                waited = int((now_mono - self._wait_started) // 60)
+                # Only mention elapsed time once there is some to mention, so the first
+                # line stays clean.
+                elapsed = f" — {waited} min so far" if waited >= 1 else ""
+                driver.log(
+                    f"Waiting for AWS to reclaim {count} seeder network "
+                    f"{noun}{elapsed} (no CloudFormation event until done)…"
+                )
+                self._last_logged = now_mono
+        elif changed and self._last_count > 0:
+            # Only announce release if we had previously seen some pending.
+            driver.log("Seeder network interfaces released.")
+            self._wait_started = None
+            self._last_logged = None
+        self._last_count = count
+
+
 def _wait_stack_settles(
     deployer: CdcStackDeployer,
     stack_name: str,
@@ -1291,8 +1348,6 @@ def _wait_stack_settles(
     resource with its reason (:func:`_rollback_failure_message`). Without it the rollback
     message is exactly as before.
     """
-    import time as _time
-
     deadline = _monotonic_deadline(timeout)
     seen_until = since
     saw_partition_quota = False
@@ -1300,14 +1355,7 @@ def _wait_stack_settles(
     # The first non-connector resource the events report FAILED (the seeder, say).
     failed_resource: Optional[tuple[str, str]] = None
     status_read_failures = 0
-    # Seeder-ENI reporting state. ``-2`` is an unused sentinel so the first real
-    # reading (including 0) always prints. ``eni_wait_started`` / ``eni_last_logged``
-    # drive the periodic re-report: logging ONLY on change left an observed 18m30s gap
-    # between "MskCluster DELETE_COMPLETE" and "Seeder network interfaces released.",
-    # which reads as a hung teardown -- the very symptom this reporting exists to cure.
-    last_eni_count = -2
-    eni_wait_started: Optional[float] = None
-    eni_last_logged: Optional[float] = None
+    eni_reporter = _SeederEniReporter() if watch_seeder_enis else None
     while True:
         if driver.cancelled:
             return None
@@ -1334,41 +1382,10 @@ def _wait_stack_settles(
                     ):
                         failed_resource = _resource
         # Delete only: report the seeder-ENI reclamation that CloudFormation is silent
-        # about, so the long tail of the teardown does not look frozen. Reported on
-        # CHANGE *and* periodically while the count is unchanged -- the wait routinely
-        # runs ~15-20 min with no stack event, so a change-only line leaves a silent gap
-        # that reads as a hang (observed: 18m30s between the last CFN event and
-        # "released"). The re-report carries elapsed minutes so the operator can see it
-        # is progressing rather than stuck.
-        if watch_seeder_enis:
-            count = deployer.seeder_eni_count(stack_name)
-            if count is not None:
-                now_mono = _time.monotonic()
-                changed = count != last_eni_count
-                if count > 0:
-                    if eni_wait_started is None:
-                        eni_wait_started = now_mono
-                    due = (
-                        eni_last_logged is None
-                        or (now_mono - eni_last_logged) >= _ENI_REPORT_INTERVAL_SECONDS
-                    )
-                    if changed or due:
-                        noun = "interface" if count == 1 else "interfaces"
-                        waited = int((now_mono - eni_wait_started) // 60)
-                        # Only mention elapsed time once there is some to mention, so
-                        # the first line stays clean.
-                        elapsed = f" — {waited} min so far" if waited >= 1 else ""
-                        driver.log(
-                            f"Waiting for AWS to reclaim {count} seeder network "
-                            f"{noun}{elapsed} (no CloudFormation event until done)…"
-                        )
-                        eni_last_logged = now_mono
-                elif changed and last_eni_count > 0:
-                    # Only announce release if we had previously seen some pending.
-                    driver.log("Seeder network interfaces released.")
-                    eni_wait_started = None
-                    eni_last_logged = None
-                last_eni_count = count
+        # about, so the long tail of the teardown does not look frozen
+        # (:class:`_SeederEniReporter`).
+        if eni_reporter is not None:
+            eni_reporter.report(deployer, stack_name, driver)
         try:
             status = deployer.stack_status_checked(stack_name)
         except Exception as exc:  # noqa: BLE001 - a status READ failure, not a state
