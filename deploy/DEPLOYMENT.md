@@ -801,6 +801,18 @@ this account?* in the security notes below.
 > holds any: they ignore it and start the session fresh, and their next save overwrites
 > it, so re-run Evaluation and Schema Conversion there. Versions after v0.1.574 keep a
 > session whose only difference is fields they do not know, and restore it without them.
+>
+> **An image older than this version does not see the `-an` bucket.** On an ECS Fargate
+> deployment whose managed bucket is `mysql-dsql-migrator-plugins-<account>-<region>-an`
+> (the activity log's *S3 bucket in use* entry names the bucket a deployment uses), an
+> older image uses only the earlier name, `mysql-dsql-migrator-plugins-<account>-<region>`,
+> and creates that bucket: every reconnecting browser starts fresh, an interrupted Full Load's
+> record is not found, so it cannot be resumed, and what the older image saves stays in
+> the earlier bucket, which this version does not read once the `-an` bucket exists, so it
+> is not seen after you roll forward again. On the single EC2 host, an older version's
+> Start CDC stops because the earlier bucket does not exist and tells you to delete the
+> CDC infrastructure and deploy it again: do not, because deleting the CDC infrastructure
+> loses the position the stream has reached; run this version or a later one instead.
 
 ### Enable AI-assisted conversion (optional)
 

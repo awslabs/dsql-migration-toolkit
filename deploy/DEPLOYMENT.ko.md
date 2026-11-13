@@ -745,6 +745,16 @@ aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" --expected-bucket-owner "$ACCO
 > 하나라도 든 세션은 그 버전들이 읽지 못해 무시하고 새로 시작하며, 다음 저장이 그것을 덮어쓰므로
 > 거기서 Evaluation과 Schema Conversion을 다시 실행하세요. v0.1.574보다 새로운 버전은 모르는 필드만
 > 다른 세션을 버리지 않고, 그 필드를 뺀 채 복원합니다.
+>
+> **이 버전보다 오래된 이미지는 `-an` 버킷을 보지 못합니다.** 관리형 버킷이
+> `mysql-dsql-migrator-plugins-<account>-<region>-an`인 ECS Fargate 배포(배포가 쓰는 버킷은 활동 로그의
+> *S3 bucket in use* 항목이 알려 줍니다)에서 오래된 이미지는 이전 이름
+> `mysql-dsql-migrator-plugins-<account>-<region>`만 쓰고 그 버킷을 만듭니다: 재연결하는 모든
+> 브라우저가 새로 시작하고, 중단된 Full Load의 기록을 찾지 못해 재개할 수 없으며, 오래된 이미지가
+> 저장한 것은 이전 버킷에 남는데, 이 버전은 `-an` 버킷이 있으면 이전 버킷을 읽지 않으므로 다시
+> 롤포워드한 뒤에는 보이지 않습니다. 단일 EC2 호스트에서는 오래된 버전의 Start CDC가 이전 버킷이 없어
+> 멈추고 CDC 인프라를 삭제한 뒤 다시 배포하라고 안내합니다: 그렇게 하지 마세요. CDC 인프라를 삭제하면
+> 스트림이 도달한 위치를 잃습니다. 대신 이 버전이나 그 이후 버전을 실행하세요.
 
 ### AI 보조 변환 활성화 (Optional)
 

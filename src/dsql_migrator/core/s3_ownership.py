@@ -148,7 +148,9 @@ def error_code(exc: BaseException) -> str:
     return ""
 
 
-def _http_status(exc: BaseException) -> Optional[int]:
+def http_status(exc: BaseException) -> Optional[int]:
+    """The HTTP status S3 answered a botocore ``ClientError`` with (``None`` when it carries
+    none: a network failure, say)."""
     response = getattr(exc, "response", None)
     if not isinstance(response, dict):
         return None
@@ -162,7 +164,7 @@ def _http_status(exc: BaseException) -> Optional[int]:
 def is_access_denied(exc: BaseException) -> bool:
     """S3 answered 403. With ``ExpectedBucketOwner``, that is a bucket another account owns,
     or one this identity may not reach: the tool cannot confirm it owns the bucket."""
-    code, status = error_code(exc), _http_status(exc)
+    code, status = error_code(exc), http_status(exc)
     if code or status is not None:
         return code in _DENIED_CODES or status == 403
     text = str(exc)
@@ -171,7 +173,7 @@ def is_access_denied(exc: BaseException) -> bool:
 
 def is_missing(exc: BaseException) -> bool:
     """S3 answered 404: the bucket (or the key) does not exist."""
-    code, status = error_code(exc), _http_status(exc)
+    code, status = error_code(exc), http_status(exc)
     if code or status is not None:
         return code in _MISSING_CODES or status == 404
     text = str(exc)
@@ -505,6 +507,7 @@ __all__ = [
     "caller_account_id",
     "create_denied_message",
     "error_code",
+    "http_status",
     "is_access_denied",
     "is_missing",
     "not_owned_message",

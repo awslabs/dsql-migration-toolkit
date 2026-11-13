@@ -55,6 +55,8 @@ from dsql_migrator.core.s3_ownership import (
     BucketOwnershipError,
     OwnedBucket,
     caller_account_id,
+    error_code,
+    http_status,
     is_access_denied,
     is_missing,
     refusal_text,
@@ -1017,7 +1019,8 @@ def managed_bucket_name(
        grants only the earlier name).
     3. HeadBucket the earlier name (:func:`earlier_plugin_bucket_name`): 200 uses it, so an
        existing deployment keeps its bucket and the state in it (nothing is copied or moved).
-       A 403 (another account may hold the name) is never used.
+       A 403 (another account may hold the name), or any other 4xx about the bucket
+       (:func:`_earlier_answer`), is never used.
     4. Otherwise create the regional name in this account's regional namespace and use it.
        Only when that CreateBucket is denied (or step 2 was a 403) and step 3 found no bucket
        is the earlier name created instead, as before. Anything else is refused
@@ -1078,6 +1081,37 @@ def _answer(bucket: OwnedBucket) -> Optional[BaseException]:
     return None
 
 
+# 4xx answers about the request rather than the bucket: the caller's own credentials, a
+# request that timed out (408) and throttling (429). S3 sends no error code on a HEAD, so the
+# codes are seen only when a response carries one.
+_REQUEST_STATUSES = frozenset({408, 429})
+_REQUEST_CODES = frozenset(
+    {"ExpiredToken", "InvalidToken", "TokenRefreshRequired", "RequestTimeout"}
+)
+
+
+def _earlier_answer(bucket: OwnedBucket) -> Optional[BaseException]:
+    """:func:`_answer` for the earlier name, which another account can hold, so any other 4xx
+    S3 answers its owner-checked HeadBucket with is an answer too: the bucket is not used, and
+    not created, and the regional bucket can still be. S3 answers HeadBucket on a bucket this
+    identity may not access with a bare 400, 403 or 404, so another account's bucket by the
+    name can answer 400 (one in a Region this account has not enabled, say). 5xx, the
+    request's own 4xx (:data:`_REQUEST_STATUSES`, :data:`_REQUEST_CODES`) and an error with
+    no HTTP status (a network failure) propagate."""
+    try:
+        return _answer(bucket)
+    except Exception as exc:  # noqa: BLE001 - classified below
+        status = http_status(exc)
+        if (
+            status is not None
+            and 400 <= status < 500
+            and status not in _REQUEST_STATUSES
+            and error_code(exc) not in _REQUEST_CODES
+        ):
+            return exc
+        raise
+
+
 def _choose_managed_bucket(
     s3_client: Any, account_id: str, region: str, sleep: Callable[[float], None]
 ) -> tuple[str, str, ActivityStatus]:
@@ -1098,7 +1132,7 @@ def _choose_managed_bucket(
             f"S3 bucket '{regional.name}' (only this AWS account can create a bucket by this "
             "name)"
         ), ActivityStatus.INFO
-    earlier_answer = _answer(earlier)
+    earlier_answer = _earlier_answer(earlier)
     if earlier_answer is None:
         return earlier.name, (
             f"S3 bucket '{earlier.name}': the tool keeps using the existing bucket earlier "

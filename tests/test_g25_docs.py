@@ -751,6 +751,52 @@ def test_faq_q31_teardown_names_the_default_cdc_stack_and_how_to_remove_the_buck
     assert "`aws s3api head-bucket --expected-bucket-owner`" in q31, lang
 
 
+# The rollback note under "Update to a new image version": its heading, and what it must say
+# about an older image on a deployment whose managed bucket is the -an one.
+_ROLLBACK_NOTE = {
+    "en": (
+        "**Rolling back to an older image can cost you saved sessions.**",
+        "**An image older than this version does not see the `-an` bucket.**",
+        "do not, because deleting the CDC infrastructure loses the position the stream has "
+        "reached; run this version or a later one instead.",
+    ),
+    "ko": (
+        "**이전 이미지로 롤백하면 저장된 세션을 잃을 수 있습니다.**",
+        "**이 버전보다 오래된 이미지는 `-an` 버킷을 보지 못합니다.**",
+        "그렇게 하지 마세요. CDC 인프라를 삭제하면 스트림이 도달한 위치를 잃습니다. 대신 이 버전이나 "
+        "그 이후 버전을 실행하세요.",
+    ),
+    "ja": (
+        "**古いイメージにロールバックすると、保存されたセッションを失うことがあります。**",
+        "**このバージョンより古いイメージには `-an` バケットが見えません。**",
+        "そうしないでください。CDC インフラを削除すると、ストリームが到達した位置が失われます。"
+        "代わりにこのバージョン以降を実行してください。",
+    ),
+}
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_the_rollback_note_says_an_older_image_does_not_see_the_regional_bucket(lang) -> None:
+    # FAILS WITHOUT THE FIX: the note said only that versions after v0.1.574 restore a saved
+    # session. An image older than the -an bucket uses the earlier name alone and creates it,
+    # so on a deployment whose bucket is the -an one it restores no session and resumes no
+    # Full Load, and what it saves is not seen after rolling forward; on the EC2 host its Start
+    # CDC sends the operator to delete the CDC infrastructure, which loses the stream's place.
+    suffix = "" if lang == "en" else f".{lang}"
+    text = (DEPLOY / f"DEPLOYMENT{suffix}.md").read_text(encoding="utf-8")
+    heading, regional, ec2 = _ROLLBACK_NOTE[lang]
+    (note,) = [
+        block for block in text.split("\n\n")
+        if block.startswith("> [!IMPORTANT]") and heading in block
+    ]
+    flat = _flat(lang, note)
+    assert _has(lang, flat, regional), lang
+    assert f"`{_PLUGIN_BUCKET}-an`" in note and f"`{_PLUGIN_BUCKET}`" in note, lang
+    assert "*S3 bucket in use*" in note, lang  # where to see which bucket a deployment uses
+    assert "ECS Fargate" in note and "EC2" in note, lang
+    assert _has(lang, flat, ec2), lang
+
+
 _ROOT_REPAIR = {
     "en": (
         "at Start CDC a repair that fails, or cannot run because the session has no source "

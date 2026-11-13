@@ -51,7 +51,7 @@ from dsql_migrator.core.s3_ownership import (
     refusal_text,
     session_caller_account,
 )
-from dsql_migrator.core.s3_provision import state_bucket
+from dsql_migrator.core.s3_provision import ManagedBucket, state_bucket
 
 if TYPE_CHECKING:
     from dsql_migrator.core.models import TargetConnectionConfig
@@ -613,13 +613,16 @@ class S3OverlayLedger(_BlobLedger):
     ``absent`` ONLY for ``NoSuchKey``: NoSuchBucket, AccessDenied, throttling, 5xx and
     network errors are retried and then read ``unreadable`` (a write raises). The client
     is built lazily (no network at construction); the bucket is ensured by the session
-    store at startup, never here.
+    store at startup, and here only when the managed bucket is checked again after a
+    request found it gone or refused (:meth:`_ops`).
 
     The bucket's name is derived, so another account can own a bucket by that name: every
     request asserts the caller's own account (``sts:GetCallerIdentity``, read once) as its
     owner (:class:`~dsql_migrator.core.s3_ownership.OwnedBucket`). A bucket another account
     owns -- or an account that cannot be read -- reads ``unreadable`` and fails a write, with
-    the refusal (:class:`~dsql_migrator.core.s3_ownership.BucketOwnershipError`) as the error.
+    the refusal (:class:`~dsql_migrator.core.s3_ownership.BucketOwnershipError`) as the error;
+    the managed bucket is then checked again, and chosen again, on the next request
+    (:meth:`_refused`).
     """
 
     def __init__(self, bucket: str, *, region: Optional[str] = None, aws_profile: Optional[str] = None,
@@ -632,7 +635,10 @@ class S3OverlayLedger(_BlobLedger):
         self._client = s3_client
         # The account that must own the bucket (``sts_client`` is the test seam), read once.
         self._owner = session_caller_account(aws_profile, region, sts_client=sts_client)
-        self._owned = None
+        self._owned: Optional[OwnedBucket] = None
+        # A request found the bound bucket gone or refused (_refused): the next binding checks
+        # the managed bucket again instead of taking the name this process chose before.
+        self._check_again = False
 
     def _s3(self):
         if self._client is None:
@@ -645,22 +651,38 @@ class S3OverlayLedger(_BlobLedger):
         """The bucket bound to the account that must own it (raises BucketOwnershipError
         while that account cannot be read): the session store's, the managed bucket when the
         configured name is its earlier name for this account and Region
-        (:func:`~dsql_migrator.core.s3_provision.state_bucket`)."""
-        if self._owned is None:
-            self._owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
-        return self._owned
+        (:func:`~dsql_migrator.core.s3_provision.state_bucket`).
+
+        Bound again after a request found the bucket gone or refused (:meth:`_refused`): the
+        managed bucket is then checked again by its rule (:meth:`ManagedBucket.ensure`), which
+        chooses it again when the bucket chosen before stopped answering as this account's,
+        so the ledger moves to the bucket the rest of the tool moves to without waiting for
+        the session store. Raises (and binds nothing) while that check fails."""
+        owned = self._owned
+        if owned is None:
+            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
+            if self._check_again and isinstance(owned, ManagedBucket) and not owned.confirmed:
+                owned.ensure()
+            self._check_again = False
+            self._owned = owned
+        return owned
 
     def _object_key(self, key: str) -> str:
         return f"{self._prefix}{key}.json"
 
     def _refused(self, exc: BaseException, ops: OwnedBucket) -> BaseException:
         """``exc`` as the bucket's refusal when it is one (a 403 to the owner-checked request),
-        so a read's ``unreadable`` error and a write's failure say what to do. A bucket deleted
-        while the app runs (NoSuchBucket) is bound again on the next request, so the ledger
-        follows the session store when that store chooses the managed bucket again."""
-        if error_code(exc) == "NoSuchBucket":
-            self._owned = None
+        so a read's ``unreadable`` error and a write's failure say what to do.
+
+        A refused bucket (another account created the name after this account's bucket was
+        deleted, say) and one deleted while the app runs (NoSuchBucket) are bound again on the
+        next request, where :meth:`_ops` checks the managed bucket again: the ledger chooses
+        it again itself, as the session and job stores do, instead of staying on the bucket
+        it first bound. A 403 on a bucket that is still this account's (IAM, a KMS key
+        policy) keeps the binding."""
         refusal = refusal_text(exc, ops)
+        if (refusal is not None or error_code(exc) == "NoSuchBucket") and self._owned is ops:
+            self._owned, self._check_again = None, True
         return BucketOwnershipError(refusal) if refusal is not None else exc
 
     def _get(self, key):
