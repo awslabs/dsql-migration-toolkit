@@ -828,13 +828,16 @@ def test_the_thread_path_voids_a_recreated_tables_old_builds_at_its_recreate(
     rig.tables = rig.tables[:1]
     earlier = IndexBuilds(submitted=1, completed=1, completed_by_table={"orders": 1})
     voided_at: list = []
-    real_void = engine._void_index_builds
+    real_void = ib._void_index_builds
 
     def _void(job, tables):
         voided_at.append((sorted(tables), [e[0] for e in rig.events]))
         return real_void(job, tables)
 
-    monkeypatch.setattr(engine, "_void_index_builds", _void)
+    # Both lookups: the recreate's void resolves the name in the engine's globals (the
+    # re-export), the merge passes' (before and after the load) in _index_builds' (FL-11).
+    for module in (engine, ib):
+        monkeypatch.setattr(module, "_void_index_builds", _void)
 
     def _work(handle):
         handle.update(lambda job: setattr(job, "index_builds", earlier))

@@ -15,8 +15,8 @@ Pinned here:
   ``_PREREQ_STATUS_COLORS``, ...): without this check, dropping one from the re-export would
   leave the suite green;
 * the one-directional imports both docstrings state: neither module imports the package
-  ``__init__``, or ``_cdc_ui``, which imports names back from it -- at its top or inside a
-  function, by any import statement: ``import ...data_migration``, ``from ...data_migration
+  ``__init__``, or ``_cdc_ui`` (which reads two of the package's helpers, each inside a
+  function at call time) -- at its top or inside a function, by any import statement: ``import ...data_migration``, ``from ...data_migration
   import <name>``, a relative import, or the parent-package ``from dsql_migrator.ui import
   data_migration``, the E2E harness's own spelling -- nor reads either off an ancestor it
   imports, through an attribute chain: ``import dsql_migrator.ui`` then

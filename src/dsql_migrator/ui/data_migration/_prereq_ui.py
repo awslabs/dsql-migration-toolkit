@@ -19,7 +19,9 @@ as a module global) and for the readers that reach them as ``dm.<name>`` / ``fro
 ``dm.<name>`` reaches the package's calls only, and the calls made here read this module's
 names, so a test patches them here. One-directional: this module imports, at its top, from
 ``_models`` and the shared ``core`` + ``ui`` modules -- never from the package ``__init__``,
-or from ``_cdc_ui``, which imports names back from it.
+or from ``_cdc_ui``, which reads two of the package's helpers (``exclusion_card_locked``,
+``table_set_lock_reason``) each inside a function, at call time;
+``tests/test_rr_dmshared06_render_split.py`` pins that this module imports neither.
 """
 
 from __future__ import annotations

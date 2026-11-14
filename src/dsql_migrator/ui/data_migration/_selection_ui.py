@@ -11,9 +11,9 @@ the pre-ticked default and the effective selection (``default_migration_selectio
 and lock icons (``build_migration_table_tree``, ``_header_table_slot_with_locks``), and the
 renderer (``_render_table_selection``). The migration-type selector and the existing CDC
 infrastructure banner stay in the package ``__init__``: the selector falls back to
-``migration_type_lock_reason``, which the package defines and ``_cdc_ui`` imports from it,
-and the banner renders ``_cdc_ui``'s attach row, so either would tie this module to that
-cycle.
+``migration_type_lock_reason``, which the package defines, and the banner renders
+``_cdc_ui``'s attach row (and reads its ``_cdc_stack_has_seeder_lambda``), so either would
+make this module import the package or ``_cdc_ui``, which it never does (below).
 
 The package ``__init__`` re-exports every name defined here, private ones included, at its
 bottom: for its own code -- the screen builder, ``resolve_migration_selection`` and the
@@ -23,8 +23,10 @@ as ``dm.<name>`` / ``from ...data_migration import <name>``. A re-export does no
 monkeypatch: a patch on ``dm.<name>`` reaches the package's calls only, and the calls made
 here read this module's names, so a test patches them here. One-directional: this module
 imports, at its top, from ``_models`` / ``_table_set_lock`` and the shared ``core`` + ``ui``
-modules -- never from the package ``__init__``, or from ``_cdc_ui``, which imports names
-back from it.
+modules -- never from the package ``__init__``, or from ``_cdc_ui``, which reads two of the
+package's helpers (``exclusion_card_locked``, ``table_set_lock_reason``) each inside a
+function, at call time; ``tests/test_rr_dmshared06_render_split.py`` pins that this module
+imports neither.
 """
 
 from __future__ import annotations

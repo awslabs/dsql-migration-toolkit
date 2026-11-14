@@ -75,15 +75,28 @@ _QUASAR_SPINNER_COLOR: dict[str, str] = {
 }
 
 
+def _notice_frame_classes(tone: str) -> str:
+    """The notice box's frame for the tone: rounded, tone border, tint, padding.
+
+    The one definition of that geometry. :func:`notice_box_classes` (a row) and
+    :func:`notice_panel` (a column) add only their own layout tokens to it, so a retune
+    here moves every notice box at once -- two hand-copied class strings would drift the
+    moment one is tuned.
+    """
+    bg, border, _icon_color, _icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
+    return f"rounded-md border {border} {bg} p-3"
+
+
 def notice_box_classes(tone: str) -> str:
     """Tailwind classes for the notice BOX itself, for the tone's palette.
 
     Shared by :func:`render_notice` and :func:`notice_container` so the box geometry
     (rounded, bordered, tinted, padded) is defined exactly once -- two hand-copied
-    class strings would drift the moment one is tuned.
+    class strings would drift the moment one is tuned. The frame is
+    :func:`_notice_frame_classes`, which :func:`notice_panel` shares too; this adds the
+    row's layout (glyph and text side by side, top-aligned, not wrapping).
     """
-    bg, border, _icon_color, _icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
-    return f"items-start gap-2 no-wrap w-full rounded-md border {border} {bg} p-3"
+    return f"items-start gap-2 no-wrap w-full {_notice_frame_classes(tone)}"
 
 
 @contextmanager
@@ -125,11 +138,13 @@ def notice_panel(ui, *, tone: str, header: str, icon: str = ""):
 
     Yields ``(header_row, body)``. Re-enter ``header_row`` (``with header_row:``) to append
     to the header; anything created directly in the ``with`` block lands in ``body``,
-    below it. The box has the notice box's tint, border and padding
-    (:func:`notice_box_classes`).
+    below it. The box has the notice box's frame -- tint, border, rounding and padding --
+    from the one definition :func:`notice_box_classes` uses (:func:`_notice_frame_classes`);
+    only the column layout is its own (a column cannot take the row's ``items-start
+    no-wrap``).
     """
-    bg, border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
-    body = ui.column().classes(f"w-full gap-2 rounded-md border {border} {bg} p-3")
+    _bg, _border, icon_color, default_icon = NOTICE_STYLE.get(tone, NOTICE_STYLE["info"])
+    body = ui.column().classes(f"w-full gap-2 {_notice_frame_classes(tone)}")
     with body:
         header_row = ui.row().classes("w-full items-center gap-2 no-wrap")
         with header_row:

@@ -466,6 +466,26 @@ def test_notice_panel_icon_override_and_unknown_tone_fallback() -> None:
     assert panel.children[0].children[0].text == icon
 
 
+def test_notice_panel_and_notice_box_share_one_frame_definition(monkeypatch) -> None:
+    """Review follow-up to cdcui-7: the panel's tint, border, rounding and padding come
+    from the same definition as notice_box_classes, so retuning that one frame moves
+    render_notice, notice_container and the CDC panels together -- a hand-copied string
+    in notice_panel would leave the panels behind with the suite green."""
+    from dsql_migrator.ui import design
+
+    bg, border, _icon_color, _icon = NOTICE_STYLE["warning"]
+    assert design._notice_frame_classes("warning") == f"rounded-md border {border} {bg} p-3"
+    assert design._notice_frame_classes("bogus") == design._notice_frame_classes("info")
+
+    monkeypatch.setattr(design, "_notice_frame_classes", lambda tone: f"FRAME-{tone}")
+    assert design.notice_box_classes("error") == "items-start gap-2 no-wrap w-full FRAME-error"
+    ui = _TreeUi()
+    with design.notice_panel(ui, tone="error", header="h"):
+        pass
+    (panel,) = ui.root.children
+    assert panel.class_list == ["w-full gap-2 FRAME-error"]
+
+
 def test_the_cdc_monitoring_panels_are_notice_panels() -> None:
     """The catalog-drift notice, the schema-drift banner and the dead-letter panel no
     longer assemble their box from NOTICE_STYLE by hand."""
