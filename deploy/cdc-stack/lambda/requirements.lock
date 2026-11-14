@@ -1,0 +1,21 @@
+# Every distribution vendored into connectors/plugins/offset-seeder-lambda.zip, pinned
+# exactly. The zip is built from exactly these, installed with pip's --no-deps (pip resolves
+# nothing), so a new upstream release cannot drift into it; an installed version other than
+# its pin stops the build. Change a pin on purpose only, live-verify the seeder with it, and
+# keep THIRD-PARTY-NOTICES.md in step (tests/test_offset_seeder_build_pins.py checks the
+# committed zip and the notices against this file).
+#
+# A line without "# via" is a runtime dependency of the seeder (its .dist-info keeps pip's
+# REQUESTED marker). A "# via" line is in the MSK IAM signer's dependency tree: its code is
+# pruned from the zip (the Lambda Python runtime provides the AWS SDK; click is the signer's
+# CLI), but its .dist-info stays. kafka-python 3.0.10 is the live-verified one.
+kafka-python==3.0.10
+aws-msk-iam-sasl-signer-python==1.0.2
+boto3==1.42.97  # via aws-msk-iam-sasl-signer-python
+botocore==1.42.97  # via aws-msk-iam-sasl-signer-python, boto3, s3transfer
+s3transfer==0.16.1  # via boto3
+jmespath==1.1.0  # via boto3, botocore
+python-dateutil==2.9.0.post0  # via botocore
+six==1.17.0  # via python-dateutil
+urllib3==1.26.20  # via botocore
+click==8.1.8  # via aws-msk-iam-sasl-signer-python

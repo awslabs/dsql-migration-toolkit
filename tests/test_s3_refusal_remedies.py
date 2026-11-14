@@ -21,7 +21,9 @@ operator something that does not work (or is not needed):
       this version's app stack template grants.
 (iv)  the managed bucket's earlier name, which an existing deployment kept, refused while the
       app runs (its owner deleted it and another account took the name): retry, and the tool
-      moves to its -an bucket by itself.
+      moves to its -an bucket by itself -- unless this identity may not use the -an name (an
+      app stack updated image-only keeps an older template, which grants only the earlier
+      name): then allow it first, as in (iii), and the retry moves.
 
 Each test pins its case's remedy and that no other case's is there. Fakes only: no AWS.
 """
@@ -39,6 +41,7 @@ from dsql_migrator.core.s3_provision import (
     S3ProvisionError,
     earlier_plugin_bucket_name,
     ensure_plugin_bucket,
+    managed_bucket_remedy,
     regional_plugin_bucket_name,
 )
 from dsql_migrator.core.session_state_store import S3SessionStateStore, SessionSnapshot
@@ -64,13 +67,27 @@ _NO_OTHER_NAME = "has no S3 account regional namespace, so the tool has no other
 _SETTING = "which names this bucket, at a bucket this account owns"
 _ALLOW_REGIONAL = "for a request whose s3:x-amz-bucket-namespace is account-regional"
 _MOVES = "the tool then checks its managed bucket again and, while this bucket is refused"
+_ALLOW_FIRST = "so retrying alone does not move the tool off this bucket"
+# A CreateBucket refusal's own remedy, which no case above gives (it would point at the name
+# another account can take).
+_CREATE_IT = "or create the bucket in this account yourself"
 _CASES = {
     "delete or support": (DELETE_OR_SUPPORT, "AWS Support"),
     "no other name": (_NO_OTHER_NAME,),
     "setting": (_SETTING,),
     "allow regional": (_ALLOW_REGIONAL,),
     "moves": (_MOVES,),
+    "allow first": (_ALLOW_FIRST,),
+    "create it": (_CREATE_IT,),
 }
+# (iii)'s remedy, which ends every refusal that names both of the managed bucket's names.
+_ALLOW_REGIONAL_REMEDY = (
+    f"Allow this identity s3:CreateBucket on '{_REGIONAL}' for a request whose "
+    "s3:x-amz-bucket-namespace is account-regional (the tool creates it in this account's "
+    "S3 account regional namespace), and s3:ListBucket on it; check SCPs and permissions "
+    "boundaries too. On ECS Fargate or EC2, the app stack template of this version grants "
+    "both: update the app stack with it."
+)
 
 
 def _only(text: str, *cases: str) -> None:
@@ -204,13 +221,7 @@ def test_no_usable_bucket_is_fixed_by_allowing_the_regional_name(unusable) -> No
     # FAILS WITHOUT THE FIX: the remedy did not tie the namespace condition to s3:CreateBucket,
     # and when the earlier name was taken during the fallback the refusal embedded the
     # earlier name's own "delete it there ... contact AWS Support" (with a double period).
-    remedy = (
-        f"Allow this identity s3:CreateBucket on '{_REGIONAL}' for a request whose "
-        "s3:x-amz-bucket-namespace is account-regional (the tool creates it in this account's "
-        "S3 account regional namespace), and s3:ListBucket on it; check SCPs and permissions "
-        "boundaries too. On ECS Fargate or EC2, the app stack template of this version grants "
-        "both: update the app stack with it. Then retry."
-    )
+    remedy = f"{_ALLOW_REGIONAL_REMEDY} Then retry."
 
     def blocked() -> OwnerCheckingS3:
         s3 = OwnerCheckingS3()
@@ -234,6 +245,42 @@ def test_no_usable_bucket_is_fixed_by_allowing_the_regional_name(unusable) -> No
         assert text.endswith(remedy), text
         _only(text, "allow regional")
     assert _REGIONAL not in s3.buckets and s3.buckets[_BUCKET].objects == {}
+
+
+@pytest.mark.parametrize("regional", ["create denied", "not granted"])
+def test_no_usable_bucket_with_the_earlier_names_create_denied_too_gives_only_one_remedy(
+    regional,
+) -> None:
+    # FAILS WITHOUT THE FIX: an SCP or a permissions boundary denies every CreateBucket and
+    # neither bucket exists yet. The refusal embedded the earlier name's own CreateBucket
+    # refusal -- "Allow s3:CreateBucket on it ..., or create the bucket in this account
+    # yourself, then retry." -- before (iii)'s remedy: two remedies, the first pointing at the
+    # name in the global namespace that another account can take.
+    def blocked() -> OwnerCheckingS3:
+        s3 = OwnerCheckingS3()
+        if regional == "not granted":  # an app stack template older than this version
+            s3.no_grant = {_REGIONAL}
+            s3.create_denied = {_BUCKET}
+        else:
+            s3.create_denied = {_REGIONAL, _BUCKET}
+        return s3
+
+    with pytest.raises(S3ProvisionError) as deploy:
+        ensure_plugin_bucket(blocked(), _ME, _REGION)
+    s3 = blocked()
+    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    jobs.save(_job("j1"), None)
+    for text in (str(deploy.value), jobs.bucket_refusal or ""):
+        assert (
+            f"'{_BUCKET}', the name earlier versions used, does not exist in this account, "
+            "and this identity may not create it either (CreateBucket: An error occurred "
+            "(AccessDenied) when calling the CreateBucket operation: Access Denied). "
+            f"{_ALLOW_REGIONAL_REMEDY} Then retry."
+        ) in text, text
+        assert text.endswith(f"{_ALLOW_REGIONAL_REMEDY} Then retry."), text
+        assert "Allow s3:CreateBucket on it" not in text, text
+        _only(text, "allow regional")
+    assert s3.buckets == {}
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +324,66 @@ def test_a_kept_earlier_bucket_refused_mid_run_says_the_tool_moves_to_the_region
     jobs.save(_job("j3"), None)
     assert jobs.bucket_refusal is None and "jobs/j3.json" in s3.buckets[_REGIONAL].objects
     assert ensure_plugin_bucket(s3, _ME, _REGION) == _REGIONAL
+    assert theirs.objects == {} and "update_stack" not in cfn.calls
+
+
+@pytest.mark.parametrize("unusable", ["not granted", "create denied"])
+def test_a_kept_earlier_bucket_whose_regional_name_is_not_allowed_says_to_allow_it_first(
+    unusable,
+) -> None:
+    # FAILS WITHOUT THE FIX: the refusal promised that a retry moves to the -an bucket, while
+    # this identity may not use that name -- an existing deployment whose app stack was
+    # updated image-only keeps an older template that grants only the earlier name (its
+    # HeadBucket of the -an name answers 403), or an SCP denies its CreateBucket (so the
+    # earlier name was created instead). The retry then refused both names, as (iii) does.
+    s3 = OwnerCheckingS3()
+    if unusable == "not granted":
+        s3.no_grant = {_REGIONAL}
+        s3.bucket(_BUCKET)  # the existing deployment's bucket
+        answer = "An error occurred (403) when calling the HeadBucket operation: 403"
+    else:
+        s3.create_denied = {_REGIONAL}  # the first choice creates the earlier name instead
+        answer = (
+            "An error occurred (AccessDenied) when calling the CreateBucket operation: "
+            "Access Denied"
+        )
+    remedy = (
+        f"This identity may not use '{_REGIONAL}', the tool's bucket name in this account's "
+        "S3 account regional namespace, where only this account can create a bucket (S3 "
+        f"answered: {answer}), so retrying alone does not move the tool off this bucket. "
+        f"{_ALLOW_REGIONAL_REMEDY} Then retry (the job and session state retry at their next "
+        f"save): while this bucket is refused, the tool moves to '{_REGIONAL}' (nothing in "
+        "this bucket is copied there)."
+    )
+    jobs = S3JobStore(_BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts())
+    ledger = S3OverlayLedger(
+        _BUCKET, region=_REGION, s3_client=s3, sts_client=_Sts(), sleep=lambda _s: None,
+        max_attempts=1,
+    )
+    jobs.save(_job("j1"), None)
+    ledger.put_tables("k", {"shop.docs": _ledger_record()})
+    deployer, cfn = _deployer(s3)
+    deployer.preflight_template(_BIG)
+    assert set(s3.buckets) == {_BUCKET}  # the tool kept (or created) the earlier name
+    del s3.buckets[_BUCKET]
+    theirs = _foreign(s3)
+    jobs.save(_job("j2"), None)
+    read = ledger.read("k")
+    with pytest.raises(CdcDeployError) as staged:
+        deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
+    for text in (jobs.bucket_refusal or "", read.error or "", str(staged.value)):
+        assert f"'{_BUCKET}'" in text and remedy in text, text
+        _only(text, "allow regional", "allow first")
+    # ...and what it says is what happens: a retry alone refuses both names...
+    jobs.save(_job("j3"), None)
+    assert (jobs.bucket_refusal or "").startswith("The tool has no S3 bucket it can use")
+    # ...and once this identity is allowed the -an name, the next save moves there, and a
+    # refusal of the earlier name says to retry again.
+    s3.no_grant, s3.create_denied = set(), set()
+    jobs.save(_job("j4"), None)
+    assert jobs.bucket_refusal is None and "jobs/j4.json" in s3.buckets[_REGIONAL].objects
+    moved = managed_bucket_remedy(_BUCKET, _ME, _REGION)
+    assert moved is not None and _MOVES in moved.action and _ALLOW_FIRST not in moved.action
     assert theirs.objects == {} and "update_stack" not in cfn.calls
 
 

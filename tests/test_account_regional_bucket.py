@@ -265,7 +265,9 @@ def test_an_earlier_name_this_identity_may_not_create_either_says_why() -> None:
     # An SCP requires every CreateBucket to be in the account regional namespace, and the app
     # stack template is older than this version (it grants only the earlier name): the -an
     # name answers 403 and the earlier one 404, and the earlier one's CreateBucket is denied.
-    # The refusal names that denial, not only that the bucket "could not be created".
+    # The refusal names that denial, not only that the bucket "could not be created", and
+    # only S3's answer to it: not the CreateBucket refusal's own "allow it, or create the
+    # bucket yourself", which would point at the name another account can take.
     s3 = OwnerCheckingS3()
     s3.no_grant = {_REGIONAL}
     s3.create_denied = {_BUCKET}
@@ -274,11 +276,13 @@ def test_an_earlier_name_this_identity_may_not_create_either_says_why() -> None:
     text = str(exc.value)
     assert f"S3 refused this identity a HeadBucket of '{_REGIONAL}'" in text
     assert (
-        f"'{_BUCKET}', the name earlier versions used, does not exist in this account and "
-        f"could not be created instead: S3 bucket '{_BUCKET}' does not exist in this account "
-        f"({_ME}), and this identity may not create it (CreateBucket: "
+        f"'{_BUCKET}', the name earlier versions used, does not exist in this account, and "
+        "this identity may not create it either (CreateBucket: An error occurred "
+        "(AccessDenied) when calling the CreateBucket operation: Access Denied). Allow this "
+        f"identity s3:CreateBucket on '{_REGIONAL}' for a request whose "
     ) in text
-    assert "AccessDenied" in text and text.endswith("Then retry.")
+    assert "create the bucket in this account yourself" not in text
+    assert text.endswith("Then retry.")
     assert s3.buckets == {} and s3_provision._MANAGED_BUCKETS == {}
 
 

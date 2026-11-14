@@ -149,11 +149,14 @@ def no_shared_managed_bucket():
     """Start every test with no managed S3 bucket chosen.
 
     ``core/s3_provision.py`` keeps the bucket it chose for each account and Region for the
-    whole process (``_MANAGED_BUCKETS``): one test's choice, made against its own fake S3, must
-    never decide which bucket another test's code uses. An own MonkeyPatch, as above.
+    whole process (``_MANAGED_BUCKETS``), and what that choice found about the ``-an`` name
+    (``_REGIONAL_REFUSED``): one test's choice, made against its own fake S3, must never
+    decide which bucket another test's code uses, or what its refusals say. An own
+    MonkeyPatch, as above.
     """
     from dsql_migrator.core import s3_provision
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(s3_provision, "_MANAGED_BUCKETS", {})
+        patch.setattr(s3_provision, "_REGIONAL_REFUSED", {})
         yield

@@ -7,9 +7,10 @@
 with an unpinned ``pip install``. A rebuild then bumped kafka-python from the
 live-verified 3.0.10 to 3.0.13, and it wrote the build machine's ``/Users/...`` .pyc
 paths into 10 ``.dist-info/RECORD`` files (58ca1657 removed exactly those lines by
-hand). Now the script pins every distribution the committed zip vendors, installs them
-with ``--no-deps``, stops on a version drift, and drops each RECORD line that names a
-file the zip does not ship.
+hand). Now every distribution the committed zip vendors is pinned exactly in the tracked
+``deploy/cdc-stack/lambda/requirements.lock``; the script installs those pins with
+``--no-deps``, stops on a version drift, and drops each RECORD line that names a file
+the zip does not ship.
 
 Everything here is offline. The committed zip is read as is. The script runs for real
 (bash, zip, the version guard and the RECORD cleanup), with only ``python3 -m pip``
@@ -18,7 +19,9 @@ maintainer's machine, including the leaking RECORD lines.
 
 ``scripts/build_lambda_seeder.sh`` is a maintainer script that ``.gitignore`` keeps
 out of the published repo (``scripts/*``), so the script tests skip on a clone without
-it. The committed-zip checks always run.
+it. The checks of the committed zip -- its versions against the tracked lock file (and
+THIRD-PARTY-NOTICES.md against it), and its RECORD lines -- read only tracked files, so
+they run on every clone.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "build_lambda_seeder.sh"
 COMMITTED_ZIP = ROOT / "connectors" / "plugins" / "offset-seeder-lambda.zip"
+LOCK = ROOT / "deploy" / "cdc-stack" / "lambda" / "requirements.lock"
+NOTICES = ROOT / "THIRD-PARTY-NOTICES.md"
 
 needs_script = pytest.mark.skipif(
     not SCRIPT.exists(),
@@ -68,18 +73,25 @@ def _zip_dists(zf: zipfile.ZipFile) -> dict[str, tuple[str, str]]:
     return dists
 
 
-def _script_pins(text: str, array: str) -> dict[str, str]:
-    block = re.search(rf"^{array}=\(\n(.*?)^\)", text, re.S | re.M)
-    assert block, f"{array}=( ... ) not found in {SCRIPT.name}"
-    pins: dict[str, str] = {}
-    for line in block.group(1).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+def _lock_pins() -> tuple[dict[str, str], dict[str, str]]:
+    """(the seeder's runtime dependencies, the signer's dependency tree), each name ->
+    version in the lock file's order: a line with a ``# via`` comment is in the tree."""
+    requested: dict[str, str] = {}
+    transitive: dict[str, str] = {}
+    for line in LOCK.read_text(encoding="utf-8").splitlines():
+        spec, _, comment = line.partition("#")
+        if not spec.strip():
             continue
-        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9.!+_-]+)", line)
-        assert match, f"{array}: {line!r} is not an exact name==version pin"
-        pins[match.group(1)] = match.group(2)
-    return pins
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9.!+_-]+)", spec.strip())
+        assert match, f"{LOCK.name}: {line!r} is not an exact name==version pin"
+        group = transitive if comment.strip().startswith("via ") else requested
+        group[match.group(1)] = match.group(2)
+    return requested, transitive
+
+
+def _all_pins() -> dict[str, str]:
+    requested, transitive = _lock_pins()
+    return {**requested, **transitive}
 
 
 # --------------------------------------------------------------------------- #
@@ -101,11 +113,11 @@ def test_no_record_line_in_the_committed_zip_names_a_local_path() -> None:
             assert b"/Users/" not in zf.read(name), f"{name} carries a /Users/ path"
 
 
-@needs_script
 def test_every_vendored_distribution_has_an_exact_pin_and_vice_versa() -> None:
-    text = SCRIPT.read_text(encoding="utf-8")
-    requested = _script_pins(text, "REQUESTED_PINS")
-    transitive = _script_pins(text, "TRANSITIVE_PINS")
+    """FAILS WITHOUT THE FIX: the pins lived only in the git-ignored script, so this check
+    skipped on every clone, and a zip rebuilt elsewhere with an unpinned pip (kafka-python
+    3.0.13) passed the suite there."""
+    requested, transitive = _lock_pins()
     assert not set(requested) & set(transitive)
     pins = {_norm(n): v for n, v in {**requested, **transitive}.items()}
     with zipfile.ZipFile(COMMITTED_ZIP) as zf:
@@ -122,6 +134,19 @@ def test_every_vendored_distribution_has_an_exact_pin_and_vice_versa() -> None:
     # Only the two runtime dependencies carry pip's REQUESTED marker.
     assert marked == {_norm(n) for n in requested} == {
         "kafka-python", "aws-msk-iam-sasl-signer-python"}
+
+
+def test_the_third_party_notices_list_exactly_the_locked_versions() -> None:
+    """THIRD-PARTY-NOTICES.md names each vendored package at the version the zip ships."""
+    text = NOTICES.read_text(encoding="utf-8")
+    section = re.search(
+        r"^### Offset-seeder Lambda \(`offset-seeder-lambda\.zip`\)\n(.*?)(?=^#)",
+        text, re.S | re.M,
+    )
+    assert section, "the offset-seeder Lambda section is missing from THIRD-PARTY-NOTICES.md"
+    rows = re.findall(r"^\| ([^|]+?) \| ([^|]+?) \| [^|]+? \|$", section.group(1), re.M)
+    listed = {_norm(name): version for name, version in rows if name != "Package"}
+    assert listed == {_norm(n): v for n, v in _all_pins().items()}
 
 
 # --------------------------------------------------------------------------- #
@@ -217,6 +242,7 @@ def run_build(tmp_path: Path):
     lambda_src.mkdir(parents=True)
     (lambda_src / "seeder.py").write_text("def handler(event, context):\n    pass\n")
     (lambda_src / "cfnresponse.py").write_text("SUCCESS = 'SUCCESS'\n")
+    shutil.copy2(LOCK, lambda_src / LOCK.name)
     (repo / "connectors" / "plugins").mkdir(parents=True)
 
     shim = tmp_path / "bin"
@@ -234,7 +260,9 @@ def run_build(tmp_path: Path):
     python3.chmod(0o755)
     log = tmp_path / "pip.log"
 
-    def run(override: dict[str, str] | None = None):
+    def run(override: dict[str, str] | None = None, lock: str | None = None):
+        if lock is not None:
+            (lambda_src / LOCK.name).write_text(lock, encoding="utf-8")
         env = dict(os.environ)
         env.update(
             PATH=f"{shim}{os.pathsep}{env.get('PATH', '')}",
@@ -265,10 +293,28 @@ def test_the_script_installs_exactly_the_pins_with_no_deps(run_build) -> None:
     assert "--no-deps" in args
     specs = [a for a in args[1:] if not a.startswith("-")]
     specs.remove(args[args.index("--target") + 1])
-    text = SCRIPT.read_text(encoding="utf-8")
-    pins = {**_script_pins(text, "REQUESTED_PINS"), **_script_pins(text, "TRANSITIVE_PINS")}
-    assert specs == [f"{n}=={v}" for n, v in pins.items()]
+    assert specs == [f"{n}=={v}" for n, v in _all_pins().items()]
     assert len(specs) == len(_LAYOUT) == 10
+
+
+@needs_script
+def test_the_script_takes_its_pins_from_the_tracked_lock_file(run_build) -> None:
+    """FAILS WITHOUT THE FIX: the pins were written into the git-ignored script itself, so
+    they had no history. Now the script installs what the tracked lock file pins (here a
+    lock that pins kafka-python 3.0.13) and refuses a lock line that is not an exact pin."""
+    lock = LOCK.read_text(encoding="utf-8")
+    assert "kafka-python==3.0.10\n" in lock
+    proc, calls, out_zip = run_build(
+        lock=lock.replace("kafka-python==3.0.10\n", "kafka-python==3.0.13\n"))
+    assert proc.returncode == 0, proc.stderr
+    assert "kafka-python==3.0.13" in calls[0] and "kafka-python==3.0.10" not in calls[0]
+    with zipfile.ZipFile(out_zip) as zf:
+        assert _zip_dists(zf)["kafka-python"][0] == "3.0.13"
+    proc, calls, _ = run_build(
+        lock=lock.replace("kafka-python==3.0.10\n", "kafka-python>=3.0.10\n"))
+    assert proc.returncode != 0
+    assert "'kafka-python>=3.0.10' is not an exact name==version pin" in proc.stderr
+    assert len(calls) == 1  # pip was not run again
 
 
 @needs_script
@@ -301,9 +347,8 @@ def test_the_built_zip_ships_no_local_path_and_no_record_line_for_a_pruned_file(
             assert "/Users/" not in line and not path.startswith(("/", "../"))
         assert f"{record},,\n" in [line for _, line in lines]
     # Every pinned dist-info stays, at its pin; only the two runtime deps are REQUESTED.
-    text = SCRIPT.read_text(encoding="utf-8")
-    requested = _script_pins(text, "REQUESTED_PINS")
-    pins = {_norm(n): v for n, v in {**requested, **_script_pins(text, "TRANSITIVE_PINS")}.items()}
+    requested, _ = _lock_pins()
+    pins = {_norm(n): v for n, v in _all_pins().items()}
     assert {n: v for n, (v, _) in dists.items()} == pins
     assert {n for n, (_, d) in dists.items() if f"{d}/REQUESTED" in files} == {
         _norm(n) for n in requested}
@@ -320,15 +365,19 @@ def test_the_built_zip_ships_no_local_path_and_no_record_line_for_a_pruned_file(
 
 
 @needs_script
-def test_the_script_refuses_a_version_drift(run_build) -> None:
+def test_the_script_refuses_a_version_drift(run_build, tmp_path) -> None:
     """FAILS WITHOUT THE FIX: whatever pip installed was zipped. Now an installed
     version other than its pin (here a pip index that serves kafka-python 3.0.13 for
-    the 3.0.10 pin) stops the build before the zip is touched."""
+    the 3.0.10 pin) stops the build before the zip is touched: the committed zip is
+    still there, byte for byte (a guard after the script's ``rm -f`` would delete it)."""
+    committed = tmp_path / "repo" / "connectors" / "plugins" / COMMITTED_ZIP.name
+    committed.write_bytes(b"the committed offset-seeder-lambda.zip")
     proc, _, out_zip = run_build(override={"kafka-python": "3.0.13"})
     assert proc.returncode != 0
     assert "kafka-python: pinned 3.0.10, installed 3.0.13" in proc.stderr
     assert "ERROR: vendored version drift" in proc.stderr
-    assert not out_zip.exists()
+    assert out_zip == committed
+    assert out_zip.read_bytes() == b"the committed offset-seeder-lambda.zip"
 
 
 @needs_script
@@ -342,11 +391,12 @@ def test_the_version_guard_refuses_a_missing_or_an_unpinned_distribution(tmp_pat
         text, re.S | re.M,
     )
     assert guard, "the version guard block is missing from the script"
+    requested, transitive = _lock_pins()
     arrays = "".join(
-        re.search(rf"^{a}=\(\n.*?^\)\n", text, re.S | re.M).group(0)
-        for a in ("REQUESTED_PINS", "TRANSITIVE_PINS")
+        f"{array}=(\n" + "".join(f"  {n}=={v}\n" for n, v in group.items()) + ")\n"
+        for array, group in (("REQUESTED_PINS", requested), ("TRANSITIVE_PINS", transitive))
     )
-    pins = {**_script_pins(text, "REQUESTED_PINS"), **_script_pins(text, "TRANSITIVE_PINS")}
+    pins = _all_pins()
 
     def guard_exit(installed: dict[str, str]) -> tuple[int, str]:
         build = tmp_path / f"build{len(list(tmp_path.iterdir()))}"

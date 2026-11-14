@@ -1038,6 +1038,17 @@ def regional_plugin_bucket_name(account_id: str, region: str) -> str:
     return f"{earlier_plugin_bucket_name(account_id, region)}-an"
 
 
+def _allow_regional(regional: str) -> str:
+    """What lets this identity use the managed bucket's ``-an`` name ``regional``."""
+    return (
+        f"Allow this identity s3:CreateBucket on '{regional}' for a request whose "
+        "s3:x-amz-bucket-namespace is account-regional (the tool creates it in this account's "
+        "S3 account regional namespace), and s3:ListBucket on it; check SCPs and permissions "
+        "boundaries too. On ECS Fargate or EC2, the app stack template of this version grants "
+        "both: update the app stack with it."
+    )
+
+
 def managed_bucket_remedy(name: str, owner: str, region: str) -> Optional[Remedy]:
     """What a refusal of ``name`` tells the operator when it is the managed bucket's earlier
     name for ``owner`` and ``region``; ``None`` (the default remedy) for any other name.
@@ -1046,7 +1057,10 @@ def managed_bucket_remedy(name: str, owner: str, region: str) -> Optional[Remedy
     bucket, so the fix is on the bucket's side. Elsewhere the tool used that name only because
     a bucket by it was this account's: on its next attempt it checks its managed bucket again
     and, while the earlier-named one is refused, uses the ``-an`` name, which no other account
-    can hold (:func:`managed_bucket_name`)."""
+    can hold (:func:`managed_bucket_name`). That move needs this identity to be allowed the
+    ``-an`` name: when the choice that kept the earlier name found it was not
+    (:data:`_REGIONAL_REFUSED`), the refusal says to allow it first, since a retry alone
+    would only refuse both names."""
     if name != earlier_plugin_bucket_name(owner, region):
         return None
     if region in NO_ACCOUNT_REGIONAL_NAMESPACE:
@@ -1054,12 +1068,23 @@ def managed_bucket_remedy(name: str, owner: str, region: str) -> Optional[Remedy
             f"{region} has no S3 account regional namespace, so the tool has no other name "
             f"for this bucket there. {DELETE_OR_SUPPORT}"
         )
+    regional = regional_plugin_bucket_name(owner, region)
+    # Read without the lock (a dict lookup), as _still_usable calls this while holding it.
+    refused = _REGIONAL_REFUSED.get((owner, region))
+    if refused is not None:
+        return Remedy(
+            f"This identity may not use '{regional}', the tool's bucket name in this "
+            "account's S3 account regional namespace, where only this account can create a "
+            f"bucket (S3 answered: {refused}), so retrying alone does not move the tool off "
+            f"this bucket. {_allow_regional(regional)} Then retry (the job and session state "
+            "retry at their next save): while this bucket is refused, the tool moves to "
+            f"'{regional}' (nothing in this bucket is copied there)."
+        )
     return Remedy(
         "Retry (the job and session state retry at their next save): the tool then checks "
         "its managed bucket again and, while this bucket is refused, moves to "
-        f"'{regional_plugin_bucket_name(owner, region)}' in this account's S3 account "
-        "regional namespace, where only this account can create a bucket (nothing in this "
-        "bucket is copied there)."
+        f"'{regional}' in this account's S3 account regional namespace, where only this "
+        "account can create a bucket (nothing in this bucket is copied there)."
     )
 
 
@@ -1074,6 +1099,13 @@ _EMBEDDED_REMEDY = Remedy("")
 # answering as this account's (_still_usable).
 _MANAGED_BUCKETS: dict[tuple[str, str], str] = {}
 _MANAGED_LOCK = threading.Lock()
+# For each (account, Region) whose last choice kept the earlier-named bucket although this
+# identity may not use the -an name (its HeadBucket answered 403, or its CreateBucket was
+# denied: an app stack template older than this version grants only the earlier name, an SCP,
+# a permissions boundary), S3's answer about the -an name: a refusal of the earlier-named
+# bucket then says to allow the -an name first (managed_bucket_remedy). Set and cleared with
+# each choice, under _MANAGED_LOCK.
+_REGIONAL_REFUSED: dict[tuple[str, str], str] = {}
 
 
 def managed_bucket_name(
@@ -1211,14 +1243,23 @@ def _choose_managed_bucket(
     # which says what to do: it adds none.
     earlier = OwnedBucket(s3_client, earlier_name, account_id, remedy=_EMBEDDED_REMEDY)
     regional = OwnedBucket(s3_client, regional_plugin_bucket_name(account_id, region), account_id)
+    key = (account_id, region)
     regional_answer = _answer(regional)
     if regional_answer is None:
+        _REGIONAL_REFUSED.pop(key, None)
         return regional.name, (
             f"S3 bucket '{regional.name}' (only this AWS account can create a bucket by this "
             "name)"
         ), ActivityStatus.INFO
     earlier_answer = _earlier_answer(earlier)
     if earlier_answer is None:
+        # A 404: this identity may list the -an name, so a refusal of the earlier one says a
+        # retry moves there (should its CreateBucket be denied, that retry's refusal says so:
+        # _no_managed_bucket_message).
+        if is_missing(regional_answer):
+            _REGIONAL_REFUSED.pop(key, None)
+        else:
+            _REGIONAL_REFUSED[key] = _s3_answer(regional_answer)
         return earlier.name, (
             f"S3 bucket '{earlier.name}': the tool keeps using the existing bucket earlier "
             "versions created, which this account owns (every request checks that), and the "
@@ -1237,6 +1278,7 @@ def _choose_managed_bucket(
                                            earlier.name, earlier_answer)
             ) from exc
         else:
+            _REGIONAL_REFUSED.pop(key, None)
             return regional.name, (
                 f"S3 bucket '{regional.name}', created in this account's S3 account regional "
                 "namespace (only this AWS account can create a bucket by this name)"
@@ -1253,6 +1295,9 @@ def _choose_managed_bucket(
             _no_managed_bucket_message(account_id, region, regional.name, denied,
                                        earlier.name, exc)
         ) from exc
+    _REGIONAL_REFUSED[key] = _s3_answer(
+        (denied.__cause__ or denied) if isinstance(denied, BucketCreateDenied) else denied
+    )
     return earlier.name, (
         f"S3 bucket '{earlier.name}', created under the name earlier versions used, because "
         f"this identity may not use '{regional.name}' in this account's S3 account regional "
@@ -1277,7 +1322,9 @@ def _no_managed_bucket_message(
     cannot be created or used (CreateBucket denied by an app stack template older than this
     version, an SCP or a permissions boundary) and the earlier name is another account's or
     cannot be created either. So what to do is to allow the ``-an`` name, which no other
-    account can hold: the earlier name's own refusal adds no remedy here (_EMBEDDED_REMEDY)."""
+    account can hold: the earlier name's own refusal adds no remedy here (_EMBEDDED_REMEDY;
+    a denied CreateBucket of it is named by S3's answer alone, as create_denied_message's
+    "allow or create it yourself" would point at the name another account can take)."""
     if isinstance(regional_problem, BucketCreateDenied):
         cause = regional_problem.__cause__ or regional_problem
         regional_part = (
@@ -1293,7 +1340,13 @@ def _no_managed_bucket_message(
             f"S3 refused this identity a HeadBucket of '{regional}', a name only this AWS "
             f"account can create (S3 answered: {_s3_answer(regional_problem)})"
         )
-    if isinstance(earlier_problem, BucketOwnershipError):
+    if isinstance(earlier_problem, BucketCreateDenied):
+        cause = earlier_problem.__cause__ or earlier_problem
+        earlier_part = (
+            f"'{earlier}', the name earlier versions used, does not exist in this account, "
+            f"and this identity may not create it either (CreateBucket: {_s3_answer(cause)})"
+        )
+    elif isinstance(earlier_problem, BucketOwnershipError):
         earlier_part = (
             f"'{earlier}', the name earlier versions used, does not exist in this account "
             f"and could not be created instead: {str(earlier_problem).rstrip('.')}"
@@ -1312,11 +1365,7 @@ def _no_managed_bucket_message(
     return (
         f"The tool has no S3 bucket it can use in this account ({account_id}) and Region "
         f"({region}), so it read and wrote nothing: {regional_part}; and {earlier_part}. "
-        f"Allow this identity s3:CreateBucket on '{regional}' for a request whose "
-        "s3:x-amz-bucket-namespace is account-regional (the tool creates it in this account's "
-        "S3 account regional namespace), and s3:ListBucket on it; check SCPs and permissions "
-        "boundaries too. On ECS Fargate or EC2, the app stack template of this version grants "
-        "both: update the app stack with it. Then retry."
+        f"{_allow_regional(regional)} Then retry."
     )
 
 
