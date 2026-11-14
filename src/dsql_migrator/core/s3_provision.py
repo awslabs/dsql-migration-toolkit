@@ -51,9 +51,11 @@ from dsql_migrator.core.activity_log import ActivityCategory, ActivityStatus, lo
 from dsql_migrator.core.aws_session import BotoSessionLike, build_session
 from dsql_migrator.core.models import SourceType
 from dsql_migrator.core.s3_ownership import (
+    DELETE_OR_SUPPORT,
     BucketCreateDenied,
     BucketOwnershipError,
     OwnedBucket,
+    Remedy,
     caller_account_id,
     error_code,
     http_status,
@@ -1036,6 +1038,36 @@ def regional_plugin_bucket_name(account_id: str, region: str) -> str:
     return f"{earlier_plugin_bucket_name(account_id, region)}-an"
 
 
+def managed_bucket_remedy(name: str, owner: str, region: str) -> Optional[Remedy]:
+    """What a refusal of ``name`` tells the operator when it is the managed bucket's earlier
+    name for ``owner`` and ``region``; ``None`` (the default remedy) for any other name.
+
+    In a Region with no S3 account regional namespace the tool has no other name for its
+    bucket, so the fix is on the bucket's side. Elsewhere the tool used that name only because
+    a bucket by it was this account's: on its next attempt it checks its managed bucket again
+    and, while the earlier-named one is refused, uses the ``-an`` name, which no other account
+    can hold (:func:`managed_bucket_name`)."""
+    if name != earlier_plugin_bucket_name(owner, region):
+        return None
+    if region in NO_ACCOUNT_REGIONAL_NAMESPACE:
+        return Remedy(
+            f"{region} has no S3 account regional namespace, so the tool has no other name "
+            f"for this bucket there. {DELETE_OR_SUPPORT}"
+        )
+    return Remedy(
+        "Retry (the job and session state retry at their next save): the tool then checks "
+        "its managed bucket again and, while this bucket is refused, moves to "
+        f"'{regional_plugin_bucket_name(owner, region)}' in this account's S3 account "
+        "regional namespace, where only this account can create a bucket (nothing in this "
+        "bucket is copied there)."
+    )
+
+
+# The managed bucket's earlier name while its refusal is part of the one that names both of
+# the managed bucket's names (_no_managed_bucket_message), which says what to do.
+_EMBEDDED_REMEDY = Remedy("")
+
+
 # The managed bucket chosen for each (account, Region) in this process: chosen once, so every
 # part of the tool (Deploy CDC infrastructure, Start and Retry CDC, the ECS Fargate state
 # stores) uses the same one, and chosen again only when an earlier-named bucket it chose stops
@@ -1098,7 +1130,9 @@ def _still_usable(
     """``name``, the bucket chosen before, checked again owner-checked; ``None`` when an
     earlier-named bucket in a Region with the regional namespace is gone (404) or refused
     (403): it is never created again, the choice is made again. Caller holds the lock."""
-    bucket = OwnedBucket(s3_client, name, account_id)
+    bucket = OwnedBucket(
+        s3_client, name, account_id, remedy=managed_bucket_remedy(name, account_id, region)
+    )
     if name == regional_plugin_bucket_name(account_id, region) or (
         region in NO_ACCOUNT_REGIONAL_NAMESPACE
     ):
@@ -1161,14 +1195,21 @@ def _choose_managed_bucket(
 ) -> tuple[str, str, ActivityStatus]:
     """(name, why, activity status) by :func:`managed_bucket_name`'s rule. Caller holds the
     lock."""
-    earlier = OwnedBucket(s3_client, earlier_plugin_bucket_name(account_id, region), account_id)
+    earlier_name = earlier_plugin_bucket_name(account_id, region)
     if region in NO_ACCOUNT_REGIONAL_NAMESPACE:
+        earlier = OwnedBucket(
+            s3_client, earlier_name, account_id,
+            remedy=managed_bucket_remedy(earlier_name, account_id, region),
+        )
         earlier.ensure(region, sleep=sleep)
         return earlier.name, (
             f"S3 bucket '{earlier.name}': {region} has no S3 account regional namespace, so "
             "the tool uses the name earlier versions used; every request checks that this "
             "account owns it"
         ), ActivityStatus.INFO
+    # Here the earlier name's own refusal is only ever part of _no_managed_bucket_message's,
+    # which says what to do: it adds none.
+    earlier = OwnedBucket(s3_client, earlier_name, account_id, remedy=_EMBEDDED_REMEDY)
     regional = OwnedBucket(s3_client, regional_plugin_bucket_name(account_id, region), account_id)
     regional_answer = _answer(regional)
     if regional_answer is None:
@@ -1232,7 +1273,11 @@ def _no_managed_bucket_message(
     earlier: str,
     earlier_problem: BaseException,
 ) -> str:
-    """The refusal when neither of the managed bucket's names can be used."""
+    """The refusal when neither of the managed bucket's names can be used: the ``-an`` name
+    cannot be created or used (CreateBucket denied by an app stack template older than this
+    version, an SCP or a permissions boundary) and the earlier name is another account's or
+    cannot be created either. So what to do is to allow the ``-an`` name, which no other
+    account can hold: the earlier name's own refusal adds no remedy here (_EMBEDDED_REMEDY)."""
     if isinstance(regional_problem, BucketCreateDenied):
         cause = regional_problem.__cause__ or regional_problem
         regional_part = (
@@ -1240,7 +1285,9 @@ def _no_managed_bucket_message(
             f"account can create (CreateBucket: {_s3_answer(cause)})"
         )
     elif isinstance(regional_problem, BucketOwnershipError):
-        regional_part = f"S3 bucket '{regional}' could not be used: {regional_problem}"
+        regional_part = (
+            f"S3 bucket '{regional}' could not be used: {str(regional_problem).rstrip('.')}"
+        )
     else:
         regional_part = (
             f"S3 refused this identity a HeadBucket of '{regional}', a name only this AWS "
@@ -1249,7 +1296,7 @@ def _no_managed_bucket_message(
     if isinstance(earlier_problem, BucketOwnershipError):
         earlier_part = (
             f"'{earlier}', the name earlier versions used, does not exist in this account "
-            f"and could not be created instead: {earlier_problem}"
+            f"and could not be created instead: {str(earlier_problem).rstrip('.')}"
         )
     elif is_missing(earlier_problem):
         earlier_part = (
@@ -1265,10 +1312,11 @@ def _no_managed_bucket_message(
     return (
         f"The tool has no S3 bucket it can use in this account ({account_id}) and Region "
         f"({region}), so it read and wrote nothing: {regional_part}; and {earlier_part}. "
-        f"Allow s3:CreateBucket and s3:ListBucket on '{regional}' for this identity (it is "
-        "created with s3:x-amz-bucket-namespace = account-regional; check SCPs and permissions "
-        "boundaries too); on ECS Fargate or EC2, update the app stack with this version's "
-        "template, which grants them. Then retry."
+        f"Allow this identity s3:CreateBucket on '{regional}' for a request whose "
+        "s3:x-amz-bucket-namespace is account-regional (the tool creates it in this account's "
+        "S3 account regional namespace), and s3:ListBucket on it; check SCPs and permissions "
+        "boundaries too. On ECS Fargate or EC2, the app stack template of this version grants "
+        "both: update the app stack with it. Then retry."
     )
 
 
@@ -1311,17 +1359,45 @@ class ManagedBucket(OwnedBucket):
             raise
         self.confirmed = True
 
+    @property
+    def remedy(self) -> Remedy:
+        """What a refusal tells the operator for the bucket chosen now (its name can change):
+        :func:`managed_bucket_remedy`."""
+        return managed_bucket_remedy(self.name, self.owner, self.region) or super().remedy
+
+
+def _state_setting_remedy(setting: str, owner: str, region: Optional[str]) -> Remedy:
+    """What a refusal of a state bucket the operator named with ``setting`` tells them: the
+    tool picks no other name for it, so the setting is the fix. With a Region, the managed
+    bucket's earlier name is one way out (:func:`state_bucket` reads it as the managed
+    bucket). Unsetting it is not: the store then keeps its state on local disk only (an ECS
+    Fargate task replacement loses it), not in the managed bucket."""
+    managed = (
+        f", or set it to '{earlier_plugin_bucket_name(owner, region)}', which the tool reads "
+        "as its managed bucket (the value the ECS Fargate app template sets)"
+        if region
+        else ""
+    )
+    return Remedy(
+        f"Point {setting}, which names this bucket, at a bucket this account owns{managed}, "
+        "then restart the app.",
+        derived=False,
+    )
+
 
 def state_bucket(
-    s3_client: Any, configured: str, owner: str, region: Optional[str]
+    s3_client: Any, configured: str, owner: str, region: Optional[str], *, setting: str
 ) -> OwnedBucket:
     """The bucket a job or session state store (and the overlay ledger beside it) set to
     ``configured`` uses, bound to ``owner``: the managed bucket (:class:`ManagedBucket`) when
     ``configured`` is the managed bucket's earlier name for this account and Region -- what
-    the ECS Fargate app template sets -- else ``configured`` itself, owner-checked as given."""
+    the ECS Fargate app template sets -- else ``configured`` itself, owner-checked as given,
+    whose refusal tells the operator to change ``setting`` (the setting that names it)."""
     if region and configured == earlier_plugin_bucket_name(owner, region):
         return ManagedBucket(s3_client, owner, region)
-    return OwnedBucket(s3_client, configured, owner)
+    return OwnedBucket(
+        s3_client, configured, owner, remedy=_state_setting_remedy(setting, owner, region)
+    )
 
 
 def _repo_root() -> Path:
@@ -1373,8 +1449,10 @@ def _ensured_bucket(
     """:func:`ensure_plugin_bucket`'s bucket, bound to ``account_id`` and confirmed to be its
     (:attr:`OwnedBucket.confirmed`), for the uploads that follow it."""
     try:
+        name = managed_bucket_name(s3_client, account_id, region)
         owned = OwnedBucket(
-            s3_client, managed_bucket_name(s3_client, account_id, region), account_id
+            s3_client, name, account_id,
+            remedy=managed_bucket_remedy(name, account_id, region),
         )
     except BucketOwnershipError as exc:
         raise S3ProvisionError(str(exc)) from exc

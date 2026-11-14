@@ -39,6 +39,13 @@ which frees the name for another account. A 200 shows the bucket is still this a
 that 403 is IAM, a KMS key policy or an SCP, reported as the error it is; anything else
 unconfirms the bucket, and the 403 is the refusal.
 
+What a refusal tells the operator to do depends on why the bucket has that name, which only the
+caller knows: each :class:`OwnedBucket` carries its :class:`Remedy`. By default it is
+:data:`DELETE_OR_SUPPORT`, for a derived name the tool has no other name for (a Region with no
+S3 account regional namespace); :mod:`~dsql_migrator.core.s3_provision` binds the others (a
+state bucket an operator named, the managed bucket's earlier name where the tool can move to
+its ``-an`` name, a refusal another message wraps).
+
 Verified against the Amazon S3 documentation: a request whose expected owner is not the
 bucket's owner fails with 403 Access Denied; HeadBucket answers a bucket that does not exist, or
 one this identity may not access, with a bare 400, 403 or 404 (only a 404 is taken as "absent";
@@ -52,6 +59,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 # ExpectedBucketOwner takes an AWS account ID: 12 digits (S3 accepts no other form).
@@ -75,12 +83,32 @@ _MISSING_CODES = frozenset({"404", "NoSuchBucket", "NotFound", "NoSuchKey"})
 _VERIFY_ATTEMPTS = 3
 _VERIFY_BACKOFF_SECONDS = 1.0
 
-# What every refusal tells the operator to do. The tool has no setting that picks another
-# bucket name (the name is derived), so the fix is on the bucket's side.
-_REMEDY = (
+# What a refusal tells the operator to do when the tool derived the bucket's name and has no
+# other name for it: S3 cannot rename a bucket, so the fix is on the bucket's side. Since the
+# managed bucket moved to the S3 account regional namespace (-an), that is only a Region with
+# no such namespace (me-south-1, me-central-1); s3_provision binds the other cases' remedies.
+DELETE_OR_SUPPORT = (
     "If the bucket is yours in another AWS account, empty and delete it there (S3 cannot "
     "rename a bucket), then retry; otherwise, contact AWS Support."
 )
+
+
+@dataclass(frozen=True)
+class Remedy:
+    """What a refusal of a bucket another AWS account may hold tells the operator.
+
+    ``action``: what to do about it (``""`` when a message that embeds the refusal says it).
+    ``derived``: the tool derived the bucket's name from the account ID and Region, so another
+    account can create it first, and versions before the owner check kept CDC artifacts as
+    well as state in it; ``False`` for a name an operator set (a state bucket setting), which
+    held only state.
+    """
+
+    action: str = DELETE_OR_SUPPORT
+    derived: bool = True
+
+
+_DEFAULT_REMEDY = Remedy()
 _WHY = (
     "The tool derives the name from the account ID and Region, so another account can create a "
     "bucket with that name first."
@@ -94,6 +122,14 @@ _EARLIER = (
     "DEFAULTs may have come from it; then rotate the source database credentials, check the "
     "target's schema and DEFAULTs against the Schema Conversion output, and its data with a "
     "CHECKSUM Validation."
+)
+# The same for a state bucket an operator named: the tool kept only state there, never CDC's.
+_EARLIER_STATE = (
+    "Versions of the tool before this check used such a bucket. If another account owns it, "
+    "the state the app restored from it (and the record of dropped DEFAULTs kept beside the "
+    "session state) may have come from that account; then rotate the source database "
+    "credentials, check the target's schema and DEFAULTs against the Schema Conversion output, "
+    "and its data with a CHECKSUM Validation."
 )
 
 # The IAM permission each request the tool sends to the bucket needs: what a 403 to it points
@@ -198,11 +234,18 @@ def _operation(exc: BaseException) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def not_owned_message(bucket: str, owner: str, exc: Optional[BaseException] = None) -> str:
+def not_owned_message(
+    bucket: str,
+    owner: str,
+    exc: Optional[BaseException] = None,
+    *,
+    remedy: Remedy = _DEFAULT_REMEDY,
+) -> str:
     """The refusal for a 403 (``exc``) to a request that asserted ``owner`` owns ``bucket``,
     before any owner-checked request has reached it: another account owns the bucket, or this
     identity may not make that request, and S3 does not say which. Names the request, the
-    IAM permission it needs and S3's own answer."""
+    IAM permission it needs and S3's own answer, then what to do (``remedy``; a name in this
+    account's regional namespace needs none: no other account can hold it)."""
     operation = _operation(exc) if exc is not None else None
     permission = _PERMISSIONS.get(operation or "")
     request = f"a {operation} request" if operation else "a request"
@@ -220,21 +263,28 @@ def not_owned_message(bucket: str, owner: str, exc: Optional[BaseException] = No
             "boundaries too; on ECS Fargate or EC2, update the app stack with this version's "
             "template, which grants it."
         )
+    action = f" {remedy.action}" if remedy.action else ""
+    background = f"{_EARLIER} {_WHY}" if remedy.derived else _EARLIER_STATE
     return (
         f"S3 bucket '{bucket}' is owned by another AWS account, or this identity cannot reach "
         f"it, so the tool did not use it: S3 refused {request} that required this account "
-        f"({owner}) to own it, so that request read and wrote nothing.{answer} {_REMEDY} If "
+        f"({owner}) to own it, so that request read and wrote nothing.{answer}{action} If "
         f"the bucket is in this account, check that this identity's IAM policy {allows}. "
-        f"{_EARLIER} {_WHY}"
+        f"{background}"
     )
 
 
-def already_exists_message(bucket: str, owner: str) -> str:
-    """The refusal for a CreateBucket that answered ``BucketAlreadyExists``."""
+def already_exists_message(
+    bucket: str, owner: str, *, remedy: Remedy = _DEFAULT_REMEDY
+) -> str:
+    """The refusal for a CreateBucket that answered ``BucketAlreadyExists``, with what to do
+    (``remedy``)."""
+    action = f" {remedy.action}" if remedy.action else ""
+    why = f" {_WHY}" if remedy.derived else ""
     return (
         f"S3 bucket '{bucket}' already exists in another AWS account (CreateBucket: "
-        "BucketAlreadyExists), so the tool did not use it, and nothing was written to it. "
-        f"{_REMEDY} This account is {owner}. {_WHY}"
+        "BucketAlreadyExists), so the tool did not use it, and nothing was written to it."
+        f"{action} This account is {owner}.{why}"
     )
 
 
@@ -331,9 +381,13 @@ class OwnedBucket:
     :attr:`confirmed` turns true once one of those requests succeeds: S3 answered it, so this
     account owned the bucket then. A 403 after that is the refusal only if :meth:`still_owned`
     no longer reaches the bucket (:func:`refusal_text`).
+
+    ``remedy`` is what a refusal of this bucket tells the operator to do (:attr:`remedy`).
     """
 
-    def __init__(self, client: Any, name: str, owner: str) -> None:
+    def __init__(
+        self, client: Any, name: str, owner: str, *, remedy: Optional[Remedy] = None
+    ) -> None:
         if not _ACCOUNT_ID.fullmatch(str(owner or "")):
             raise CallerAccountError(
                 f"No AWS account ID to assert as the owner of S3 bucket '{name}' (got "
@@ -342,8 +396,15 @@ class OwnedBucket:
         self.client = client
         self.name = name
         self.owner = owner
+        self._remedy = remedy or _DEFAULT_REMEDY
         #: An owner-checked request to the bucket has succeeded: this account owns it.
         self.confirmed = False
+
+    @property
+    def remedy(self) -> Remedy:
+        """What a refusal of this bucket tells the operator to do (:data:`DELETE_OR_SUPPORT`
+        unless the caller bound another)."""
+        return self._remedy
 
     def _reached(self, response: Any) -> Any:
         self.confirmed = True
@@ -432,7 +493,7 @@ class OwnedBucket:
         except Exception as exc:  # noqa: BLE001 - classified below
             if is_access_denied(exc):
                 raise BucketOwnershipError(
-                    not_owned_message(self.name, self.owner, exc)
+                    not_owned_message(self.name, self.owner, exc, remedy=self.remedy)
                 ) from exc
             if not is_missing(exc):
                 raise
@@ -452,7 +513,7 @@ class OwnedBucket:
                 pass  # an earlier create, or a race: checked below like a new bucket
             elif _code_is(exc, "BucketAlreadyExists"):
                 raise BucketOwnershipError(
-                    already_exists_message(self.name, self.owner)
+                    already_exists_message(self.name, self.owner, remedy=self.remedy)
                 ) from exc
             elif is_access_denied(exc):
                 # A denied CreateBucket is this identity's permissions (an SCP, a boundary,
@@ -470,7 +531,7 @@ class OwnedBucket:
             except Exception as exc:  # noqa: BLE001 - classified below
                 if is_access_denied(exc):
                     raise BucketOwnershipError(
-                        not_owned_message(self.name, self.owner, exc)
+                        not_owned_message(self.name, self.owner, exc, remedy=self.remedy)
                     ) from exc
                 if not is_missing(exc) or attempt + 1 == _VERIFY_ATTEMPTS:
                     raise
@@ -492,7 +553,7 @@ def refusal_text(exc: BaseException, bucket: OwnedBucket | None = None) -> Optio
         return None
     if bucket.confirmed and bucket.still_owned():
         return None
-    return not_owned_message(bucket.name, bucket.owner, exc)
+    return not_owned_message(bucket.name, bucket.owner, exc, remedy=bucket.remedy)
 
 
 __all__ = [
@@ -501,7 +562,9 @@ __all__ = [
     "BucketOwnershipError",
     "CallerAccount",
     "CallerAccountError",
+    "DELETE_OR_SUPPORT",
     "OwnedBucket",
+    "Remedy",
     "account_regional_region",
     "already_exists_message",
     "caller_account_id",

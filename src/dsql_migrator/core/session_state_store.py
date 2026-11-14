@@ -561,6 +561,10 @@ class S3SessionStateStore:
     owner-checked HeadBucket (``refusal_text``).
     """
 
+    #: The setting that names this store's bucket (what a refusal of a bucket the
+    #: operator named says to change).
+    SETTING = "DSQL_MIGRATOR_SESSION_STATE_BUCKET"
+
     def __init__(
         self,
         bucket: str,
@@ -627,7 +631,8 @@ class S3SessionStateStore:
         Region (:func:`~dsql_migrator.core.s3_provision.state_bucket`)."""
         owned = self._owned
         if owned is None:
-            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
+            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region,
+                                 setting=self.SETTING)
             self._owned = owned
         return owned
 

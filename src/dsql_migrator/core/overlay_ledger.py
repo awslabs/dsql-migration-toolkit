@@ -625,6 +625,10 @@ class S3OverlayLedger(_BlobLedger):
     (:meth:`_refused`).
     """
 
+    #: The setting that names this ledger's bucket: the session state's (what a refusal
+    #: of a bucket the operator named says to change).
+    SETTING = "DSQL_MIGRATOR_SESSION_STATE_BUCKET"
+
     def __init__(self, bucket: str, *, region: Optional[str] = None, aws_profile: Optional[str] = None,
                  prefix: str = LEDGER_PREFIX, s3_client=None, sts_client=None, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -660,7 +664,8 @@ class S3OverlayLedger(_BlobLedger):
         the session store. Raises (and binds nothing) while that check fails."""
         owned = self._owned
         if owned is None:
-            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region)
+            owned = state_bucket(self._s3(), self._bucket, self._owner.get(), self._region,
+                                 setting=self.SETTING)
             if self._check_again and isinstance(owned, ManagedBucket) and not owned.confirmed:
                 owned.ensure()
             self._check_again = False

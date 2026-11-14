@@ -39,6 +39,7 @@ from dsql_migrator.core.s3_ownership import (
     is_missing,
     refusal_text,
 )
+from dsql_migrator.core.s3_provision import managed_bucket_remedy
 
 # Stack statuses from which an UpdateStack can safely start. Anything in an
 # *_IN_PROGRESS / ROLLBACK / FAILED state means a deploy is unsafe right now.
@@ -346,7 +347,13 @@ class CdcStackDeployer:
         bucket = self._template_bucket
         if bucket is None or bucket.name != bucket_name:
             try:
-                bucket = OwnedBucket(self._client("s3"), bucket_name, self.caller_account_id())
+                owner = self.caller_account_id()
+                # The managed bucket's earlier name is refused with what to do about it there
+                # (in most Regions, Start or Retry CDC again moves to the -an bucket).
+                bucket = OwnedBucket(
+                    self._client("s3"), bucket_name, owner,
+                    remedy=managed_bucket_remedy(bucket_name, owner, self._region),
+                )
             except BucketOwnershipError as exc:
                 raise CdcDeployError(f"{not_staged}: {exc}") from exc
             except Exception as exc:  # noqa: BLE001 - e.g. no S3 client for this session

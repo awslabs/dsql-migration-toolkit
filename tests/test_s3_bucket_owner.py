@@ -333,12 +333,26 @@ def _foreign(s3: OwnerCheckingS3, name: str = _BUCKET) -> _Bucket:
     return s3.bucket(name, _THEM, lets_me_in=True)
 
 
-def _assert_refusal(text: str, bucket: str = _BUCKET) -> None:
-    """What every refusal must tell the operator."""
+# What a refusal says to do, by why the bucket has its name (tests/test_s3_refusal_remedies.py
+# pins each in full): a derived name the tool has no other name for (the default, and a Region
+# with no S3 account regional namespace); the managed bucket's earlier name elsewhere, which
+# the tool moves off to its -an name; a state bucket the operator named.
+_DELETE_OR_SUPPORT = "delete it there"
+_MOVES_TO_REGIONAL = "moves to '"
+_POINT_THE_SETTING = "which names this bucket, at a bucket this account owns"
+_REMEDIES = (_DELETE_OR_SUPPORT, _MOVES_TO_REGIONAL, _POINT_THE_SETTING)
+
+
+def _assert_refusal(text: str, bucket: str = _BUCKET, remedy: Optional[str] = None) -> None:
+    """What every refusal must tell the operator: the bucket, that another account may hold
+    it, and what to do -- its case's ``remedy`` and no other case's (by default, the setting's
+    for :data:`_CUSTOM`, a state bucket the operator named, else :data:`_DELETE_OR_SUPPORT`)."""
+    remedy = remedy or (_POINT_THE_SETTING if bucket == _CUSTOM else _DELETE_OR_SUPPORT)
     assert f"'{bucket}'" in text, text
     assert "another AWS account" in text, text
-    assert "AWS Support" in text, text
-    assert "delete it there" in text, text
+    for other in _REMEDIES:
+        assert (other in text) is (other == remedy), (other, text)
+    assert ("AWS Support" in text) is (remedy == _DELETE_OR_SUPPORT), text
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +944,7 @@ def test_a_template_bucket_another_account_owns_stops_the_deploy(action) -> None
             deployer.create_stack("dsql-cdc-owner", _BIG, [("VpcId", "vpc-1")])
         else:
             deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
-    _assert_refusal(str(exc.value))
+    _assert_refusal(str(exc.value), remedy=_MOVES_TO_REGIONAL)
     assert str(exc.value).startswith("The cdc-stack template was not staged")
     assert "create_stack" not in cfn.calls and "update_stack" not in cfn.calls
     assert theirs.objects == {}
@@ -968,7 +982,7 @@ def test_start_cdc_updates_no_stack_from_another_accounts_template_bucket() -> N
             on_log=lambda _ts, msg: log.append(msg), template_body=_BIG,
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0, sleep=lambda _s: None,
         )
-    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET)
+    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET, remedy=_MOVES_TO_REGIONAL)
     assert cfn.updates == []
     assert theirs.objects == {}
     assert any("another AWS account" in line for line in log)
@@ -1031,7 +1045,7 @@ def test_a_template_preflight_in_another_accounts_bucket_is_the_refusal() -> Non
     for _ in range(2):  # a refusal confirms nothing: the next preflight tries again
         with pytest.raises(CdcDeployError) as exc:
             deployer.preflight_template(_BIG)
-        _assert_refusal(str(exc.value))
+        _assert_refusal(str(exc.value), remedy=_MOVES_TO_REGIONAL)
     assert s3.ops() == ["PutObject", "PutObject"]
     assert theirs.objects == {} and cfn.calls == [] and s3.violations == []
 
@@ -1074,7 +1088,7 @@ def test_start_cdc_refuses_another_accounts_template_bucket_before_the_kafka_pre
             seed_fn=lambda *a, **k: seeded.append(k) or "seeded",
             connector_timeout_seconds=5.0, poll_interval_seconds=0.0, sleep=lambda _s: None,
         )
-    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET)
+    _assert_refusal(str(exc.value), g25._EARLIER_BUCKET, remedy=_MOVES_TO_REGIONAL)
     assert seeded == [] and cfn.updates == [] and theirs.objects == {}
     assert s3.ops() == ["PutObject"] and s3.violations == []
     # Stopped while validating: the bootstrap brokers were never even read.
@@ -1106,12 +1120,15 @@ def test_a_refusal_names_the_refused_request_its_permission_and_s3s_answer(
     artifact.write_bytes(b"x")
     with pytest.raises(S3ProvisionError) as uploaded:
         upload_plugin(managed, _BUCKET, "cdc-plugins/0/a.zip", artifact, expected_owner=_ME)
-    for text, operation, permission in (
-        (str(staged.value), "PutObject", "s3:PutObject"),
-        (str(ensured.value), "HeadBucket", "s3:ListBucket"),
-        (str(uploaded.value), "PutObject", "s3:PutObject"),  # s3transfer's wrapped error
+    # The deployer stages in the managed bucket, whose earlier name the tool moves off; the
+    # other two are bound to the name as given.
+    for text, operation, permission, remedy in (
+        (str(staged.value), "PutObject", "s3:PutObject", _MOVES_TO_REGIONAL),
+        (str(ensured.value), "HeadBucket", "s3:ListBucket", _DELETE_OR_SUPPORT),
+        # s3transfer's wrapped error
+        (str(uploaded.value), "PutObject", "s3:PutObject", _DELETE_OR_SUPPORT),
     ):
-        _assert_refusal(text)
+        _assert_refusal(text, remedy=remedy)
         assert f"a {operation} request" in text, text
         assert f"allows {permission} on it" in text, text
         assert f"when calling the {operation} operation" in text, text  # S3's answer
@@ -1179,7 +1196,7 @@ def test_a_deployer_that_may_not_list_the_bucket_cannot_confirm_it_after_a_403()
     with pytest.raises(CdcDeployError) as exc:
         deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
     text = str(exc.value)
-    _assert_refusal(text)
+    _assert_refusal(text, remedy=_MOVES_TO_REGIONAL)
     assert "a PutObject request" in text and "allows s3:PutObject on it" in text
     assert "s3:ListBucket" not in text
     assert s3.ops() == ["PutObject", "PutObject", "HeadBucket"]
@@ -1277,13 +1294,13 @@ def test_the_ledger_and_the_deployer_refuse_a_bucket_taken_over_after_they_reach
     s3.reads.clear()  # the ledger's own read-back of its write
     read = ledger.read("k")
     assert read.status == "unreadable"
-    _assert_refusal(read.error or "")
+    _assert_refusal(read.error or "", remedy=_POINT_THE_SETTING)
     with pytest.raises(OverlayLedgerError) as written:
         ledger.put_tables("k", {"shop.docs": _ledger_record()})
-    _assert_refusal(str(written.value))
+    _assert_refusal(str(written.value), remedy=_POINT_THE_SETTING)
     with pytest.raises(CdcDeployError) as staged:
         deployer.submit_update("dsql-cdc-owner", [], template_body=_BIG)
-    _assert_refusal(str(staged.value))
+    _assert_refusal(str(staged.value), remedy=_MOVES_TO_REGIONAL)
     assert "update_stack" not in cfn.calls
     assert theirs.objects == {} and s3.reads == [] and s3.violations == []
 
@@ -1467,10 +1484,10 @@ def test_the_overlay_ledger_reads_another_accounts_bucket_as_unreadable() -> Non
     ledger = S3OverlayLedger(_BUCKET, s3_client=s3, sts_client=_Sts(), sleep=lambda _s: None)
     read = ledger.read("k")
     assert read.status == "unreadable"
-    _assert_refusal(read.error or "")
+    _assert_refusal(read.error or "", remedy=_POINT_THE_SETTING)
     with pytest.raises(OverlayLedgerError) as exc:
         ledger.put_tables("k", {"shop.docs": _ledger_record()})
-    _assert_refusal(str(exc.value))
+    _assert_refusal(str(exc.value), remedy=_POINT_THE_SETTING)
     assert theirs.objects == planted
     assert s3.reads == []
     assert s3.violations == []

@@ -253,7 +253,8 @@ def test_no_bucket_this_account_can_use_is_refused_naming_both(unusable) -> None
     text = str(exc.value)
     assert f"'{_REGIONAL}'" in text and f"'{_BUCKET}'" in text
     assert "another AWS account may hold that name" in text
-    assert "Allow s3:CreateBucket and s3:ListBucket" in text and text.endswith("Then retry.")
+    assert f"Allow this identity s3:CreateBucket on '{_REGIONAL}'" in text
+    assert "and s3:ListBucket on it" in text and text.endswith("Then retry.")
     assert ("CreateBucket", _BUCKET) not in _named(s3)
     assert theirs.objects == {} and _REGIONAL not in s3.buckets
     # Nothing was chosen: the next call chooses again.
@@ -484,7 +485,7 @@ def test_a_state_bucket_set_to_any_other_name_is_used_as_given() -> None:
         (earlier_plugin_bucket_name(_ME, "eu-west-1"), _REGION),  # another Region's
         (_BUCKET, None),  # no Region configured (a local run)
     ):
-        bound = state_bucket(s3, configured, _ME, region)
+        bound = state_bucket(s3, configured, _ME, region, setting=S3JobStore.SETTING)
         assert type(bound) is OwnedBucket and bound.name == configured, configured
     assert s3.calls == []  # bound, not yet used
 
@@ -515,7 +516,7 @@ def test_a_state_bucket_with_no_usable_bucket_is_the_stores_refusal() -> None:
     assert theirs.objects == {} and "PutObject" not in s3.ops()
     # A managed-bucket refusal is a BucketOwnershipError like any other bucket's.
     with pytest.raises(BucketOwnershipError):
-        state_bucket(s3, _BUCKET, _ME, _REGION)
+        state_bucket(s3, _BUCKET, _ME, _REGION, setting=S3JobStore.SETTING)
 
 
 def test_a_ledger_bucket_deleted_mid_run_is_chosen_again_by_the_ledger() -> None:
