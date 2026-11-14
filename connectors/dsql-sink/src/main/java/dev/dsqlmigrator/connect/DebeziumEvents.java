@@ -315,6 +315,14 @@ final class DebeziumEvents {
    * Whether two projected keys address the same row: numbers by value ({@code 5.0} equals
    * {@code 5.00}), bytes by content, anything else by {@code equals}. Never treats an
    * unchanged key as a move.
+   *
+   * <p>One of the sink's three row-key equality rules, kept apart because each errs to its own
+   * safe side. This one decides whether an update moved its composite key, and says "same" only
+   * for keys Aurora DSQL sees as one row (anything else is a move: the old key's delete, then
+   * the upsert). {@code DsqlSinkTask.rowIdentity} decides whether two moves can share a
+   * group, and the exact {@link ChangeEvent#pkValues()} equality of
+   * {@link DsqlSinkTask#dedupeRunByPk} and {@code DsqlSinkTask.replaces} folds or skips a
+   * change.
    */
   static boolean sameKey(List<Object> a, List<Object> b) {
     if (a.size() != b.size()) {

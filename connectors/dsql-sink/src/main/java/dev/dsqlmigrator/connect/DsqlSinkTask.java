@@ -1294,6 +1294,11 @@ public class DsqlSinkTask extends SinkTask {
    * that spares a row), or a plain upsert rendering the same SQL (the same column set, so a
    * partial image never replaces a full one). The rule of {@link #supersededInPut} and
    * {@link #endLookaheads}.
+   *
+   * <p>The row is matched by exact {@link ChangeEvent#pkValues()} equality, the rule of
+   * {@link #dedupeRunByPk}, not by the looser {@link #rowIdentity}: a false match would skip a
+   * change that still has to be written, a missed one leaves it to the hold or the dead-letter
+   * path. The sink's third row-key rule is {@link DebeziumEvents#sameKey}.
    */
   private static boolean replaces(Applicable failing, SinkRecord lr, ChangeEvent le) {
     SinkRecord fr = failing.record();
@@ -2037,6 +2042,12 @@ public class DsqlSinkTask extends SinkTask {
    * numbers by value (an INT widened to BIGINT, a NUMERIC scale), bytes by content, text
    * without trailing spaces (CHAR padding); anything else as itself. {@code null} for a missing
    * or empty key, or one with a null component.
+   *
+   * <p>The loosest of the sink's three row-key equality rules, on purpose: two moves share a
+   * group ({@link #moveGroupEnd}) only when they cannot be one row, because a group runs all its
+   * deletes before its upserts; a doubt only costs batching. The others are
+   * {@link DebeziumEvents#sameKey} (did one update move its key) and the exact
+   * {@link ChangeEvent#pkValues()} equality of {@link #dedupeRunByPk} and {@link #replaces}.
    */
   private static List<Object> rowIdentity(List<Object> key) {
     if (key == null || key.isEmpty()) {
@@ -2093,6 +2104,12 @@ public class DsqlSinkTask extends SinkTask {
    * delete). Deduping here is REQUIRED for {@code reWriteBatchedInserts}: a
    * rewritten multi-row {@code ON CONFLICT} rejects a duplicate conflict key
    * ("cannot affect row a second time").
+   *
+   * <p>Primary keys are equal by exact {@link ChangeEvent#pkValues()} equality
+   * ({@code List.equals}), one of the sink's three row-key equality rules, which
+   * {@link #replaces} shares: only equal values are folded, so two keys Aurora DSQL compares
+   * equal but Java does not ({@code 5.0} and {@code 5.00}) keep both images, in order. The
+   * others are {@link DebeziumEvents#sameKey} and {@link #rowIdentity}.
    */
   static List<Applicable> dedupeRunByPk(List<Applicable> chunk, int start, int end) {
     // LinkedHashMap keyed by PK: a re-put keeps the key's FIRST-seen position but
