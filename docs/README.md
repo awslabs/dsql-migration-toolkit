@@ -1,6 +1,6 @@
-# DSQL Migration Toolkit — Documentation
+# Aurora DSQL Migration Toolkit — Documentation
 
-Documentation for the DSQL Migration Toolkit — a web tool for migrating Amazon
+Documentation for the Aurora DSQL Migration Toolkit — a web tool for migrating Amazon
 RDS / Aurora **MySQL** *or* **PostgreSQL** to **Amazon Aurora DSQL**. New to the
 project? Start with the [top-level README](../README.md) for the architecture and
 AWS-services overview; this folder is the task-oriented documentation.

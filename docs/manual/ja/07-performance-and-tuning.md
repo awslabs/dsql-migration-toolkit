@@ -134,7 +134,7 @@ Full Load と Validation の環境変数は、タスク定義のコンテナ `en
 
 どちらを上げる場合も再デプロイが必要です。Fargate はタスクのメモリを自動スケールしません。CPU↔メモリの完全な組み合わせ表は [DEPLOYMENT.ja.md → タスクのサイジング](../../../deploy/DEPLOYMENT.ja.md#タスクのサイジング--containercpu--containermemory) を参照してください。
 
-> **ローカル実行** も同じ環境変数を読み取ります — `mysql-dsql-migrator ui` を起動する前に、シェルまたは `.env` に設定してください。
+> **ローカル実行** も同じ環境変数を読み取ります — `dsql-migration-toolkit ui` を起動する前に、シェルまたは `.env` に設定してください。
 
 ---
 

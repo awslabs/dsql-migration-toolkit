@@ -2,7 +2,7 @@
 
 _The deployment guide is localized — [English](DEPLOYMENT.md) · [한국어](DEPLOYMENT.ko.md) · [日本語](DEPLOYMENT.ja.md)._
 
-This folder holds everything needed to deploy the DSQL Migration Toolkit into an
+This folder holds everything needed to deploy the Aurora DSQL Migration Toolkit into an
 AWS account, **co-located with the infrastructure it provisions** (the guide
 references these templates and scripts by path).
 

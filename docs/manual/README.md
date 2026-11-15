@@ -1,4 +1,4 @@
-# mysql-dsql-migrator — User Manual
+# Aurora DSQL Migration Toolkit — User Manual
 
 A guided manual for migrating **Amazon RDS / Aurora MySQL or PostgreSQL** to
 **Amazon Aurora DSQL** with this tool.

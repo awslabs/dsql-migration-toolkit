@@ -75,10 +75,11 @@ _언어: [English](../en/01-setup.md) | **한국어** | [日本語](../ja/01-set
 # 로컬 가상환경에 의존성 설치
 uv sync
 # 웹 UI 실행 (기본 127.0.0.1:8080 바인딩)
-uv run mysql-dsql-migrator ui
+uv run dsql-migration-toolkit ui
 ```
 
-브라우저에서 **http://127.0.0.1:8080** 을 엽니다.
+브라우저에서 **http://127.0.0.1:8080** 을 엽니다. v0.1.590 이전의 명령 이름인
+`mysql-dsql-migrator`도 계속 동작합니다.
 
 선택 사항: 리포지토리 루트의 `.env` 파일에 연결 항목을 한 줄에 하나씩 `KEY=value`로 적으면(소스는
 `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, Aurora DSQL은 `TARGET_ENDPOINT`, `TARGET_REGION`,

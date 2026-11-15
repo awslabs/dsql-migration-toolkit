@@ -1,4 +1,4 @@
-# 배포 가이드 — MySQL / PostgreSQL → Aurora DSQL 마이그레이션 도구 (app-stack)
+# 배포 가이드 — MySQL / PostgreSQL → Aurora DSQL Migration Toolkit (app-stack)
 
 _언어: [English](DEPLOYMENT.md) | **한국어** | [日本語](DEPLOYMENT.ja.md)_
 
@@ -70,7 +70,7 @@ Aurora **DSQL**(타깃)과 리전 간 **데이터 전송**은 **사용량 기반
 끝입니다.**
 
 ```console
-$ uv run mysql-dsql-migrator ui
+$ uv run dsql-migration-toolkit ui
 NiceGUI ready to go on http://127.0.0.1:8080
 ```
 
@@ -99,7 +99,7 @@ AWS 자격증명이 있어야 합니다. 인프라 없음 — 평가 / 소규모
 >
 > ```bash
 > DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") \
->   uv run mysql-dsql-migrator ui
+>   uv run dsql-migration-toolkit ui
 > ```
 >
 > - **설정하지 않으면** — 재시작마다 세션 id가 바뀌어, 워크플로 진행과 **Schema Conversion 편집**
@@ -371,7 +371,7 @@ MSK **9098** 포트로 시드하고, 그 주소는 CDC VPC *내부*로 해석되
    (VPC 안에서 접속; 위 "UI 접근" 참고).
 
 **7. 열기 — 도구가 보여야 함.** 브라우저에서 `AppUrl`로 접속(VPC 내부에서)하면
-   **Aurora DSQL Migration Tool** UI가 뜹니다 — **Connect**로 시작하는 안내형
+   **Aurora DSQL Migration Toolkit** UI가 뜹니다 — **Connect**로 시작하는 안내형
    워크플로(Connect → Evaluation → Schema Conversion → Data Migration →
    Validation → Cut over). UI가 보이면 배포 완료이며, **Connect**에서 소스 DB 자격증명을
    입력해 시작합니다.
@@ -514,7 +514,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 주요 출력: `LoadBalancerDns`, `AppUrl`, `ClusterName`, `ServiceName`,
 `TaskRoleArn`, `CognitoHostedUiDomain`.
 
-브라우저에서 **`AppUrl`**로 접속(VPC 내부에서)하면 **Aurora DSQL Migration Tool**
+브라우저에서 **`AppUrl`**로 접속(VPC 내부에서)하면 **Aurora DSQL Migration Toolkit**
 UI가 뜹니다 — **Connect**로 시작하는 안내형 워크플로(Connect → Evaluation →
 Schema Conversion → Data Migration → Validation → Cut over). UI가 보이면 배포 성공이며,
 **Connect**에서 소스 DB 자격증명을 입력해 시작합니다.

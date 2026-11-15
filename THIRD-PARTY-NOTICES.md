@@ -1,7 +1,7 @@
 # Third-Party Notices
 
-This project (`mysql-dsql-migrator`) is licensed under the Apache License 2.0
-(see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)).
+This project (Aurora DSQL Migration Toolkit, distribution `dsql-migration-toolkit`) is
+licensed under the Apache License 2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)).
 
 It **bundles** the following pre-built third-party artifacts under
 `connectors/plugins/` so the optional CDC pipeline can be deployed without a

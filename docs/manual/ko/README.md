@@ -1,4 +1,4 @@
-# mysql-dsql-migrator — 사용자 매뉴얼 (한국어)
+# Aurora DSQL Migration Toolkit — 사용자 매뉴얼 (한국어)
 
 _언어: [English](../en/README.md) | **한국어** | [日本語](../ja/README.md)_
 

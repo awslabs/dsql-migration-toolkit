@@ -1,4 +1,4 @@
-# デプロイガイド — MySQL / PostgreSQL → Aurora DSQL 移行ツール (app-stack)
+# デプロイガイド — MySQL / PostgreSQL → Aurora DSQL Migration Toolkit (app-stack)
 
 _言語: [English](DEPLOYMENT.md) | [한국어](DEPLOYMENT.ko.md) | **日本語**_
 
@@ -70,7 +70,7 @@ egress）で事前算定不可 — 計算機を参照。
 UI が起動します。それだけです。**
 
 ```console
-$ uv run mysql-dsql-migrator ui
+$ uv run dsql-migration-toolkit ui
 NiceGUI ready to go on http://127.0.0.1:8080
 ```
 
@@ -103,7 +103,7 @@ DSQL リージョンへのアウトバウンド HTTPS + AWS 認証情報が必�
 >
 > ```bash
 > DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") \
->   uv run mysql-dsql-migrator ui
+>   uv run dsql-migration-toolkit ui
 > ```
 >
 > - **設定しないと** — 再起動のたびに新しいセッション ID が発行され、ワークフローの進捗**および
@@ -395,7 +395,7 @@ MSK の **9098** ポート経由でシードし、そのアドレスは CDC VPC 
    （VPC 内から到達してください。上記の「UI への到達」を参照）。
 
 **7. 開く — ツールが表示されるはずです。** ブラウザで `AppUrl` にアクセスします
-   （VPC 内から）。**Aurora DSQL Migration Tool** の UI が読み込まれます —
+   （VPC 内から）。**Aurora DSQL Migration Toolkit** の UI が読み込まれます —
    **Connect** から始まるガイド付きワークフロー（Connect → Evaluation → Schema
    Conversion → Data Migration → Validation → Cut over）です。読み込まれれば
    デプロイは完了です。**Connect** でソース DB の認証情報を入力して開始します。
@@ -548,7 +548,7 @@ aws cloudformation describe-stacks --stack-name mysql-dsql-migrator \
 `TaskRoleArn`、`CognitoHostedUiDomain`。
 
 ブラウザで **`AppUrl`** を開きます（VPC 内から）。**Aurora DSQL
-Migration Tool** の UI が読み込まれます — **Connect** から始まるガイド付き
+Migration Toolkit** の UI が読み込まれます — **Connect** から始まるガイド付き
 ワークフロー（Connect → Evaluation → Schema Conversion →
 Data Migration → Validation → Cut over）です。UI が表示されればデプロイは
 成功です。**Connect** でソース DB の認証情報を入力して開始します。

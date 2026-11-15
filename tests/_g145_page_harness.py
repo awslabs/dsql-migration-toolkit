@@ -111,7 +111,7 @@ async def run() -> dict:
             user = User(http)
             await user.open("/")
             await asyncio.sleep(0.5)
-            result["browser_sees_app"] = await _sees(user, "Aurora DSQL Migration Tool")
+            result["browser_sees_app"] = await _sees(user, "Aurora DSQL Migration Toolkit")
             result["browser_sees_failure"] = await _sees(user, "The page could not be built")
             result["after_browser"] = _sessions()
     result["aws_refused"] = REFUSED

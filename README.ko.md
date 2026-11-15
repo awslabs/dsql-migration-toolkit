@@ -1,4 +1,4 @@
-# DSQL Migration Toolkit
+# Aurora DSQL Migration Toolkit
 
 _언어: [English](README.md) | **한국어** | [日本語](README.ja.md)_
 
@@ -137,10 +137,11 @@ git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
 # .venv 가상환경 생성·채움 (uv 필요)
 uv sync
-uv run mysql-dsql-migrator ui
+uv run dsql-migration-toolkit ui
 ```
 
-기본적으로 `http://127.0.0.1:8080`에 바인딩됩니다. 출력된 URL을 열고 **Connect** 단계부터
+기본적으로 `http://127.0.0.1:8080`에 바인딩됩니다. v0.1.590 이전의 명령 이름인
+`mysql-dsql-migrator`도 계속 동작합니다. 출력된 URL을 열고 **Connect** 단계부터
 시작하세요. 선택 사항으로, 리포지토리 루트의 git-ignore된 `.env` 파일이 연결 정보를 미리 채워
 줍니다(매뉴얼 [§1.2](docs/manual/ko/01-setup.md#12-로컬에서-실행)).
 

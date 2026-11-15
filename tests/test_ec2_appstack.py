@@ -152,7 +152,9 @@ def test_user_data_runs_from_source_not_docker() -> None:
     assert "uv sync" in ud and "--extra cdc-external" in ud  # deps incl. seed client
     assert "git clone" in ud
     assert "dsql-migrator.service" in ud  # systemd unit
-    assert "/opt/dsql-migrator/.venv/bin/mysql-dsql-migrator ui" in ud  # ExecStart
+    # ExecStart keeps the command's name before v0.1.590 (a permanent alias): SourceRepoRef
+    # can be a tag from before the rename (test_distribution_name checks it still exists).
+    assert "/opt/dsql-migrator/.venv/bin/mysql-dsql-migrator ui" in ud
 
 
 def test_user_data_source_mode_branches() -> None:

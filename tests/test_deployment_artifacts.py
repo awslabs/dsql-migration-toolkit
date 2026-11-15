@@ -59,7 +59,7 @@ def test_dockerfile_bakes_cdc_external_extra() -> None:
 
 def test_dockerfile_runs_nicegui_ui_entrypoint() -> None:
     text = _dockerfile_text()
-    assert 'ENTRYPOINT ["mysql-dsql-migrator"]' in text
+    assert 'ENTRYPOINT ["dsql-migration-toolkit"]' in text
     assert 'CMD ["ui"]' in text
 
 

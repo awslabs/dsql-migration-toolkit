@@ -140,7 +140,7 @@ mkdir -p "${OUT_DIR}"
 # report is echoed to stdout between markers for CloudWatch recovery.
 #
 # The measurement task-def sets entryPoint=["/bin/sh","-c"] (overriding the image's
-# `mysql-dsql-migrator` ENTRYPOINT, which an ECS command override alone can NOT do --
+# `dsql-migration-toolkit` ENTRYPOINT, which an ECS command override alone can NOT do --
 # containerOverrides has no entryPoint field). So the command override is a
 # SINGLE-element array holding the shell string that `sh -c` runs.
 build_cmd_json() {

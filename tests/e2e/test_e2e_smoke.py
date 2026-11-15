@@ -15,7 +15,7 @@ from playwright.sync_api import Page, expect
 
 
 def test_app_loads_with_title(page: Page) -> None:
-    assert page.title() == "DSQL Migration Tool"
+    assert page.title() == "Aurora DSQL Migration Toolkit"
     # The Connect screen (the landing step) renders its connection actions.
     expect(page.get_by_role("button", name="Test source connection")).to_be_visible()
     expect(page.get_by_role("button", name="Test target connection")).to_be_visible()

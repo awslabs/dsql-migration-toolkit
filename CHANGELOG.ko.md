@@ -5,6 +5,38 @@ _언어: [English](CHANGELOG.md) | **한국어** | [日本語](CHANGELOG.ja.md)_
 이 프로젝트의 주요 변경 사항을 기록합니다. [유의적 버전(semver)](https://semver.org/)을
 따르며, 버그 수정은 패치 릴리스로 올립니다.
 
+## v0.1.590
+
+이름을 바꾸고 S3 버킷 거부 메시지를 다듬은 릴리스입니다. 배포 이름(distribution)과 명령 이름이 이제 `dsql-migration-toolkit`이고, 앱의 제목은 *Aurora DSQL Migration Toolkit*입니다. `mysql-dsql-migrator` 명령도 계속 동작하며 AWS 리소스 이름은 하나도 바뀌지 않으므로, 기존 스택, 저장된 세션, CDC 파이프라인은 할 일이 없습니다. 관리형 버킷이나 상태 S3 버킷의 거부는 이제 각자의 경우에 맞는 해결 방법을 알려 줍니다. ECS Fargate 앱 스택은 이미지만 업데이트하면 되고, CDC 인프라는 다시 배포할 것이 없습니다.
+
+### 변경
+
+- **배포 이름과 명령 이름이 이제 `dsql-migration-toolkit`입니다(이전 `mysql-dsql-migrator`). 앱은 `uv run dsql-migration-toolkit ui`로 실행합니다.** `mysql-dsql-migrator` 명령은 같은 프로그램의 두 번째 이름으로 영구히 남으므로, 스크립트, 셸 별칭, 단일 EC2 호스트의 systemd 유닛(여전히 `mysql-dsql-migrator ui`를 실행합니다)은 바꿀 것이 없습니다. 어느 이름으로 실행하든 `--version`과 `--help`는 이제 `dsql-migration-toolkit`을 출력합니다. 컨테이너 이미지의 ENTRYPOINT는 이제 `dsql-migration-toolkit`이며, 명령(`ui` 등)만 덮어쓰는 ECS 태스크는 예전처럼 실행됩니다. Python 패키지는 `dsql_migrator` 그대로이므로 이름 변경은 이를 import하는 프로그램에 영향을 주지 않습니다.
+- **앱의 헤더와 브라우저 탭 제목이 이제 *Aurora DSQL Migration Toolkit*입니다**(이전 *Aurora DSQL Migration Tool*과 *DSQL Migration Tool*). README, 매뉴얼, 배포 가이드, `NOTICE`, `THIRD-PARTY-NOTICES.md`도 같은 이름을 씁니다.
+- **바뀌지 않는 것: 모든 AWS 리소스 이름.** 컨테이너 이미지 리포지토리(`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator`), 관리형 버킷(`mysql-dsql-migrator-plugins-<account>-<region>`, 새 버킷은 `-an`이 붙음), CDC 소스 시크릿(`mysql-dsql-migrator/cdc/<stack>/source`), CDC 메트릭 네임스페이스 `MysqlDsqlMigrator/CDC`, 앱의 로그 그룹(`/ecs/<stack>-mysql-dsql-migrator`), 배포 가이드의 예시 스택 이름, `DSQL_MIGRATOR_` 설정은 이름이 그대로입니다.
+- **내부 변경으로 동작은 바뀌지 않습니다: 오프셋 시더의 빌드를 `deploy/cdc-stack/lambda/requirements.lock`이 고정합니다.** 이 파일은 `connectors/plugins/offset-seeder-lambda.zip`에 포함된 배포 패키지 10개의 정확한 버전(kafka-python 3.0.10과 aws-msk-iam-sasl-signer-python 1.0.2, 그리고 서명기의 의존성)이며, 테스트가 클론할 때마다 커밋된 zip과 `THIRD-PARTY-NOTICES.md`를 이 파일과 대조합니다. zip은 바뀌지 않았습니다.
+- **`dsql_migrator.core.s3_provision.state_bucket`이 키워드 전용(keyword-only) 필수 인자 `setting`을 받습니다:** 버킷 이름을 정하는 설정(`DSQL_MIGRATOR_JOB_STATE_BUCKET` 등)으로, 버킷이 거부되면 거부 메시지가 운영자에게 이 설정을 바꾸라고 합니다. 이 인자 없이 호출하면 `TypeError`가 발생합니다. 거부 메시지의 해결 방법을 위해 새로 생긴 것: `dsql_migrator.core.s3_ownership`에 `Remedy`(거부가 운영자에게 알려 주는 할 일)와 `DELETE_OR_SUPPORT`(이전 버전이 준 유일한 해결 방법이며 여전히 기본값)가 추가되었고, `OwnedBucket`, `not_owned_message`, `already_exists_message`는 선택적 키워드 전용 인자 `remedy`를 받으며, `OwnedBucket`에는 `remedy` 속성이 생겼습니다. `dsql_migrator.core.s3_provision`에는 관리형 버킷의 이전 이름이 거부될 때의 해결 방법을 돌려주는 `managed_bucket_remedy(name, owner, region)`이 추가되었습니다(다른 이름이면 `None`).
+
+### 수정
+
+- **관리형 버킷이나 상태 버킷의 거부가 이제 각자의 경우에 맞는 할 일을 알려 줍니다.** v0.1.587부터 v0.1.589까지는 거부된 버킷에 "If the bucket is yours in another AWS account, empty and delete it there (S3 cannot rename a bucket), then retry; otherwise, contact AWS Support"라는 해결 방법 하나만 주었는데, v0.1.589의 `-an` 버킷 이후로 이 방법은 도구에 다른 이름이 없는 곳에서만 맞습니다. 이제는 다음과 같습니다.
+  - **me-south-1과 me-central-1에서** 다른 계정이 관리형 버킷 이름의 버킷을 소유한 경우: 거부 메시지가 먼저 그 리전에는 S3 계정 리전 네임스페이스가 없어 도구가 그곳에서 쓸 다른 이름이 없다고 밝히고, 그다음 위의 해결 방법을 줍니다.
+  - **`DSQL_MIGRATOR_JOB_STATE_BUCKET`이나 `DSQL_MIGRATOR_SESSION_STATE_BUCKET`을 직접 정한 버킷 이름으로 설정했는데** 다른 계정이 그 버킷을 소유한 경우: 그 설정이 내 계정이 소유한 버킷을 가리키게 하거나, 도구가 관리형 버킷으로 읽는 `mysql-dsql-migrator-plugins-<account>-<region>`(ECS Fargate 템플릿이 설정하는 값)으로 바꾼 뒤 앱을 재시작하라고 합니다. 도구가 그 이름을 정했다거나 CDC가 그 버킷에서 실행되었을 수 있다는 말은 더 이상 하지 않습니다.
+  - **쓸 수 있는 관리형 버킷이 없는 경우**(v0.1.589보다 오래된 앱 스택 템플릿, SCP, 권한 경계 때문에 이 자격 증명이 `-an` 버킷을 만들 수 없고, 이전 이름은 다른 계정의 것이거나 그것도 만들 수 없는 경우): 해결 방법은 하나뿐입니다. 이 자격 증명에 `s3:x-amz-bucket-namespace`가 `account-regional`인 요청에 대해 `-an` 이름의 `s3:CreateBucket`을, 그리고 그 버킷의 `s3:ListBucket`을 허용하라고 하며, 이 버전의 앱 스택 템플릿이 이를 부여합니다. 그 안에 들어간 이전 이름의 거부는 더 이상 위의 해결 방법이나, 다른 계정이 가져갈 수 있는 이름인 이전 이름의 버킷을 직접 만들라는 말을 덧붙이지 않습니다.
+  - **기존 배포가 유지해 온 이전 이름의 버킷이 앱 실행 중에 거부된 경우**(소유자가 버킷을 삭제했고 다른 계정이 그 이름을 만든 경우): 다시 시도하라고 하며(작업·세션 상태는 다음 저장 때 다시 시도합니다), 그러면 도구가 `-an` 버킷으로 옮겨 갑니다. 거부된 버킷의 내용은 그곳으로 복사되지 않습니다. 이 자격 증명이 `-an` 이름을 쓸 수 없으면(이미지만 업데이트한 앱 스택은 이전 이름만 허용하는 예전 템플릿을 유지합니다), 다시 시도만으로는 두 이름이 모두 거부되므로, 거부 메시지가 S3의 응답과 함께 그렇다고 밝히고 먼저 그 이름을 허용하라고 합니다.
+
+### 문서
+
+- **README, 매뉴얼, 배포 가이드가 앱을 `uv run dsql-migration-toolkit ui`로 실행하며,** README와 매뉴얼 [§1.2](docs/manual/ko/01-setup.md#12-로컬에서-실행)가 이전 명령도 계속 동작한다고 밝힙니다. 영어, 한국어, 일본어 모두 같습니다. AWS 리소스(관리형 버킷, CDC 시크릿, 로그 그룹, 이미지 리포지토리, 스택 이름)를 가리키는 문장은 그 실제 이름을 그대로 씁니다.
+
+### 업그레이드 참고
+
+- **앱 스택(ECS Fargate): 이미지만 업데이트하면 됩니다. `ContainerImageUri`를 0.1.590 이미지로 설정하세요.** `deploy/cloudformation.yaml`은 기본 이미지 말고는 그대로이고 IAM 변경은 없으며, 이미지는 같은 리포지토리에 있습니다. 실행 중인 작업은 먼저 끝내거나 멈추세요. task 교체가 작업을 끝냅니다.
+- **단일 EC2 호스트: 할 일이 없습니다.** `deploy/cloudformation-ec2.yaml`은 주석만 바뀌었고, 호스트의 사용자 데이터는 그대로입니다. 이 릴리스로 시작한 호스트나 스택 업데이트가 교체한 호스트(리포지토리를 다시 클론합니다)는 `dsql-migration-toolkit`을 설치하고, 그 systemd 유닛은 이 릴리스가 유지하는 `mysql-dsql-migrator ui`를 계속 실행합니다. 호스트는 처음 부팅할 때 받은 코드를 계속 씁니다. 실제 호스트에서는 테스트하지 않았습니다.
+- **CDC 인프라: 다시 배포할 것이 없습니다.** 싱크 플러그인은 여전히 v57이고, CDC 스택 템플릿은 그대로입니다.
+- **로컬 실행(리포지토리의 `.venv`): `uv run`만 하지 말고 `uv sync`를 한 번 실행하세요.** `uv sync`는 설치된 `mysql-dsql-migrator` 배포 패키지를 `dsql-migration-toolkit`으로 바꿉니다. 반면 `uv run`은 `dsql-migration-toolkit`을 이전 배포 패키지 옆에 설치하며, 그러면 다음 `uv sync`가 이전 배포 패키지를 지울 때 `mysql-dsql-migrator` 명령도 함께 지웁니다. `uv sync --reinstall-package dsql-migration-toolkit`을 실행하면 그 명령이 돌아옵니다. **직접 만든 가상환경**(`uv sync`는 이를 그대로 둡니다): 프로젝트를 그 가상환경에 다시 설치하세요. `pip uninstall mysql-dsql-migrator` 다음에 `pip install -e .`를 실행하거나, `uv sync --active`를 실행합니다(`uv.lock`에 없는 패키지도 지웁니다). 그 전까지 이 릴리스 이전에 설치한 가상환경에는 `mysql-dsql-migrator` 명령만 있고, 설치할 때의 버전을 표시합니다. 이름 변경은 `dsql_migrator`를 import하는 프로그램에 영향을 주지 않습니다.
+- **따로 옮길 것이 없고, v0.1.589로 되돌리는 것도 안전합니다.** 이 버전은 v0.1.589와 같은 Full Load 기록, 저장된 세션, 버킷을 읽고 쓰며 같은 설정을 받아들입니다. v0.1.589는 예전 제목과 거부 메시지를 다시 보여 줍니다.
+
 ## v0.1.589
 
 관리형 S3 버킷을 강화한 CDC 기능 릴리스입니다. 이 버전이 배포한 CDC 인프라(싱크 플러그인 v57)는 테이블 이름에 `.`이 들어간 테이블을 스트리밍하며, 그 싱크는 더 이상 Debezium 톰스톤을 적용하지 않습니다. Evaluation은 이제 Kafka 토픽 이름 때문에 CDC가 스트리밍할 수 없는 테이블을 표시합니다. 아직 관리형 버킷이 없는 계정과 리전에서는 이제 도구가 그 버킷을 내 계정의 S3 계정 리전 네임스페이스(account regional namespace)에 `mysql-dsql-migrator-plugins-<account>-<region>-an`으로 만들며, 다른 계정은 이 버킷을 만들 수 없습니다(me-south-1과 me-central-1은 이전 이름을 유지합니다). 이전 이름의 버킷이 이미 있는 계정과 리전은 그 버킷을 계속 씁니다. ECS Fargate 앱 스택은 이 릴리스의 템플릿(그 IAM 역할이 새 이름에 대한 권한을 부여합니다)과 0.1.589 이미지로 업데이트하세요. CDC 인프라는 그런 테이블을 스트리밍하거나 새 싱크와 오프셋 시더를 받으려는 경우에만 Delete CDC infrastructure 후 새로 배포하면 됩니다. 나머지는 CDC 모니터, Start CDC, Validation 수정, 두 가지 외관 변경, 문서, 그리고 내부 리팩터링입니다.

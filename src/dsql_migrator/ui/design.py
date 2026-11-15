@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AWS Console (Cloudscape)-inspired design system for the DSQL migrator UI.
+"""AWS Console (Cloudscape)-inspired design system for the Aurora DSQL Migration Toolkit UI.
 
 Single source of truth for the app's visual language so every page reads like one
 AWS-service experience instead of diverging per screen. The real AWS Console uses

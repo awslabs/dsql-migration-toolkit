@@ -181,7 +181,7 @@ def _open_page(browser: Browser, base_url: str) -> "tuple[object, Page]":
     pg = context.new_page()
     pg.goto(base_url + "/", wait_until="networkidle", timeout=30000)
     # NiceGUI renders over the WebSocket after load; wait for a known element.
-    pg.wait_for_selector("text=DSQL Migration Tool", timeout=15000)
+    pg.wait_for_selector("text=Aurora DSQL Migration Toolkit", timeout=15000)
     return context, pg
 
 

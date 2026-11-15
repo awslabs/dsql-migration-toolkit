@@ -1,4 +1,4 @@
-# Deployment Guide — MySQL / PostgreSQL → Aurora DSQL Migration Tool (app-stack)
+# Deployment Guide — MySQL / PostgreSQL → Aurora DSQL Migration Toolkit (app-stack)
 
 _Language: **English** | [한국어](DEPLOYMENT.ko.md) | [日本語](DEPLOYMENT.ja.md)_
 
@@ -73,7 +73,7 @@ billing at teardown.)
 command and the UI is up. That's it.**
 
 ```console
-$ uv run mysql-dsql-migrator ui
+$ uv run dsql-migration-toolkit ui
 NiceGUI ready to go on http://127.0.0.1:8080
 ```
 
@@ -106,7 +106,7 @@ for a real migration use **[ECS Fargate](#deploy-on-ecs-fargate)**.
 >
 > ```bash
 > DSQL_MIGRATOR_STORAGE_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(32))") \
->   uv run mysql-dsql-migrator ui
+>   uv run dsql-migration-toolkit ui
 > ```
 >
 > - **Without it** — each restart gets a new session id, so workflow progress **and your
@@ -396,7 +396,7 @@ that destination gets its own parameter and must not be folded into
    inside the VPC; see "Reaching the UI" above).
 
 **7. Open it — you should see the tool.** Browse `AppUrl` in a browser (from
-   inside the VPC). The **Aurora DSQL Migration Tool** UI loads — the
+   inside the VPC). The **Aurora DSQL Migration Toolkit** UI loads — the
    guided workflow starting at **Connect** (Connect → Evaluation → Schema
    Conversion → Data Migration → Validation → Cut over). If it loads, the
    deployment is done; enter your source DB credentials at **Connect** to begin.
@@ -549,7 +549,7 @@ Key outputs: `LoadBalancerDns`, `AppUrl`, `ClusterName`, `ServiceName`,
 `TaskRoleArn`, `CognitoHostedUiDomain`.
 
 Open **`AppUrl`** in a browser (from inside the VPC). The **Aurora DSQL
-Migration Tool** UI loads — the guided workflow starting at **Connect** (Connect
+Migration Toolkit** UI loads — the guided workflow starting at **Connect** (Connect
 → Evaluation → Schema Conversion → Data Migration → Validation → Cut
 over). Seeing the UI means the deployment succeeded; enter your source DB
 credentials at **Connect** to begin.

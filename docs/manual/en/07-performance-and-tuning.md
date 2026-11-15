@@ -279,7 +279,7 @@ Raising either is a redeploy: Fargate does not auto-scale a task's memory.
 has the full CPU↔memory pairing table.
 
 > **Local runs** read the same environment variables — set them in your shell or `.env`
-> before launching `mysql-dsql-migrator ui`.
+> before launching `dsql-migration-toolkit ui`.
 
 ---
 

@@ -80,10 +80,11 @@ _言語: [English](../en/01-setup.md) | [한국어](../ko/01-setup.md) | **日�
 # ローカルの仮想環境に依存関係をインストール
 uv sync
 # Web UI を起動 (既定では 127.0.0.1:8080 にバインド)
-uv run mysql-dsql-migrator ui
+uv run dsql-migration-toolkit ui
 ```
 
-その後、ブラウザで **http://127.0.0.1:8080** を開きます。
+その後、ブラウザで **http://127.0.0.1:8080** を開きます。v0.1.590 より前のコマンド名
+`mysql-dsql-migrator` も引き続き使えます。
 
 任意: リポジトリのルートにある `.env` ファイルに接続項目を 1 行に 1 つずつ `KEY=value` で記入すると
 (ソースは `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、Aurora DSQL は `TARGET_ENDPOINT`、

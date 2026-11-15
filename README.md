@@ -1,4 +1,4 @@
-# DSQL Migration Toolkit
+# Aurora DSQL Migration Toolkit
 
 _Language: **English** | [한국어](README.ko.md) | [日本語](README.ja.md)_
 
@@ -151,13 +151,13 @@ git clone https://github.com/awslabs/dsql-migration-toolkit.git
 cd dsql-migration-toolkit
 # create + fill a .venv (needs uv)
 uv sync
-uv run mysql-dsql-migrator ui
+uv run dsql-migration-toolkit ui
 ```
 
-Binds to `http://127.0.0.1:8080` by default. Open the printed URL and start from
-the **Connect** step. Optionally, a git-ignored `.env` file in the repository root
-pre-fills the connection details (manual
-[§1.2](docs/manual/en/01-setup.md#12-run-the-tool-locally)).
+Binds to `http://127.0.0.1:8080` by default. The command's name before v0.1.590,
+`mysql-dsql-migrator`, still works. Open the printed URL and start from the **Connect**
+step. Optionally, a git-ignored `.env` file in the repository root pre-fills the
+connection details (manual [§1.2](docs/manual/en/01-setup.md#12-run-the-tool-locally)).
 
 ### ECS Fargate (real migrations)
 

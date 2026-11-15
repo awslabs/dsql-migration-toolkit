@@ -5,6 +5,38 @@ _言語: [English](CHANGELOG.md) | [한국어](CHANGELOG.ko.md) | **日本語**_
 このプロジェクトの主要な変更点はすべてここに記録されます。本プロジェクトは
 [セマンティックバージョニング(semver)](https://semver.org/)に従います(バグ修正はパッチリリース)。
 
+## v0.1.590
+
+名前の変更と、S3 バケットの拒否メッセージを改めたリリースです。ディストリビューション名とコマンド名は `dsql-migration-toolkit` になり、アプリのタイトルは *Aurora DSQL Migration Toolkit* になりました。`mysql-dsql-migrator` コマンドは引き続き動作し、AWS リソースの名前は一切変わらないため、既存のスタック、保存済みのセッション、CDC パイプラインでは何もする必要はありません。管理バケットまたは状態用 S3 バケットの拒否は、それぞれのケースに合った対処を示すようになりました。ECS Fargate のアプリスタックはイメージのみの更新で適用でき、CDC インフラは再デプロイ不要です。
+
+### 変更
+
+- **ディストリビューション名とコマンド名が `dsql-migration-toolkit` になりました (以前は `mysql-dsql-migrator`)。アプリは `uv run dsql-migration-toolkit ui` で起動します。** `mysql-dsql-migrator` コマンドは同じプログラムの 2 つ目の名前として恒久的に残るため、スクリプト、シェルのエイリアス、単一 EC2 ホストの systemd ユニット (引き続き `mysql-dsql-migrator ui` を実行します) は変更不要です。どちらの名前で実行しても、`--version` と `--help` は `dsql-migration-toolkit` と表示するようになりました。コンテナイメージの ENTRYPOINT は `dsql-migration-toolkit` になりました。コマンド (`ui` など) だけを上書きする ECS タスクはこれまでどおり動作します。Python パッケージは `dsql_migrator` のままなので、名前の変更はこれを import するプログラムに影響しません。
+- **アプリのヘッダーとブラウザのタブのタイトルが *Aurora DSQL Migration Toolkit* になりました** (以前は *Aurora DSQL Migration Tool* と *DSQL Migration Tool*)。README、マニュアル、デプロイガイド、`NOTICE`、`THIRD-PARTY-NOTICES.md` も同じ名前を使います。
+- **変わらないもの: すべての AWS リソースの名前。** コンテナイメージのリポジトリ (`public.ecr.aws/z0q0i9j0/mysql-dsql-migrator`)、管理バケット (`mysql-dsql-migrator-plugins-<account>-<region>`、新しいバケットには `-an` が付きます)、CDC のソースシークレット (`mysql-dsql-migrator/cdc/<stack>/source`)、CDC のメトリクス名前空間 `MysqlDsqlMigrator/CDC`、アプリのロググループ (`/ecs/<stack>-mysql-dsql-migrator`)、デプロイガイドの例のスタック名、`DSQL_MIGRATOR_` の設定は名前が変わりません。
+- **内部の変更で、動作は変わりません: オフセットシーダーのビルドを `deploy/cdc-stack/lambda/requirements.lock` が固定します。** このファイルは `connectors/plugins/offset-seeder-lambda.zip` が同梱する 10 個のディストリビューションの正確なバージョン (kafka-python 3.0.10 と aws-msk-iam-sasl-signer-python 1.0.2、および署名ライブラリの依存関係) で、テストはクローンのたびに、コミット済みの zip と `THIRD-PARTY-NOTICES.md` をこのファイルと照合します。zip は変わりません。
+- **`dsql_migrator.core.s3_provision.state_bucket` は必須のキーワード専用引数 `setting` を取るようになりました:** バケットの名前を決める設定 (`DSQL_MIGRATOR_JOB_STATE_BUCKET` など) で、バケットが拒否されると、拒否メッセージはオペレーターにこの設定を変えるよう示します。これを渡さない呼び出しは `TypeError` を送出します。拒否メッセージの対処のために新しく加わったもの: `dsql_migrator.core.s3_ownership` に `Remedy` (拒否がオペレーターに示す対処) と `DELETE_OR_SUPPORT` (以前のバージョンが示した唯一の対処で、引き続き既定値) が加わり、`OwnedBucket`、`not_owned_message`、`already_exists_message` は省略可能なキーワード専用引数 `remedy` を取り、`OwnedBucket` には `remedy` プロパティが加わりました。`dsql_migrator.core.s3_provision` には、管理バケットの以前の名前が拒否されたときの対処を返す `managed_bucket_remedy(name, owner, region)` が加わりました (ほかの名前では `None`)。
+
+### 修正
+
+- **管理バケットまたは状態用バケットの拒否が、それぞれのケースで何をすべきかを示すようになりました。** v0.1.587 から v0.1.589 までは、拒否したバケットに「If the bucket is yours in another AWS account, empty and delete it there (S3 cannot rename a bucket), then retry; otherwise, contact AWS Support」という 1 つの対処だけを示していましたが、v0.1.589 の `-an` バケット以降、これが当てはまるのはツールにほかの名前がない場所だけです。現在は次のとおりです。
+  - **me-south-1 と me-central-1 で**、管理バケットの名前のバケットをほかのアカウントが所有している場合: 拒否メッセージはまず、そのリージョンには S3 アカウントリージョナル名前空間がないため、ツールにはそこで使えるほかの名前がないことを示し、そのうえで上記の対処を示します。
+  - **`DSQL_MIGRATOR_JOB_STATE_BUCKET` または `DSQL_MIGRATOR_SESSION_STATE_BUCKET` を独自のバケット名に設定し**、そのバケットをほかのアカウントが所有している場合: その設定を自分のアカウントが所有するバケットに向けるか、ツールが管理バケットとして読む `mysql-dsql-migrator-plugins-<account>-<region>` (ECS Fargate テンプレートが設定する値) に設定してから、アプリを再起動するよう示します。ツールがその名前を決めた、あるいは CDC がそのバケットから実行された可能性がある、とはもう言いません。
+  - **使える管理バケットがない場合** (v0.1.589 より古いアプリスタックのテンプレート、SCP、またはアクセス許可の境界のために、この ID が `-an` バケットを作成できず、以前の名前はほかのアカウントのものか、それも作成できない場合): 対処は 1 つだけです。この ID に、`s3:x-amz-bucket-namespace` が `account-regional` であるリクエストに対する `-an` の名前への `s3:CreateBucket` と、そのバケットへの `s3:ListBucket` を許可するよう示し、このバージョンのアプリスタックのテンプレートがこれらを付与します。その中に含まれる以前の名前の拒否は、上記の対処も、ほかのアカウントが取得できる名前である以前の名前のバケットを自分で作成する、という対処も、もう付け加えません。
+  - **既存のデプロイが使い続けてきた以前の名前のバケットが、アプリの実行中に拒否された場合** (所有者がバケットを削除し、ほかのアカウントがその名前を作成した場合): 再試行するよう示し (ジョブとセッションの状態は次の保存時に再試行します)、ツールは `-an` バケットに移ります。拒否されたバケットの中身はそこにコピーされません。この ID が `-an` の名前を使えない場合 (イメージのみを更新したアプリスタックは、以前の名前だけを許可する古いテンプレートのままです) は、再試行だけでは両方の名前が拒否されるため、拒否メッセージは S3 の応答とともにそのことを示し、先にその名前を許可するよう示します。
+
+### ドキュメント
+
+- **README、マニュアル、デプロイガイドは、アプリを `uv run dsql-migration-toolkit ui` で起動します。** README とマニュアルの [§1.2](docs/manual/ja/01-setup.md#12-ツールをローカルで実行する) は、以前のコマンドも引き続き動作することを示します。英語、韓国語、日本語のすべてで同じです。AWS リソース (管理バケット、CDC シークレット、ロググループ、イメージのリポジトリ、スタック名) を指す文は、その実際の名前のままです。
+
+### アップグレードの注意
+
+- **アプリスタック (ECS Fargate): イメージのみの更新で十分です。`ContainerImageUri` を 0.1.590 のイメージに設定してください。** `deploy/cloudformation.yaml` は既定のイメージ以外は変わらず、IAM の変更もなく、イメージは同じリポジトリにあります。実行中のジョブは先に終えるか止めてください: タスクの置き換えでジョブは終了します。
+- **単一 EC2 ホスト: 何もする必要はありません。** `deploy/cloudformation-ec2.yaml` はコメントだけが変わり、ホストのユーザーデータは変わりません。このリリースで起動したホストや、スタックの更新で置き換えられたホスト (リポジトリをもう一度クローンします) は `dsql-migration-toolkit` をインストールし、その systemd ユニットは、このリリースが残す `mysql-dsql-migrator ui` を引き続き実行します。ホストは最初の起動時に取得したコードを使い続けます。実際のホストではテストしていません。
+- **CDC インフラストラクチャ: 再デプロイは不要です。** sink プラグインは引き続き v57 で、CDC スタックのテンプレートは変わりません。
+- **ローカル実行 (リポジトリの `.venv`): `uv run` だけでなく、`uv sync` を一度実行してください。** `uv sync` は、インストール済みの `mysql-dsql-migrator` ディストリビューションを `dsql-migration-toolkit` に置き換えます。一方 `uv run` は `dsql-migration-toolkit` を以前のディストリビューションの隣にインストールするため、次の `uv sync` が以前のディストリビューションを削除するときに `mysql-dsql-migrator` コマンドも削除します。`uv sync --reinstall-package dsql-migration-toolkit` を実行すると、このコマンドは戻ります。**独自の仮想環境** (`uv sync` はこれに手を付けません): プロジェクトをその仮想環境にインストールし直してください。`pip uninstall mysql-dsql-migrator` のあとに `pip install -e .` を実行するか、`uv sync --active` を実行します (`uv.lock` にないパッケージも削除します)。それまでは、このリリースより前にインストールした仮想環境には `mysql-dsql-migrator` コマンドしかなく、インストールした時点のバージョンを表示します。名前の変更は、`dsql_migrator` を import するプログラムに影響しません。
+- **移行すべきものはなく、v0.1.589 に戻しても安全です。** このバージョンは v0.1.589 と同じ Full Load の記録、保存済みのセッション、バケットを読み書きし、同じ設定を受け付けます。v0.1.589 は、以前のタイトルと拒否メッセージを再び表示します。
+
 ## v0.1.589
 
 管理 S3 バケットの強化を伴う、CDC の機能リリースです。このバージョンがデプロイした CDC インフラ (sink プラグイン v57) は、テーブル名に `.` を含むテーブルをストリーミングし、その sink は Debezium のトゥームストーンを適用しなくなりました。Evaluation は、Kafka のトピック名のために CDC がストリーミングできないテーブルを示すようになりました。まだ管理バケットのないアカウントとリージョンでは、ツールは管理バケットを、あなたのアカウントの S3 アカウントリージョナル名前空間に、ほかのどのアカウントも作成できない `mysql-dsql-migrator-plugins-<account>-<region>-an` として作成するようになりました (me-south-1 と me-central-1 は以前の名前のままです)。以前の名前のバケットがすでにあるアカウントとリージョンは、引き続きそのバケットを使います。ECS Fargate のアプリスタックを、このリリースのテンプレート (その IAM ロールが新しい名前を許可します) と 0.1.589 のイメージで更新してください。CDC インフラに Delete CDC infrastructure と新しいデプロイが必要なのは、そのようなテーブルをストリーミングする場合か、新しい sink とオフセットシーダーを使う場合だけです。残りは、CDC モニター、Start CDC、Validation の修正、2 つの見た目の変更、ドキュメント、そして内部リファクタリングです。

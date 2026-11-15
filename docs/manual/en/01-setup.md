@@ -80,10 +80,11 @@ From a fresh clone:
 # install dependencies into a local virtualenv
 uv sync
 # launch the web UI (binds to 127.0.0.1:8080 by default)
-uv run mysql-dsql-migrator ui
+uv run dsql-migration-toolkit ui
 ```
 
-Then open **http://127.0.0.1:8080** in your browser.
+Then open **http://127.0.0.1:8080** in your browser. The command's name before v0.1.590,
+`mysql-dsql-migrator`, still works.
 
 Optionally, put the connection fields in a `.env` file in the repository root, one
 `KEY=value` per line: `DB_HOST`, `DB_PORT`, `DB_USER` and `DB_PASSWORD` for the source,

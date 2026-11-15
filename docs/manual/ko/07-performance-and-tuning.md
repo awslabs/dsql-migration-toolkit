@@ -253,7 +253,7 @@ CPU↔메모리 짝 표는
 [DEPLOYMENT.ko.md → 태스크 사이징](../../../deploy/DEPLOYMENT.ko.md#태스크-사이징--containercpu--containermemory)을
 참고하세요.
 
-> **로컬 실행**도 동일 환경 변수를 읽습니다 — `mysql-dsql-migrator ui` 실행 전 셸이나 `.env`에
+> **로컬 실행**도 동일 환경 변수를 읽습니다 — `dsql-migration-toolkit ui` 실행 전 셸이나 `.env`에
 > 설정하세요.
 
 ---

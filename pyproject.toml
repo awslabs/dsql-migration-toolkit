@@ -1,6 +1,6 @@
 [project]
-name = "mysql-dsql-migrator"
-version = "0.1.589"
+name = "dsql-migration-toolkit"
+version = "0.1.590"
 description = "Aurora DSQL Migration Toolkit: migrate RDS/Aurora MySQL and PostgreSQL to Amazon Aurora DSQL"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,10 @@ cdc-external = [
 ]
 
 [project.scripts]
+dsql-migration-toolkit = "dsql_migrator.cli.main:main"
+# The command's name before v0.1.590, kept for good: the single EC2 host's systemd
+# unit runs it (deploy/cloudformation-ec2.yaml, ExecStart), and a host an existing
+# stack replaces clones this repository again under the template it was deployed with.
 mysql-dsql-migrator = "dsql_migrator.cli.main:main"
 
 [dependency-groups]

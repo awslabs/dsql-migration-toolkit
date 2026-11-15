@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Command-line entrypoint for the DSQL migration tool.
+"""Command-line entrypoint for the Aurora DSQL Migration Toolkit.
 
 Provides a minimal, extensible CLI. At this scaffolding stage it supports
 inspecting the loaded (non-secret) configuration and launching the NiceGUI UI.
@@ -22,8 +22,12 @@ from dsql_migrator.config import load_config
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser."""
     parser = argparse.ArgumentParser(
-        prog="mysql-dsql-migrator",
-        description="RDS/Aurora MySQL or PostgreSQL to Amazon Aurora DSQL migration toolkit.",
+        prog="dsql-migration-toolkit",
+        description=(
+            "Aurora DSQL Migration Toolkit: migrate RDS/Aurora MySQL or PostgreSQL to "
+            "Amazon Aurora DSQL. The command mysql-dsql-migrator, its name before "
+            "v0.1.590, runs the same program."
+        ),
     )
     parser.add_argument(
         "--version",

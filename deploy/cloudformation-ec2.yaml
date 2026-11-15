@@ -1411,6 +1411,15 @@ Resources:
           # Fn::Sub: ${...} CloudFormation refs interpolate; shell variables we
           # define are escaped as ${!VAR} so Fn::Sub leaves them literal. $(...)
           # and bare $VAR are untouched by Fn::Sub (it only expands ${...}).
+          #
+          # The systemd unit's ExecStart below runs mysql-dsql-migrator, the
+          # command's name before v0.1.590 (now dsql-migration-toolkit), on purpose:
+          # SourceRepoRef can name a tag from before the rename, which has only the
+          # old name. pyproject.toml keeps the old name as a permanent alias for the
+          # other direction: a host that an existing stack replaces runs that stack's
+          # older template's ExecStart against a new clone of SourceRepoRef (main by
+          # default). This note is a YAML comment so the host's user data does not
+          # change: a UserData change stops and starts a running host.
           Fn::Sub: |
             #!/bin/bash
             set -euxo pipefail

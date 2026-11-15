@@ -904,7 +904,7 @@ def build_page(
     build_workflow_sidebar(
         SESSION_STORE,
         session_id,
-        app_title="Aurora DSQL Migration Tool",
+        app_title="Aurora DSQL Migration Toolkit",
         version=__version__,
         connect_builder=lambda go_to_first_step, on_connection_change: (
             build_connect_page(
@@ -1651,7 +1651,7 @@ def main() -> None:
     ui.run(
         host=config.app_host,
         port=config.app_port,
-        title="DSQL Migration Tool",
+        title="Aurora DSQL Migration Toolkit",
         reload=False,
         show=False,
         storage_secret=storage_secret,

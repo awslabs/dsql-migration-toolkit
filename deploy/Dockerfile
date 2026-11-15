@@ -1,6 +1,6 @@
-# Container image for the MySQL -> Aurora DSQL migration tool.
+# Container image for the Aurora DSQL Migration Toolkit (MySQL / PostgreSQL -> Aurora DSQL).
 #
-# The same image runs the control-plane app (default: `mysql-dsql-migrator ui`). It is
+# The same image runs the control-plane app (default: `dsql-migration-toolkit ui`). It is
 # pushed to Amazon ECR and run as a single-task Amazon ECS Fargate service behind
 # an ALB (see deploy/cloudformation.yaml). Dependencies are installed from the
 # committed uv.lock with `uv sync --frozen` for reproducible builds.
@@ -108,7 +108,8 @@ RUN useradd --system --uid 10001 --create-home appuser
 WORKDIR /app
 COPY --from=build /app /app
 
-# Put the virtualenv on PATH so the `mysql-dsql-migrator` console script is available.
+# Put the virtualenv on PATH so the `dsql-migration-toolkit` console script is available
+# (and `mysql-dsql-migrator`, its name before v0.1.590, which runs the same program).
 # The runtime state paths default to /tmp because the container runs as a non-root
 # user (appuser) and WORKDIR /app is root-owned: the relative defaults
 # (migration_activity.log / session_state.sqlite / job_state.sqlite) would resolve
@@ -129,5 +130,5 @@ USER appuser
 EXPOSE 8080
 
 # Default to the web UI; override the command for other entrypoints.
-ENTRYPOINT ["mysql-dsql-migrator"]
+ENTRYPOINT ["dsql-migration-toolkit"]
 CMD ["ui"]
